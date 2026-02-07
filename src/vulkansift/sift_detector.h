@@ -56,12 +56,13 @@ typedef struct vksift_SiftDetector_T
   VkDescriptorSet *dog_desc_sets;
   VkPipelineLayout dog_pipeline_layout;
   VkPipeline dog_pipeline;
-  // ExtrackKeypoints set
+  // ExtractKeypoints set
   VkDescriptorSetLayout extractkpts_desc_set_layout;
   VkDescriptorPool extractkpts_desc_pool;
   VkDescriptorSet *extractkpts_desc_sets;
   VkPipelineLayout extractkpts_pipeline_layout;
   VkPipeline extractkpts_pipeline;
+  VkPipeline extractkpts_2d_pipeline;
   // ComputeOrientation set
   VkDescriptorSetLayout orientation_desc_set_layout;
   VkDescriptorPool orientation_desc_pool;
@@ -75,6 +76,21 @@ typedef struct vksift_SiftDetector_T
   VkPipelineLayout descriptor_pipeline_layout;
   VkPipeline descriptor_pipeline;
 
+  // RGBA→Gray conversion set (only when use_rgba_input=true)
+  VkDescriptorSetLayout rgba_convert_desc_set_layout;
+  VkDescriptorPool rgba_convert_desc_pool;
+  VkDescriptorSet rgba_convert_desc_set;
+  VkPipelineLayout rgba_convert_pipeline_layout;
+  VkPipeline rgba_convert_pipeline;
+
+  // RGB→Gray conversion set (only when use_rgb_input=true)
+  // Uses SSBO for RGB input since VK_FORMAT_R8G8B8 has poor storage image support
+  VkDescriptorSetLayout rgb_convert_desc_set_layout;
+  VkDescriptorPool rgb_convert_desc_pool;
+  VkDescriptorSet rgb_convert_desc_set;
+  VkPipelineLayout rgb_convert_pipeline_layout;
+  VkPipeline rgb_convert_pipeline;
+
   // Config
   bool use_hardware_interp_kernel;
   float input_blur_level;
@@ -83,6 +99,10 @@ typedef struct vksift_SiftDetector_T
   float edge_threshold;
   uint32_t max_nb_orientations;
   uint32_t use_vlfeat_format;
+  bool detection_only;
+  bool use_2d_nms;
+  bool use_rgba_input;
+  bool use_rgb_input;
 
 } * vksift_SiftDetector;
 

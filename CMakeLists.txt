@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.5)
 project(VulkanSift DESCRIPTION "SIFT GPU implementation using Vulkan" LANGUAGES C CXX)
 
 
@@ -27,7 +27,7 @@ option(VULKANSIFT_LOAD_VK_AT_RUNTIME "Use to dynamically load the Vulkan library
 option(VULKANSIFT_BUILD_EXAMPLES "Use to build VulkanSift examples." OFF)
 option(VULKANSIFT_WITH_GPU_DEBUG_EXAMPLE "Use to build an example that can be used with GPU profilers/debuggers" OFF)
 option(VULKANSIFT_BUILD_PERFS "Use to build VulkanSift performance tests." OFF)
-set(VULKANSIFT_SANITIZE "" CACHE STRING "Use with value \"Address\" to build using the address sanitizer or 
+set(VULKANSIFT_SANITIZE "" CACHE STRING "Use with value \"Address\" to build using the address sanitizer or
     with \"Thread\" to build using the thread sanitizer. Leave empty otherwise.")
 
 #####################################################################################"
@@ -70,6 +70,9 @@ set(VULKANSIFT_LIB_SHADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussianBlurInterpolated.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/DifferenceOfGaussian.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ExtractKeypoints.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ExtractKeypoints2D.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/RGBAtoGray.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/RGBtoGray.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ComputeOrientation.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ComputeDescriptors.comp
     # SIFT matching algorithm shaders
@@ -199,7 +202,7 @@ find_package(OpenCV REQUIRED core highgui features2d)
 
 # Appart from OpenCV, all compared SIFT implementations are compiled separately.
 # Their headers are placed in external_libs/SIFT_IMPL_NAME/src/ and the library placed in external_libs/SIFT_IMPL_NAME/lib/.
-set(VULKAN_SIFT_PERFS_COMMON_SRC 
+set(VULKAN_SIFT_PERFS_COMMON_SRC
     src/perf/perf_common.cpp
     src/perf/wrappers/vulkansift_wrapper.cpp
     src/perf/wrappers/opencv_wrapper.cpp

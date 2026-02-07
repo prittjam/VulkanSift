@@ -1,0 +1,15 @@
+[project]
+name = "VulkanSift"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+vulkan-headers = "*"
+glslang = "*"
+shaderc = "*"
+cmake = "*"
+make = "*"
+gcc = "*"
+gxx = "*"
+xorg-libx11 = "*"
+xorg-xorgproto = "*"

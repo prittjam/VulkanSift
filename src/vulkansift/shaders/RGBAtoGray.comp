@@ -1,0 +1,16 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba8, set = 0, binding = 0) uniform readonly image2D rgba_input;
+layout(r8, set = 0, binding = 1) uniform writeonly image2D gray_output;
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 img_size = imageSize(rgba_input);
+    if (coords.x >= img_size.x || coords.y >= img_size.y) return;
+
+    vec4 rgba = imageLoad(rgba_input, coords);
+    // ITU-R BT.601 luminance (matches C wrapper: 77/256, 150/256, 29/256)
+    float gray = 0.299 * rgba.r + 0.587 * rgba.g + 0.114 * rgba.b;
+    imageStore(gray_output, coords, vec4(gray, 0.0, 0.0, 1.0));
+}

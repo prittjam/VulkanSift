@@ -60,6 +60,10 @@ static vksift_Config vksift_Config_Default = {.input_image_max_size = 1920u * 10
                                               .use_hardware_interpolated_blur = true,            // faster with no noticeable quality loss
                                               .pyramid_precision_mode = VKSIFT_PYRAMID_PRECISION_FLOAT32,
                                               .on_error_callback_function = default_error_callback,
+                                              .detection_only = false,
+                                              .use_2d_nms = false,
+                                              .use_rgba_input = false,
+                                              .use_rgb_input = false,
                                               .use_gpu_debug_functions = false,
                                               .gpu_debug_external_window_info = {.context = NULL, .window = NULL}};
 

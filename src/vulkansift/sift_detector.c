@@ -529,6 +529,104 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     return false;
   }
 
+  ///////////////////////////////////////////////////
+  // Descriptors for RGBAtoGray pipeline (only when use_rgba_input)
+  ///////////////////////////////////////////////////
+  if (detector->use_rgba_input)
+  {
+    VkDescriptorSetLayoutBinding rgba_input_binding = {.binding = 0,
+                                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                       .descriptorCount = 1,
+                                                       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                       .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding gray_output_binding = {.binding = 1,
+                                                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                        .descriptorCount = 1,
+                                                        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                        .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding rgba_bindings[2] = {rgba_input_binding, gray_output_binding};
+    VkDescriptorSetLayoutCreateInfo rgba_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = rgba_bindings};
+    if (vkCreateDescriptorSetLayout(detector->dev->device, &rgba_layout_info, NULL, &detector->rgba_convert_desc_set_layout) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create RGBAtoGray descriptor set layout");
+      return false;
+    }
+
+    VkDescriptorPoolSize rgba_pool_sizes[1];
+    rgba_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 2};
+    VkDescriptorPoolCreateInfo rgba_pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                                  .maxSets = 1,
+                                                  .poolSizeCount = 1,
+                                                  .pPoolSizes = rgba_pool_sizes};
+    if (vkCreateDescriptorPool(detector->dev->device, &rgba_pool_info, NULL, &detector->rgba_convert_desc_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create RGBAtoGray descriptor pool");
+      return false;
+    }
+
+    VkDescriptorSetAllocateInfo rgba_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                    .descriptorPool = detector->rgba_convert_desc_pool,
+                                                    .descriptorSetCount = 1,
+                                                    .pSetLayouts = &detector->rgba_convert_desc_set_layout};
+    alloc_res = vkAllocateDescriptorSets(detector->dev->device, &rgba_alloc_info, &detector->rgba_convert_desc_set);
+    if (alloc_res != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to allocate RGBAtoGray descriptor set");
+      return false;
+    }
+  }
+
+  ///////////////////////////////////////////////////
+  // Descriptors for RGBtoGray pipeline (only when use_rgb_input)
+  // Binding 0: SSBO (packed RGB bytes), Binding 1: storage image (R8 output)
+  ///////////////////////////////////////////////////
+  if (detector->use_rgb_input)
+  {
+    VkDescriptorSetLayoutBinding rgb_ssbo_binding = {.binding = 0,
+                                                      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                      .descriptorCount = 1,
+                                                      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                      .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding rgb_gray_output_binding = {.binding = 1,
+                                                             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                             .descriptorCount = 1,
+                                                             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                             .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding rgb_bindings[2] = {rgb_ssbo_binding, rgb_gray_output_binding};
+    VkDescriptorSetLayoutCreateInfo rgb_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = rgb_bindings};
+    if (vkCreateDescriptorSetLayout(detector->dev->device, &rgb_layout_info, NULL, &detector->rgb_convert_desc_set_layout) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create RGBtoGray descriptor set layout");
+      return false;
+    }
+
+    VkDescriptorPoolSize rgb_pool_sizes[2];
+    rgb_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1};
+    rgb_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1};
+    VkDescriptorPoolCreateInfo rgb_pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                                 .maxSets = 1,
+                                                 .poolSizeCount = 2,
+                                                 .pPoolSizes = rgb_pool_sizes};
+    if (vkCreateDescriptorPool(detector->dev->device, &rgb_pool_info, NULL, &detector->rgb_convert_desc_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create RGBtoGray descriptor pool");
+      return false;
+    }
+
+    VkDescriptorSetAllocateInfo rgb_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                   .descriptorPool = detector->rgb_convert_desc_pool,
+                                                   .descriptorSetCount = 1,
+                                                   .pSetLayouts = &detector->rgb_convert_desc_set_layout};
+    alloc_res = vkAllocateDescriptorSets(detector->dev->device, &rgb_alloc_info, &detector->rgb_convert_desc_set);
+    if (alloc_res != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to allocate RGBtoGray descriptor set");
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -595,6 +693,27 @@ static bool setupComputePipelines(vksift_SiftDetector detector)
     return false;
   }
   vkDestroyShaderModule(detector->dev->device, extractkpts_shader_module, NULL);
+
+  //////////////////////////////////////
+  // Setup ExtractKeypoints2D pipeline (2D spatial NMS, no refinement)
+  //////////////////////////////////////
+  VkShaderModule extractkpts_2d_shader_module;
+  if (!vkenv_createShaderModule(detector->dev->device, "shaders/ExtractKeypoints2D.comp.spv", &extractkpts_2d_shader_module))
+  {
+    logError(LOG_TAG, "Failed to create ExtractKeypoints2D shader module");
+    return false;
+  }
+  // Reuse the same pipeline layout as 3D (same push constants and descriptor sets)
+  VkPipelineLayout extractkpts_2d_layout_unused;
+  if (!vkenv_createComputePipeline(detector->dev->device, extractkpts_2d_shader_module, detector->extractkpts_desc_set_layout,
+                                   sizeof(ExtractKeypointsPushConsts), &extractkpts_2d_layout_unused, &detector->extractkpts_2d_pipeline))
+  {
+    logError(LOG_TAG, "Failed to create ExtractKeypoints2D pipeline");
+    vkDestroyShaderModule(detector->dev->device, extractkpts_2d_shader_module, NULL);
+    return false;
+  }
+  vkDestroyShaderModule(detector->dev->device, extractkpts_2d_shader_module, NULL);
+
   //////////////////////////////////////
   // Setup ComputeOrientation pipeline
   //////////////////////////////////////
@@ -634,6 +753,49 @@ static bool setupComputePipelines(vksift_SiftDetector detector)
     return false;
   }
   vkDestroyShaderModule(detector->dev->device, descriptor_shader_module, NULL);
+
+  //////////////////////////////////////
+  // Setup RGBAtoGray pipeline (only when use_rgba_input)
+  //////////////////////////////////////
+  if (detector->use_rgba_input)
+  {
+    VkShaderModule rgba_shader_module;
+    if (!vkenv_createShaderModule(detector->dev->device, "shaders/RGBAtoGray.comp.spv", &rgba_shader_module))
+    {
+      logError(LOG_TAG, "Failed to create RGBAtoGray shader module");
+      return false;
+    }
+    if (!vkenv_createComputePipeline(detector->dev->device, rgba_shader_module, detector->rgba_convert_desc_set_layout, 0,
+                                     &detector->rgba_convert_pipeline_layout, &detector->rgba_convert_pipeline))
+    {
+      logError(LOG_TAG, "Failed to create RGBAtoGray pipeline");
+      vkDestroyShaderModule(detector->dev->device, rgba_shader_module, NULL);
+      return false;
+    }
+    vkDestroyShaderModule(detector->dev->device, rgba_shader_module, NULL);
+  }
+
+  //////////////////////////////////////
+  // Setup RGBtoGray pipeline (only when use_rgb_input)
+  // Push constant: uint32_t image_width
+  //////////////////////////////////////
+  if (detector->use_rgb_input)
+  {
+    VkShaderModule rgb_shader_module;
+    if (!vkenv_createShaderModule(detector->dev->device, "shaders/RGBtoGray.comp.spv", &rgb_shader_module))
+    {
+      logError(LOG_TAG, "Failed to create RGBtoGray shader module");
+      return false;
+    }
+    if (!vkenv_createComputePipeline(detector->dev->device, rgb_shader_module, detector->rgb_convert_desc_set_layout, sizeof(uint32_t),
+                                     &detector->rgb_convert_pipeline_layout, &detector->rgb_convert_pipeline))
+    {
+      logError(LOG_TAG, "Failed to create RGBtoGray pipeline");
+      vkDestroyShaderModule(detector->dev->device, rgb_shader_module, NULL);
+      return false;
+    }
+    vkDestroyShaderModule(detector->dev->device, rgb_shader_module, NULL);
+  }
 
   return true;
 }
@@ -854,6 +1016,66 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
     vkUpdateDescriptorSets(detector->dev->device, 2, descriptor_writes, 0, NULL);
   }
 
+  /////////////////////////////////////////////////////
+  // Write sets for RGBAtoGray pipeline (only when use_rgba_input)
+  if (detector->use_rgba_input)
+  {
+    VkDescriptorImageInfo rgba_input_image_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->rgba_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo gray_output_image_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet rgba_descriptor_writes[2];
+    rgba_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                        .dstSet = detector->rgba_convert_desc_set,
+                                                        .dstBinding = 0,
+                                                        .dstArrayElement = 0,
+                                                        .descriptorCount = 1,
+                                                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                        .pImageInfo = &rgba_input_image_info,
+                                                        .pBufferInfo = NULL,
+                                                        .pTexelBufferView = NULL};
+    rgba_descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                        .dstSet = detector->rgba_convert_desc_set,
+                                                        .dstBinding = 1,
+                                                        .dstArrayElement = 0,
+                                                        .descriptorCount = 1,
+                                                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                        .pImageInfo = &gray_output_image_info,
+                                                        .pBufferInfo = NULL,
+                                                        .pTexelBufferView = NULL};
+    vkUpdateDescriptorSets(detector->dev->device, 2, rgba_descriptor_writes, 0, NULL);
+  }
+
+  /////////////////////////////////////////////////////
+  // Write sets for RGBtoGray pipeline (only when use_rgb_input)
+  if (detector->use_rgb_input)
+  {
+    VkDescriptorBufferInfo rgb_ssbo_info = {
+        .buffer = detector->mem->rgb_input_buffer, .offset = 0, .range = VK_WHOLE_SIZE};
+    VkDescriptorImageInfo rgb_gray_output_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet rgb_descriptor_writes[2];
+    rgb_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                       .dstSet = detector->rgb_convert_desc_set,
+                                                       .dstBinding = 0,
+                                                       .dstArrayElement = 0,
+                                                       .descriptorCount = 1,
+                                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                       .pImageInfo = NULL,
+                                                       .pBufferInfo = &rgb_ssbo_info,
+                                                       .pTexelBufferView = NULL};
+    rgb_descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                       .dstSet = detector->rgb_convert_desc_set,
+                                                       .dstBinding = 1,
+                                                       .dstArrayElement = 0,
+                                                       .descriptorCount = 1,
+                                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                       .pImageInfo = &rgb_gray_output_info,
+                                                       .pBufferInfo = NULL,
+                                                       .pTexelBufferView = NULL};
+    vkUpdateDescriptorSets(detector->dev->device, 2, rgb_descriptor_writes, 0, NULL);
+  }
+
   return true;
 }
 
@@ -863,29 +1085,127 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
   // Copy input image
   /////////////////////////////////////////////////
   beginMarkerRegion(detector, cmdbuf, "CopyInputImage");
-  // Setup input image layout and access for transfer
   VkImageMemoryBarrier image_barrier;
-  image_barrier = vkenv_genImageMemoryBarrier(
-      detector->mem->input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
-      VK_QUEUE_FAMILY_IGNORED,
-      (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
-  vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
-  // Copy from staging buffer to device only image command
-  VkBufferImageCopy buffer_image_region = {
-      .bufferOffset = 0,
-      .bufferRowLength = 0,
-      .bufferImageHeight = 0,
-      .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
-      .imageOffset = {.x = 0, .y = 0, .z = 0},
-      .imageExtent = {.width = detector->mem->curr_input_image_width, .height = detector->mem->curr_input_image_height, .depth = 1}};
-  vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                         &buffer_image_region);
-  // Setup input image layout and access for compute shaders
-  image_barrier = vkenv_genImageMemoryBarrier(
-      detector->mem->input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-      (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
-  vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
+
+  if (detector->use_rgba_input)
+  {
+    // RGBA path: copy staging → rgba_input_image, then compute shader → input_image
+    // Transition rgba_input_image for transfer write
+    image_barrier = vkenv_genImageMemoryBarrier(
+        detector->mem->rgba_input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
+
+    // Copy staging buffer to RGBA image
+    VkBufferImageCopy buffer_image_region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+        .imageOffset = {.x = 0, .y = 0, .z = 0},
+        .imageExtent = {.width = detector->mem->curr_input_image_width, .height = detector->mem->curr_input_image_height, .depth = 1}};
+    vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->rgba_input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &buffer_image_region);
+
+    // Transition rgba_input_image to GENERAL for compute read
+    image_barrier = vkenv_genImageMemoryBarrier(
+        detector->mem->rgba_input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
+
+    // Transition input_image (R8) to GENERAL for compute write
+    VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
+        detector->mem->input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &input_barrier);
+
+    // Dispatch RGBA→Gray compute shader
+    vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->rgba_convert_pipeline);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->rgba_convert_pipeline_layout, 0, 1,
+                            &detector->rgba_convert_desc_set, 0, NULL);
+    vkCmdDispatch(cmdbuf, (uint32_t)ceilf((float)detector->mem->curr_input_image_width / 8.f),
+                  (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
+
+    // Transition input_image from compute write to shader read (for scale-space blit)
+    image_barrier = vkenv_genImageMemoryBarrier(
+        detector->mem->input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
+  }
+  else if (detector->use_rgb_input)
+  {
+    // RGB path: copy staging → rgb_input_buffer (SSBO), then compute shader → input_image
+    uint32_t W = detector->mem->curr_input_image_width;
+    uint32_t H = detector->mem->curr_input_image_height;
+    VkDeviceSize rgb_size = 3 * (VkDeviceSize)W * H;
+
+    // Copy staging buffer → device-local RGB buffer
+    VkBufferCopy buf_copy = {.srcOffset = 0, .dstOffset = 0, .size = rgb_size};
+    vkCmdCopyBuffer(cmdbuf, detector->mem->image_staging_buffer, detector->mem->rgb_input_buffer, 1, &buf_copy);
+
+    // Barrier: transfer write to RGB buffer → shader read
+    VkBufferMemoryBarrier buf_barrier = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = detector->mem->rgb_input_buffer,
+        .offset = 0,
+        .size = VK_WHOLE_SIZE};
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &buf_barrier, 0, NULL);
+
+    // Transition input_image (R8) to GENERAL for compute write
+    VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
+        detector->mem->input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &input_barrier);
+
+    // Dispatch RGB→Gray compute shader with push constant for image width
+    vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->rgb_convert_pipeline);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->rgb_convert_pipeline_layout, 0, 1,
+                            &detector->rgb_convert_desc_set, 0, NULL);
+    vkCmdPushConstants(cmdbuf, detector->rgb_convert_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &W);
+    vkCmdDispatch(cmdbuf, (uint32_t)ceilf((float)W / 8.f), (uint32_t)ceilf((float)H / 8.f), 1);
+
+    // Transition input_image from compute write to shader read (for scale-space blit)
+    image_barrier = vkenv_genImageMemoryBarrier(
+        detector->mem->input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
+  }
+  else
+  {
+    // Grayscale path: copy staging → input_image directly (original code)
+    image_barrier = vkenv_genImageMemoryBarrier(
+        detector->mem->input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
+
+    VkBufferImageCopy buffer_image_region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+        .imageOffset = {.x = 0, .y = 0, .z = 0},
+        .imageExtent = {.width = detector->mem->curr_input_image_width, .height = detector->mem->curr_input_image_height, .depth = 1}};
+    vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &buffer_image_region);
+
+    image_barrier = vkenv_genImageMemoryBarrier(
+        detector->mem->input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
+  }
 
   endMarkerRegion(detector, cmdbuf);
 }
@@ -1127,7 +1447,8 @@ static void recExtractKeypointsCmds(vksift_SiftDetector detector, VkCommandBuffe
   vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, oct_count * 2, buffer_barriers, 0,
                        NULL);
 
-  vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->extractkpts_pipeline);
+  VkPipeline kpts_pipeline = detector->use_2d_nms ? detector->extractkpts_2d_pipeline : detector->extractkpts_pipeline;
+  vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, kpts_pipeline);
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
     ExtractKeypointsPushConsts pushconst;
@@ -1135,12 +1456,13 @@ static void recExtractKeypointsCmds(vksift_SiftDetector detector, VkCommandBuffe
     pushconst.seed_scale_sigma = detector->seed_scale_sigma;
     pushconst.dog_threshold = detector->intensity_threshold / detector->mem->nb_scales_per_octave;
     pushconst.edge_threshold = detector->edge_threshold;
-    // logError(LOG_TAG, "sigmul %f", pushconst.sigma_multiplier);
     vkCmdPushConstants(cmdbuf, detector->extractkpts_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ExtractKeypointsPushConsts), &pushconst);
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->extractkpts_pipeline_layout, 0, 1, &detector->extractkpts_desc_sets[oct_idx],
                             0, NULL);
+    // 2D NMS dispatches over all DoG scales; 3D dispatches over nb_scales_per_octave (interior only)
+    uint32_t z_dispatch = detector->use_2d_nms ? (detector->mem->nb_scales_per_octave + 2) : detector->mem->nb_scales_per_octave;
     vkCmdDispatch(cmdbuf, ceilf((float)(detector->mem->octave_resolutions[oct_idx].width) / 8.f),
-                  ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), detector->mem->nb_scales_per_octave);
+                  ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), z_dispatch);
   }
 
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
@@ -1382,11 +1704,15 @@ static bool recordCommandBuffers(vksift_SiftDetector detector)
 
   // Extract extrema (keypoints) from DoG images
   recExtractKeypointsCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
-  // For the main orientations of each keypoint (this creates new keypoints if there's more than one orientation)
-  recComputeOrientationsCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
 
-  // For each oriented keypoint compute its descriptor
-  recComputeDestriptorsCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
+  if (!detector->detection_only)
+  {
+    // For the main orientations of each keypoint (this creates new keypoints if there's more than one orientation)
+    recComputeOrientationsCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
+
+    // For each oriented keypoint compute its descriptor
+    recComputeDestriptorsCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
+  }
 
   // Copy the number of found keypoints to the sift_count staging buffer
   // (so that when the CPU want to download the result it can download only the number of SIFT found with a custom command buffer)
@@ -1439,6 +1765,10 @@ bool vksift_createSiftDetector(vkenv_Device device, vksift_SiftMemory memory, vk
   detector->edge_threshold = config->edge_threshold;
   detector->max_nb_orientations = config->max_nb_orientation_per_keypoint;
   detector->use_vlfeat_format = config->descriptor_format == VKSIFT_DESCRIPTOR_FORMAT_VLFEAT ? 1u : 0u;
+  detector->detection_only = config->detection_only;
+  detector->use_2d_nms = config->use_2d_nms;
+  detector->use_rgba_input = config->use_rgba_input;
+  detector->use_rgb_input = config->use_rgb_input;
 
   detector->curr_buffer_idx = 0u; // Default target buffer is 0 (always available)
 
@@ -1579,6 +1909,7 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   VK_NULL_SAFE_DELETE(detector->dog_desc_set_layout, vkDestroyDescriptorSetLayout(detector->dev->device, detector->dog_desc_set_layout, NULL));
   // Extract keypoints
   VK_NULL_SAFE_DELETE(detector->extractkpts_pipeline, vkDestroyPipeline(detector->dev->device, detector->extractkpts_pipeline, NULL));
+  VK_NULL_SAFE_DELETE(detector->extractkpts_2d_pipeline, vkDestroyPipeline(detector->dev->device, detector->extractkpts_2d_pipeline, NULL));
   VK_NULL_SAFE_DELETE(detector->extractkpts_pipeline_layout, vkDestroyPipelineLayout(detector->dev->device, detector->extractkpts_pipeline_layout, NULL));
   VK_NULL_SAFE_DELETE(detector->extractkpts_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->extractkpts_desc_pool, NULL));
   VK_NULL_SAFE_DELETE(detector->extractkpts_desc_set_layout,
@@ -1595,6 +1926,26 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   VK_NULL_SAFE_DELETE(detector->descriptor_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->descriptor_desc_pool, NULL));
   VK_NULL_SAFE_DELETE(detector->descriptor_desc_set_layout,
                       vkDestroyDescriptorSetLayout(detector->dev->device, detector->descriptor_desc_set_layout, NULL));
+  // RGBA→Gray conversion
+  if (detector->use_rgba_input)
+  {
+    VK_NULL_SAFE_DELETE(detector->rgba_convert_pipeline, vkDestroyPipeline(detector->dev->device, detector->rgba_convert_pipeline, NULL));
+    VK_NULL_SAFE_DELETE(detector->rgba_convert_pipeline_layout,
+                        vkDestroyPipelineLayout(detector->dev->device, detector->rgba_convert_pipeline_layout, NULL));
+    VK_NULL_SAFE_DELETE(detector->rgba_convert_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->rgba_convert_desc_pool, NULL));
+    VK_NULL_SAFE_DELETE(detector->rgba_convert_desc_set_layout,
+                        vkDestroyDescriptorSetLayout(detector->dev->device, detector->rgba_convert_desc_set_layout, NULL));
+  }
+  // RGB→Gray conversion
+  if (detector->use_rgb_input)
+  {
+    VK_NULL_SAFE_DELETE(detector->rgb_convert_pipeline, vkDestroyPipeline(detector->dev->device, detector->rgb_convert_pipeline, NULL));
+    VK_NULL_SAFE_DELETE(detector->rgb_convert_pipeline_layout,
+                        vkDestroyPipelineLayout(detector->dev->device, detector->rgb_convert_pipeline_layout, NULL));
+    VK_NULL_SAFE_DELETE(detector->rgb_convert_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->rgb_convert_desc_pool, NULL));
+    VK_NULL_SAFE_DELETE(detector->rgb_convert_desc_set_layout,
+                        vkDestroyDescriptorSetLayout(detector->dev->device, detector->rgb_convert_desc_set_layout, NULL));
+  }
 
   // Free descriptor arrays
   VK_NULL_SAFE_DELETE(detector->gaussian_kernels, free(detector->gaussian_kernels));

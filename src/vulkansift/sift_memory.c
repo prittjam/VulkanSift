@@ -180,6 +180,80 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
     return false;
   }
 
+  // Create RGBA input image if using RGBA input mode
+  if (memory->use_rgba_input)
+  {
+    res = true;
+    res = res && vkenv_createImage(&memory->rgba_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
+                                   (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
+                                   VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE,
+                                   0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+
+    if (is_init)
+    {
+      res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height, &memory_requirement, 0,
+                                                    VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+    else if (res)
+    {
+      vkGetImageMemoryRequirements(memory->device->device, memory->rgba_input_image, &memory_requirement);
+    }
+
+    if (memory_requirement.size > memory->rgba_input_image_memory_size)
+    {
+      VK_NULL_SAFE_DELETE(memory->rgba_input_image_memory, vkFreeMemory(memory->device->device, memory->rgba_input_image_memory, NULL));
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->rgba_input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+      memory->rgba_input_image_memory_size = memory_requirement.size;
+    }
+    res = res && vkenv_bindImageMemory(memory->device, memory->rgba_input_image, memory->rgba_input_image_memory, 0u);
+    res = res && vkenv_createImageView(&memory->rgba_input_image_view, memory->device, 0, memory->rgba_input_image, VK_IMAGE_VIEW_TYPE_2D,
+                                       VK_FORMAT_R8G8B8A8_UNORM, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    if (!res)
+    {
+      logError(LOG_TAG, "An error occured when setting up the RGBA input image");
+      return false;
+    }
+  }
+
+  // Create RGB input buffer if using RGB input mode (SSBO-based)
+  if (memory->use_rgb_input)
+  {
+    VkDeviceSize rgb_buf_size = 3 * (VkDeviceSize)memory->curr_input_image_width * memory->curr_input_image_height;
+    // Round up to 4 bytes for uint32 alignment in shader
+    rgb_buf_size = (rgb_buf_size + 3u) & ~3u;
+
+    if (rgb_buf_size > memory->rgb_input_buffer_size)
+    {
+      VK_NULL_SAFE_DELETE(memory->rgb_input_buffer, vkDestroyBuffer(memory->device->device, memory->rgb_input_buffer, NULL));
+      VK_NULL_SAFE_DELETE(memory->rgb_input_buffer_memory, vkFreeMemory(memory->device->device, memory->rgb_input_buffer_memory, NULL));
+
+      res = true;
+      res = res && vkenv_createBuffer(&memory->rgb_input_buffer, memory->device, 0, rgb_buf_size,
+                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+      if (res)
+      {
+        vkGetBufferMemoryRequirements(memory->device->device, memory->rgb_input_buffer, &memory_requirement);
+      }
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement,
+                                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->rgb_input_buffer_memory, memory->device, memory_requirement.size, memory_type_idx);
+      res = res && vkenv_bindBufferMemory(memory->device, memory->rgb_input_buffer, memory->rgb_input_buffer_memory, 0u);
+      memory->rgb_input_buffer_size = rgb_buf_size;
+
+      if (!res)
+      {
+        logError(LOG_TAG, "An error occured when setting up the RGB input buffer");
+        return false;
+      }
+    }
+  }
+
   // Create blur temp result images (one per octave)
   res = true;
   for (uint32_t oct_idx = 0; oct_idx < memory->curr_nb_octaves; oct_idx++)
@@ -370,8 +444,25 @@ bool setupStaticObjectsAndMemory(vksift_SiftMemory memory)
 
   // Create image staging buffer and memory for the input and output images of max size
   // The biggest output images will be the float32 scale image of the largest octave (potential upsampling)
+  // When using RGBA input, we also need 4 bytes per pixel for the full input image
   res = true;
   VkDeviceSize image_staging_size = 4 * (memory->octave_resolutions[0].width * memory->octave_resolutions[0].height);
+  if (memory->use_rgba_input)
+  {
+    VkDeviceSize rgba_staging_size = 4 * (VkDeviceSize)memory->max_image_size;
+    if (rgba_staging_size > image_staging_size)
+    {
+      image_staging_size = rgba_staging_size;
+    }
+  }
+  if (memory->use_rgb_input)
+  {
+    VkDeviceSize rgb_staging_size = 3 * (VkDeviceSize)memory->max_image_size;
+    if (rgb_staging_size > image_staging_size)
+    {
+      image_staging_size = rgb_staging_size;
+    }
+  }
   res = res && vkenv_createBuffer(&memory->image_staging_buffer, memory->device, 0, image_staging_size,
                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
   if (res)
@@ -639,6 +730,8 @@ bool vksift_createSiftMemory(vkenv_Device device, vksift_SiftMemory *memory_ptr,
   memory->max_nb_sift_per_buffer = config->max_nb_sift_per_buffer;
   memory->pyr_precision_mode = config->pyramid_precision_mode;
   memory->use_upsampling = config->use_input_upsampling;
+  memory->use_rgba_input = config->use_rgba_input;
+  memory->use_rgb_input = config->use_rgb_input;
 
   // Define default input image width/height from configuration
   memory->curr_input_image_width = ceilf(sqrtf((float)memory->max_image_size));
@@ -843,6 +936,17 @@ void vksift_destroySiftMemory(vksift_SiftMemory *memory_ptr)
   }
   VK_NULL_SAFE_DELETE(memory->input_image_view, vkDestroyImageView(memory->device->device, memory->input_image_view, NULL));
   VK_NULL_SAFE_DELETE(memory->input_image, vkDestroyImage(memory->device->device, memory->input_image, NULL));
+  if (memory->use_rgba_input)
+  {
+    VK_NULL_SAFE_DELETE(memory->rgba_input_image_view, vkDestroyImageView(memory->device->device, memory->rgba_input_image_view, NULL));
+    VK_NULL_SAFE_DELETE(memory->rgba_input_image, vkDestroyImage(memory->device->device, memory->rgba_input_image, NULL));
+    VK_NULL_SAFE_DELETE(memory->rgba_input_image_memory, vkFreeMemory(memory->device->device, memory->rgba_input_image_memory, NULL));
+  }
+  if (memory->use_rgb_input)
+  {
+    VK_NULL_SAFE_DELETE(memory->rgb_input_buffer, vkDestroyBuffer(memory->device->device, memory->rgb_input_buffer, NULL));
+    VK_NULL_SAFE_DELETE(memory->rgb_input_buffer_memory, vkFreeMemory(memory->device->device, memory->rgb_input_buffer_memory, NULL));
+  }
   VK_NULL_SAFE_DELETE(memory->output_image, vkDestroyImage(memory->device->device, memory->output_image, NULL));
   VK_NULL_SAFE_DELETE(memory->input_image_memory, vkFreeMemory(memory->device->device, memory->input_image_memory, NULL));
   VK_NULL_SAFE_DELETE(memory->output_image_memory, vkFreeMemory(memory->device->device, memory->output_image_memory, NULL));
@@ -901,6 +1005,17 @@ bool vksift_prepareSiftMemoryForDetection(vksift_SiftMemory memory, const uint8_
     // (to avoid extremely slow memory reallocation)
     VK_NULL_SAFE_DELETE(memory->input_image_view, vkDestroyImageView(memory->device->device, memory->input_image_view, NULL));
     VK_NULL_SAFE_DELETE(memory->input_image, vkDestroyImage(memory->device->device, memory->input_image, NULL));
+    if (memory->use_rgba_input)
+    {
+      VK_NULL_SAFE_DELETE(memory->rgba_input_image_view, vkDestroyImageView(memory->device->device, memory->rgba_input_image_view, NULL));
+      VK_NULL_SAFE_DELETE(memory->rgba_input_image, vkDestroyImage(memory->device->device, memory->rgba_input_image, NULL));
+    }
+    if (memory->use_rgb_input)
+    {
+      VK_NULL_SAFE_DELETE(memory->rgb_input_buffer, vkDestroyBuffer(memory->device->device, memory->rgb_input_buffer, NULL));
+      VK_NULL_SAFE_DELETE(memory->rgb_input_buffer_memory, vkFreeMemory(memory->device->device, memory->rgb_input_buffer_memory, NULL));
+      memory->rgb_input_buffer_size = 0;
+    }
     for (uint32_t oct_idx = 0; oct_idx < memory->max_nb_octaves; oct_idx++)
     {
       VK_NULL_SAFE_DELETE(memory->blur_tmp_image_view_arr[oct_idx],
@@ -940,7 +1055,18 @@ bool vksift_prepareSiftMemoryForDetection(vksift_SiftMemory memory, const uint8_
     return false;
   }
 
-  memcpy(memory->image_staging_buffer_ptr, image_data, sizeof(uint8_t) * input_width * input_height);
+  if (memory->use_rgba_input)
+  {
+    memcpy(memory->image_staging_buffer_ptr, image_data, 4 * input_width * input_height);
+  }
+  else if (memory->use_rgb_input)
+  {
+    memcpy(memory->image_staging_buffer_ptr, image_data, 3 * input_width * input_height);
+  }
+  else
+  {
+    memcpy(memory->image_staging_buffer_ptr, image_data, sizeof(uint8_t) * input_width * input_height);
+  }
 
   if (vkFlushMappedMemoryRanges(memory->device->device, 1, &memory_range) != VK_SUCCESS)
   {

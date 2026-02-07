@@ -1,0 +1,56 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Push constant: image width so we can compute pixel index from 2D coords
+layout(push_constant) uniform PushConstants {
+    uint image_width;
+} pc;
+
+// RGB input as packed bytes in a storage buffer (3 bytes per pixel)
+layout(std430, set = 0, binding = 0) readonly buffer RGBInput {
+    uint data[];
+} rgb_input;
+
+// Grayscale output as R8 image
+layout(r8, set = 0, binding = 1) uniform writeonly image2D gray_output;
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 img_size = imageSize(gray_output);
+    if (coords.x >= img_size.x || coords.y >= img_size.y) return;
+
+    // Compute byte offset for this pixel: pixel_idx * 3
+    uint pixel_idx = uint(coords.y) * pc.image_width + uint(coords.x);
+    uint byte_offset = pixel_idx * 3u;
+
+    // Read RGB bytes from packed uint32 buffer
+    // Each uint32 holds 4 bytes; we need 3 consecutive bytes starting at byte_offset
+    uint word_idx = byte_offset >> 2u;   // byte_offset / 4
+    uint byte_in_word = byte_offset & 3u; // byte_offset % 4
+
+    uint word0 = rgb_input.data[word_idx];
+    uint r, g, b;
+
+    if (byte_in_word <= 1u) {
+        // All 3 bytes fit in word0
+        r = (word0 >> (byte_in_word * 8u)) & 0xFFu;
+        g = (word0 >> ((byte_in_word + 1u) * 8u)) & 0xFFu;
+        b = (word0 >> ((byte_in_word + 2u) * 8u)) & 0xFFu;
+    } else if (byte_in_word == 2u) {
+        // R and G in word0, B in word1
+        r = (word0 >> 16u) & 0xFFu;
+        g = (word0 >> 24u) & 0xFFu;
+        uint word1 = rgb_input.data[word_idx + 1u];
+        b = word1 & 0xFFu;
+    } else {
+        // byte_in_word == 3: R in word0, G and B in word1
+        r = (word0 >> 24u) & 0xFFu;
+        uint word1 = rgb_input.data[word_idx + 1u];
+        g = word1 & 0xFFu;
+        b = (word1 >> 8u) & 0xFFu;
+    }
+
+    // ITU-R BT.601 luminance (matches C wrapper: 77/256, 150/256, 29/256)
+    float gray = (float(r) * 0.299 + float(g) * 0.587 + float(b) * 0.114) / 255.0;
+    imageStore(gray_output, coords, vec4(gray, 0.0, 0.0, 1.0));
+}

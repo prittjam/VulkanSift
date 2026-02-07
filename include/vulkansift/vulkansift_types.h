@@ -134,6 +134,19 @@ extern "C"
     // (default: VKSIFT_DESCRIPTOR_FORMAT_UBC)
     vksift_DescriptorFormat descriptor_format;
 
+    // If true, skip orientation assignment and descriptor computation. Only detect keypoints.
+    // Useful when only keypoint locations and scores are needed. (default: false)
+    bool detection_only;
+    // If true, use 2D spatial NMS (8 neighbors per scale) instead of 3D NMS (26 neighbors across 3 scales).
+    // No subpixel refinement is performed in 2D mode. (default: false)
+    bool use_2d_nms;
+    // If true, detectFeatures expects RGBA data (4 bytes/pixel) instead of grayscale (1 byte/pixel).
+    // The RGBA→Gray conversion is performed on the GPU via a compute shader. (default: false)
+    bool use_rgba_input;
+    // If true, detectFeatures expects RGB data (3 bytes/pixel) instead of grayscale (1 byte/pixel).
+    // The RGB→Gray conversion is performed on the GPU via a compute shader. (default: false)
+    bool use_rgb_input;
+
     // GPU and implementation configuration
 
     // Define the GPU used by the Instance. For a given GPU, the device index should the same as its corresponding name index when retrieved

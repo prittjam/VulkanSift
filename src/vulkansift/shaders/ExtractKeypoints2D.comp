@@ -1,0 +1,121 @@
+#version 450
+
+// 2D NMS: spatial-only extrema detection (no cross-scale comparison).
+// No subpixel refinement. Edge suppression via Hessian ratio test.
+
+#define NB_HIST 4
+#define NB_ORI 8
+
+struct SIFT_Feat {
+  float x;
+  float y;
+  float scale_x;
+  float scale_y;
+  uint scale_idx;
+  int octave_idx;
+  float sigma;
+  float orientation;
+  float intensity;
+  uint descriptor[(NB_HIST*NB_HIST*NB_ORI)/4];
+};
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(r32f, binding = 0) uniform image2DArray dog_input;
+layout(std430, binding = 1) buffer SIFT_buffer {
+    uint nb_elem;
+    uint max_nb_feat;
+    SIFT_Feat data[];
+};
+layout(std430, binding = 2) buffer IndispatchBuffer {
+    uint nb_x_group;
+    uint nb_y_group;
+    uint nb_z_group;
+};
+
+layout(push_constant) uniform PushConst {
+  int octave_idx;
+  float seed_scale_sigma;
+  float dog_threshold;
+  float edge_threshold;
+} push_const;
+
+
+float getVal(int scale_idx, int x, int y) {
+    return imageLoad(dog_input, ivec3(x, y, scale_idx)).r;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    int s = int(gl_GlobalInvocationID.z);
+
+    int image_width = imageSize(dog_input).x;
+    int image_height = imageSize(dog_input).y;
+    int nb_scales = imageSize(dog_input).z;
+
+    // Process all DoG scales except the last (VLFeat convention)
+    int nb_scales_per_octave = nb_scales - 2;  // DoG has nb_scales_per_octave + 2 levels
+    if(x >= 1 && x < (image_width-1) && y >= 1 && y < (image_height-1) && s < (nb_scales - 1)) {
+
+        float center_value = getVal(s, x, y);
+        float abs_val = abs(center_value);
+
+        // Threshold check
+        bool is_extremum = abs_val > (push_const.dog_threshold * 0.8f);
+
+        if(is_extremum) {
+            // 2D spatial NMS: check 8 neighbors in same scale only
+            bool is_max =
+                center_value > getVal(s, x-1, y-1) &&
+                center_value > getVal(s, x,   y-1) &&
+                center_value > getVal(s, x+1, y-1) &&
+                center_value > getVal(s, x-1, y)   &&
+                center_value > getVal(s, x+1, y)   &&
+                center_value > getVal(s, x-1, y+1) &&
+                center_value > getVal(s, x,   y+1) &&
+                center_value > getVal(s, x+1, y+1);
+
+            bool is_min =
+                center_value < getVal(s, x-1, y-1) &&
+                center_value < getVal(s, x,   y-1) &&
+                center_value < getVal(s, x+1, y-1) &&
+                center_value < getVal(s, x-1, y)   &&
+                center_value < getVal(s, x+1, y)   &&
+                center_value < getVal(s, x-1, y+1) &&
+                center_value < getVal(s, x,   y+1) &&
+                center_value < getVal(s, x+1, y+1);
+
+            if(is_max || is_min) {
+                // Edge suppression: Hessian ratio test (no refinement)
+                if(abs_val > push_const.dog_threshold) {
+                    float h11 = getVal(s, x+1, y) + getVal(s, x-1, y) - 2.f * center_value;
+                    float h22 = getVal(s, x, y+1) + getVal(s, x, y-1) - 2.f * center_value;
+                    float h12 = 0.25f * (getVal(s, x+1, y+1) - getVal(s, x+1, y-1) -
+                                         getVal(s, x-1, y+1) + getVal(s, x-1, y-1));
+
+                    float det = h11 * h22 - h12 * h12;
+                    float trace = h11 + h22;
+                    float edgeness = (trace * trace) / det;
+
+                    if(edgeness < (pow(push_const.edge_threshold + 1, 2.0f) / push_const.edge_threshold) && edgeness >= 0) {
+                        uint idx = atomicAdd(nb_elem, 1);
+                        if(idx < max_nb_feat) {
+                            atomicAdd(nb_x_group, 1);
+
+                            float scale_factor = pow(2.f, push_const.octave_idx);
+                            data[idx].scale_x = float(x);
+                            data[idx].scale_y = float(y);
+                            data[idx].scale_idx = uint(s);
+                            data[idx].octave_idx = push_const.octave_idx;
+                            data[idx].sigma = push_const.seed_scale_sigma * pow(2.f, float(s)/float(nb_scales_per_octave)) * scale_factor;
+                            data[idx].orientation = 0.f;
+                            data[idx].intensity = center_value;
+                            data[idx].x = float(x) * scale_factor;
+                            data[idx].y = float(y) * scale_factor;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

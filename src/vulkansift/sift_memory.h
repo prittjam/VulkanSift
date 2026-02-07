@@ -61,6 +61,20 @@ typedef struct vksift_SiftMemory_T
   VkDeviceMemory input_image_memory;
   VkDeviceSize input_image_memory_size;
 
+  // RGBA input image (only allocated when use_rgba_input=true)
+  VkImage rgba_input_image;
+  VkImageView rgba_input_image_view;
+  VkDeviceMemory rgba_input_image_memory;
+  VkDeviceSize rgba_input_image_memory_size;
+  bool use_rgba_input;
+
+  // RGB input buffer (only allocated when use_rgb_input=true)
+  // Uses SSBO since VK_FORMAT_R8G8B8_UNORM has poor storage image support
+  VkBuffer rgb_input_buffer;
+  VkDeviceMemory rgb_input_buffer_memory;
+  VkDeviceSize rgb_input_buffer_size;
+  bool use_rgb_input;
+
   VkImage output_image; // output image is used to export scalespace images to the CPU for debug/viz
   VkDeviceMemory output_image_memory;
 
