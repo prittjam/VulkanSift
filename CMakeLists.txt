@@ -11,9 +11,20 @@ endif()
 
 #####################################################################################
 # Find the Vulkan SDK
-if(NOT CMAKE_VERSION VERSION_LESS 3.7.0) #if FindCmake is available
-    find_package(Vulkan REQUIRED)
-elseif(DEFINED ENV{VULKAN_SDK}) # if VULKAN_SDK in the path
+# With VULKANSIFT_LOAD_VK_AT_RUNTIME=ON (default), only headers are needed —
+# volk loads libvulkan at runtime via dlopen. This allows building in
+# environments that have headers but no Vulkan library (e.g. BinaryBuilder).
+if(NOT CMAKE_VERSION VERSION_LESS 3.7.0)
+    find_package(Vulkan QUIET)
+    if(NOT Vulkan_FOUND)
+        # Headers-only fallback: find vulkan/vulkan.h without requiring the library
+        find_path(Vulkan_INCLUDE_DIRS "vulkan/vulkan.h")
+        if(NOT Vulkan_INCLUDE_DIRS)
+            message(FATAL_ERROR "Could not find Vulkan headers (vulkan/vulkan.h)")
+        endif()
+        message(STATUS "Vulkan headers found at ${Vulkan_INCLUDE_DIRS} (no library)")
+    endif()
+elseif(DEFINED ENV{VULKAN_SDK})
     set(Vulkan_INCLUDE_DIRS "$ENV{VULKAN_SDK}/include")
     find_library(Vulkan_LIBRARY NAMES vulkan-1 vulkan PATHS "$ENV{VULKAN_SDK}/lib")
 else()
@@ -148,10 +159,33 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
     target_compile_definitions(vulkansift PRIVATE VK_USE_PLATFORM_METAL_EXT=1)
 endif()
 
-# Add dependencies on shader files
-include("cmake/ShaderUtils.cmake")
-addEmbeddedSpvShaderDependency(vulkansift "${VULKANSIFT_LIB_SHADERS}" ${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_shader_provider.c)
+# Embedded shaders: use pre-built file if available, otherwise compile from source
+set(PREBUILT_SHADERS "${CMAKE_CURRENT_SOURCE_DIR}/generated/embedded_shader_provider.c")
+if(EXISTS "${PREBUILT_SHADERS}")
+    message(STATUS "Using pre-built embedded shaders")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    configure_file("${PREBUILT_SHADERS}"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_shader_provider.c" COPYONLY)
+else()
+    message(STATUS "Compiling shaders from source (requires glslc + Python)")
+    include("cmake/ShaderUtils.cmake")
+    addEmbeddedSpvShaderDependency(vulkansift "${VULKANSIFT_LIB_SHADERS}"
+        ${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_shader_provider.c)
+endif()
 target_compile_definitions(vulkansift PRIVATE VKENV_USE_EMBEDDED_SHADERS=1)
+
+#####################################################################################
+# Julia wrapper shared library (detection-only C API)
+option(VULKANSIFT_BUILD_JL_WRAPPER "Build libvksift_jl shared library for Julia" ON)
+
+if(VULKANSIFT_BUILD_JL_WRAPPER)
+    add_library(vksift_jl SHARED vksift_jl.c)
+    target_link_libraries(vksift_jl vulkansift)
+    target_include_directories(vksift_jl PRIVATE ${PROJECT_SOURCE_DIR}/include/)
+    # Use default visibility (not -fvisibility=hidden) so all functions are exported
+    target_compile_options(vksift_jl PRIVATE -Wall -O3 $<$<CONFIG:Debug>:-g>)
+    install(TARGETS vksift_jl LIBRARY DESTINATION lib)
+endif()
 
 #####################################################################################
 ##########################################################################

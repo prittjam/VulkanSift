@@ -138,3 +138,26 @@ void vksift_jl_destroy(vksift_jl_handle h)
     vksift_unloadVulkan();
     free(h);
 }
+
+uint8_t vksift_jl_get_nb_octaves(vksift_jl_handle h)
+{
+    return vksift_getScaleSpaceNbOctaves(h->instance);
+}
+
+void vksift_jl_get_octave_resolution(vksift_jl_handle h,
+    uint8_t octave, uint32_t* width, uint32_t* height)
+{
+    vksift_getScaleSpaceOctaveResolution(h->instance, octave, width, height);
+}
+
+void vksift_jl_download_scalespace_image(vksift_jl_handle h,
+    uint8_t octave, uint8_t scale, float* out)
+{
+    vksift_downloadScaleSpaceImage(h->instance, octave, scale, out);
+}
+
+void vksift_jl_download_dog_image(vksift_jl_handle h,
+    uint8_t octave, uint8_t scale, float* out)
+{
+    vksift_downloadDoGImage(h->instance, octave, scale, out);
+}

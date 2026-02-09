@@ -53,6 +53,24 @@ void vksift_jl_get_features(vksift_jl_handle h,
 // Destroy context and free GPU resources.
 void vksift_jl_destroy(vksift_jl_handle h);
 
+// Scale-space access (call after detect)
+
+// Return number of octaves in the pyramid.
+uint8_t vksift_jl_get_nb_octaves(vksift_jl_handle h);
+
+// Return the image resolution for a given octave.
+void vksift_jl_get_octave_resolution(vksift_jl_handle h,
+    uint8_t octave, uint32_t* width, uint32_t* height);
+
+// Download the Gaussian-smoothed image at (octave, scale) into a float buffer.
+// Buffer must hold width*height floats (from vksift_jl_get_octave_resolution).
+void vksift_jl_download_scalespace_image(vksift_jl_handle h,
+    uint8_t octave, uint8_t scale, float* out);
+
+// Download the DoG image at (octave, scale) into a float buffer.
+void vksift_jl_download_dog_image(vksift_jl_handle h,
+    uint8_t octave, uint8_t scale, float* out);
+
 #ifdef __cplusplus
 }
 #endif
