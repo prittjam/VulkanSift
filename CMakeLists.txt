@@ -156,6 +156,41 @@ target_compile_definitions(vulkansift PRIVATE VKENV_USE_EMBEDDED_SHADERS=1)
 
 #####################################################################################
 ##########################################################################
+# Standalone shader test (pure C, no OpenCV dependency) — always built.
+# Re-compile the vkenv helpers into the test because libvulkansift hides them
+# (-fvisibility=hidden); only the public vksift_* surface is exported.
+set(TEST_AFFINE_WARP_SRCS
+    src/examples/test_affine_warp.c
+    src/vulkansift/vkenv/vulkan_device.c
+    src/vulkansift/vkenv/vulkan_utils.c
+    src/vulkansift/vkenv/logger.c)
+if(VULKANSIFT_LOAD_VK_AT_RUNTIME)
+    list(APPEND TEST_AFFINE_WARP_SRCS src/thirdparty/volk/volk.c)
+endif()
+add_executable(test_affine_warp ${TEST_AFFINE_WARP_SRCS})
+target_include_directories(test_affine_warp PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/
+    ${PROJECT_SOURCE_DIR}/src/thirdparty/
+    ${Vulkan_INCLUDE_DIRS})
+if(VULKANSIFT_LOAD_VK_AT_RUNTIME)
+    target_compile_definitions(test_affine_warp PRIVATE VK_NO_PROTOTYPES=1)
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+        target_link_libraries(test_affine_warp dl)
+    endif()
+else()
+    target_link_libraries(test_affine_warp ${Vulkan_LIBRARY})
+endif()
+# Reuse the same embedded shader provider the main library uses
+target_compile_definitions(test_affine_warp PRIVATE VKENV_USE_EMBEDDED_SHADERS=1)
+target_sources(test_affine_warp PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_shader_provider.c)
+add_dependencies(test_affine_warp vulkansift_embedded_shaders)
+target_link_libraries(test_affine_warp m)
+target_compile_options(test_affine_warp PRIVATE "${VULKANSIFT_COMPILER_OPTIONS}")
+set_property(TARGET test_affine_warp APPEND_STRING PROPERTY LINK_FLAGS " ${VULKANSIFT_LINKER_OPTIONS}")
+
+#####################################################################################
+##########################################################################
 # Example and perf executables
 
 if(VULKANSIFT_BUILD_EXAMPLES)
