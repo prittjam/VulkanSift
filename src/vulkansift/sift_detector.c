@@ -26,6 +26,21 @@ typedef struct
   float edge_threshold;
 } ExtractKeypointsPushConsts;
 
+// Mirrors AffineWarp.comp's push_constant layout. Order matters:
+// uint, uint, 7×float = 36 bytes total.
+typedef struct
+{
+  uint32_t output_width;
+  uint32_t output_height;
+  float    a11;
+  float    a12;
+  float    a13;
+  float    a21;
+  float    a22;
+  float    a23;
+  float    fill_value;
+} AffineWarpPushConsts;
+
 static void getGPUDebugMarkerFuncs(vksift_SiftDetector detector)
 {
   detector->vkCmdDebugMarkerBeginEXT = (PFN_vkCmdDebugMarkerBeginEXT)vkGetDeviceProcAddr(detector->dev->device, "vkCmdDebugMarkerBeginEXT");
@@ -245,6 +260,53 @@ static VkDescriptorSetLayout *allocMultLayoutCopy(VkDescriptorSetLayout layout, 
 static bool prepareDescriptorSets(vksift_SiftDetector detector)
 {
   VkResult alloc_res;
+  ///////////////////////////////////////////////////
+  // Descriptors for AffineWarp pipeline (ASIFT batch path)
+  // binding 0 = sampler2D (input image), binding 1 = image2D r32f (warped output)
+  ///////////////////////////////////////////////////
+  {
+    VkDescriptorSetLayoutBinding aw_in = {.binding = 0,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                          .descriptorCount = 1,
+                                          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                          .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding aw_out = {.binding = 1,
+                                           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                           .descriptorCount = 1,
+                                           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                           .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding aw_bindings[2] = {aw_in, aw_out};
+    VkDescriptorSetLayoutCreateInfo aw_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = aw_bindings};
+    if (vkCreateDescriptorSetLayout(detector->dev->device, &aw_layout_info, NULL, &detector->affinewarp_desc_set_layout) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create AffineWarp descriptor set layout");
+      return false;
+    }
+    VkDescriptorPoolSize aw_pool_sizes[2] = {
+        {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1}};
+    VkDescriptorPoolCreateInfo aw_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = aw_pool_sizes};
+    if (vkCreateDescriptorPool(detector->dev->device, &aw_pool_info, NULL, &detector->affinewarp_desc_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create AffineWarp descriptor pool");
+      return false;
+    }
+    VkDescriptorSetAllocateInfo aw_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                 .descriptorPool = detector->affinewarp_desc_pool,
+                                                 .descriptorSetCount = 1,
+                                                 .pSetLayouts = &detector->affinewarp_desc_set_layout};
+    if (vkAllocateDescriptorSets(detector->dev->device, &aw_alloc_info, &detector->affinewarp_desc_set) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to allocate AffineWarp descriptor set");
+      return false;
+    }
+    // Image-view bindings (input_image as sampler source, warped_input_image as
+    // storage output) are wired up by updateDynamicDescriptorSets in the
+    // detect-dispatch path so they track allocation-on-resize.
+  }
+
   ///////////////////////////////////////////////////
   // Descriptors for GaussianBlur pipeline
   ///////////////////////////////////////////////////
@@ -632,6 +694,26 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
 
 static bool setupComputePipelines(vksift_SiftDetector detector)
 {
+  //////////////////////////////////////
+  // Setup AffineWarp pipeline (ASIFT batch path)
+  //////////////////////////////////////
+  {
+    VkShaderModule aw_shader_module;
+    if (!vkenv_createShaderModule(detector->dev->device, "shaders/AffineWarp.comp.spv", &aw_shader_module))
+    {
+      logError(LOG_TAG, "Failed to create AffineWarp shader module");
+      return false;
+    }
+    if (!vkenv_createComputePipeline(detector->dev->device, aw_shader_module, detector->affinewarp_desc_set_layout, sizeof(AffineWarpPushConsts),
+                                     &detector->affinewarp_pipeline_layout, &detector->affinewarp_pipeline))
+    {
+      logError(LOG_TAG, "Failed to create AffineWarp pipeline");
+      vkDestroyShaderModule(detector->dev->device, aw_shader_module, NULL);
+      return false;
+    }
+    vkDestroyShaderModule(detector->dev->device, aw_shader_module, NULL);
+  }
+
   //////////////////////////////////////
   // Setup GaussianBlur pipeline
   //////////////////////////////////////
@@ -1897,6 +1979,12 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   }
 
   // Destroy pipelines and descriptors
+  // Affine warp (ASIFT batch path)
+  VK_NULL_SAFE_DELETE(detector->affinewarp_pipeline, vkDestroyPipeline(detector->dev->device, detector->affinewarp_pipeline, NULL));
+  VK_NULL_SAFE_DELETE(detector->affinewarp_pipeline_layout, vkDestroyPipelineLayout(detector->dev->device, detector->affinewarp_pipeline_layout, NULL));
+  VK_NULL_SAFE_DELETE(detector->affinewarp_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->affinewarp_desc_pool, NULL));
+  VK_NULL_SAFE_DELETE(detector->affinewarp_desc_set_layout,
+                      vkDestroyDescriptorSetLayout(detector->dev->device, detector->affinewarp_desc_set_layout, NULL));
   // Gaussian blur
   VK_NULL_SAFE_DELETE(detector->blur_pipeline, vkDestroyPipeline(detector->dev->device, detector->blur_pipeline, NULL));
   VK_NULL_SAFE_DELETE(detector->blur_pipeline_layout, vkDestroyPipelineLayout(detector->dev->device, detector->blur_pipeline_layout, NULL));

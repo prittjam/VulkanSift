@@ -142,19 +142,23 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
   VkMemoryRequirements memory_requirement;
   uint32_t memory_type_idx;
 
-  // Create input image and image view
+  // Create input image and image view.
+  // SAMPLED_BIT added so AffineWarp.comp can read it via sampler2D when the
+  // ASIFT batch detect path is active (Phase 2b+). Doesn't affect existing
+  // storage-image reads on the standard detect path.
   res = true;
   res = res && vkenv_createImage(&memory->input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM,
                                  (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
                                  VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE,
-                                 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
 
   if (is_init)
   {
     res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height, &memory_requirement, 0,
                                                   VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                                   VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
   }
   else if (res)
@@ -177,6 +181,43 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
   if (!res)
   {
     logError(LOG_TAG, "An error occured when setting up the input image");
+    return false;
+  }
+
+  // Create warped input image (r32f). Output of AffineWarp.comp; consumed by
+  // the first Gaussian blur as a sampler2D, so we need SAMPLED + STORAGE bits.
+  res = true;
+  res = res && vkenv_createImage(&memory->warped_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
+                                 (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
+                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+  if (is_init)
+  {
+    res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height * 4u, &memory_requirement, 0,
+                                                  VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+  }
+  else if (res)
+  {
+    vkGetImageMemoryRequirements(memory->device->device, memory->warped_input_image, &memory_requirement);
+  }
+  if (memory_requirement.size > memory->warped_input_image_memory_size)
+  {
+    VK_NULL_SAFE_DELETE(memory->warped_input_image_memory, vkFreeMemory(memory->device->device, memory->warped_input_image_memory, NULL));
+    res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+    res = res && vkenv_allocateMemory(&memory->warped_input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+    memory->warped_input_image_memory_size = memory_requirement.size;
+    logDebug(LOG_TAG, "Warped input image (%d,%d) allocation", memory->curr_input_image_width, memory->curr_input_image_height);
+  }
+  res = res && vkenv_bindImageMemory(memory->device, memory->warped_input_image, memory->warped_input_image_memory, 0u);
+  res = res && vkenv_createImageView(&memory->warped_input_image_view, memory->device, 0, memory->warped_input_image, VK_IMAGE_VIEW_TYPE_2D,
+                                     VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+  if (!res)
+  {
+    logError(LOG_TAG, "An error occured when setting up the warped input image");
     return false;
   }
 
@@ -936,6 +977,9 @@ void vksift_destroySiftMemory(vksift_SiftMemory *memory_ptr)
   }
   VK_NULL_SAFE_DELETE(memory->input_image_view, vkDestroyImageView(memory->device->device, memory->input_image_view, NULL));
   VK_NULL_SAFE_DELETE(memory->input_image, vkDestroyImage(memory->device->device, memory->input_image, NULL));
+  VK_NULL_SAFE_DELETE(memory->warped_input_image_view, vkDestroyImageView(memory->device->device, memory->warped_input_image_view, NULL));
+  VK_NULL_SAFE_DELETE(memory->warped_input_image, vkDestroyImage(memory->device->device, memory->warped_input_image, NULL));
+  VK_NULL_SAFE_DELETE(memory->warped_input_image_memory, vkFreeMemory(memory->device->device, memory->warped_input_image_memory, NULL));
   if (memory->use_rgba_input)
   {
     VK_NULL_SAFE_DELETE(memory->rgba_input_image_view, vkDestroyImageView(memory->device->device, memory->rgba_input_image_view, NULL));
@@ -1005,6 +1049,8 @@ bool vksift_prepareSiftMemoryForDetection(vksift_SiftMemory memory, const uint8_
     // (to avoid extremely slow memory reallocation)
     VK_NULL_SAFE_DELETE(memory->input_image_view, vkDestroyImageView(memory->device->device, memory->input_image_view, NULL));
     VK_NULL_SAFE_DELETE(memory->input_image, vkDestroyImage(memory->device->device, memory->input_image, NULL));
+    VK_NULL_SAFE_DELETE(memory->warped_input_image_view, vkDestroyImageView(memory->device->device, memory->warped_input_image_view, NULL));
+    VK_NULL_SAFE_DELETE(memory->warped_input_image, vkDestroyImage(memory->device->device, memory->warped_input_image, NULL));
     if (memory->use_rgba_input)
     {
       VK_NULL_SAFE_DELETE(memory->rgba_input_image_view, vkDestroyImageView(memory->device->device, memory->rgba_input_image_view, NULL));

@@ -61,6 +61,15 @@ typedef struct vksift_SiftMemory_T
   VkDeviceMemory input_image_memory;
   VkDeviceSize input_image_memory_size;
 
+  // Warped input image (r32f). Output of the optional AffineWarp.comp pass;
+  // becomes the source of the first Gaussian blur for ASIFT-style detection.
+  // Sized at curr_input_image_width × curr_input_image_height to fit the
+  // worst-case tilt-warp output bbox.
+  VkImage warped_input_image;
+  VkImageView warped_input_image_view;
+  VkDeviceMemory warped_input_image_memory;
+  VkDeviceSize warped_input_image_memory_size;
+
   // RGBA input image (only allocated when use_rgba_input=true)
   VkImage rgba_input_image;
   VkImageView rgba_input_image_view;

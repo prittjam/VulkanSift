@@ -42,6 +42,14 @@ typedef struct vksift_SiftDetector_T
   uint32_t *gaussian_kernel_sizes;
   float *gaussian_kernels;
 
+  // AffineWarp set — used by the ASIFT batch detect path to pre-warp the
+  // input image before each pyramid build. Idle on the standard detect path.
+  VkDescriptorSetLayout affinewarp_desc_set_layout;
+  VkDescriptorPool affinewarp_desc_pool;
+  VkDescriptorSet affinewarp_desc_set;
+  VkPipelineLayout affinewarp_pipeline_layout;
+  VkPipeline affinewarp_pipeline;
+
   // Gaussian Blur set
   VkDescriptorSetLayout blur_desc_set_layout;
   VkDescriptorPool blur_desc_pool;
