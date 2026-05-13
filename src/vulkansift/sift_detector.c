@@ -912,6 +912,24 @@ static bool setupSyncObjects(vksift_SiftDetector detector)
 static bool writeDescriptorSets(vksift_SiftDetector detector)
 {
   /////////////////////////////////////////////////////
+  // Write set for AffineWarp pipeline (ASIFT batch path)
+  // Binds (sampler input_image_view) and (storage warped_input_image_view).
+  {
+    VkDescriptorImageInfo aw_in_info = {
+        .sampler = detector->image_sampler, .imageView = detector->mem->input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo aw_out_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->warped_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet aw_writes[2] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = detector->affinewarp_desc_set, .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &aw_in_info},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = detector->affinewarp_desc_set, .dstBinding = 1, .dstArrayElement = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &aw_out_info}};
+    vkUpdateDescriptorSets(detector->dev->device, 2, aw_writes, 0, NULL);
+  }
+
+  /////////////////////////////////////////////////////
   // Write sets for gaussian blur pipeline
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
@@ -1298,24 +1316,69 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
   // Scale space construction
   /////////////////////////////////////////////////
   beginMarkerRegion(detector, cmdbuf, "Scale space construction");
-  vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline);
 
   VkImageMemoryBarrier image_barriers[2];
   uint32_t nb_scales = detector->mem->nb_scales_per_octave;
   GaussianBlurPushConsts blur_push_const;
 
+  // Octave 0: dispatch AffineWarp (input_image → warped_input_image) BEFORE the
+  // blur pipeline is bound. Phase 2b runs with an identity matrix only — Phase
+  // 2c will overwrite the matrix per-warp via push constants.
+  if (oct_idx == 0)
+  {
+    beginMarkerRegion(detector, cmdbuf, "AffineWarp identity");
+    // warped_input_image: ensure SHADER_WRITE access is available (image is
+    // already in GENERAL layout from setupDynamicObjectsAndMemory's init pass).
+    image_barriers[0] = vkenv_genImageMemoryBarrier(
+        detector->mem->warped_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
+
+    vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->affinewarp_pipeline);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->affinewarp_pipeline_layout,
+                            0, 1, &detector->affinewarp_desc_set, 0, NULL);
+    AffineWarpPushConsts aw_pc = {
+        .output_width  = detector->mem->curr_input_image_width,
+        .output_height = detector->mem->curr_input_image_height,
+        .a11 = 1.0f, .a12 = 0.0f, .a13 = 0.0f,
+        .a21 = 0.0f, .a22 = 1.0f, .a23 = 0.0f,
+        .fill_value = 0.0f,
+    };
+    vkCmdPushConstants(cmdbuf, detector->affinewarp_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(AffineWarpPushConsts), &aw_pc);
+    vkCmdDispatch(cmdbuf,
+                  (uint32_t)ceilf((float)detector->mem->curr_input_image_width  / 8.f),
+                  (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
+
+    // Barrier: warped_input_image SHADER_WRITE → TRANSFER_READ for the BlitImage below.
+    image_barriers[0] = vkenv_genImageMemoryBarrier(
+        detector->mem->warped_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
+    endMarkerRegion(detector, cmdbuf);
+  }
+
+  vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline);
+
   // Handle the octave first scale (blit from input image)
   if (oct_idx == 0)
   {
-    // Copy input image (convert to pyr format and upscale if needed) then blur it to get (Octave 0,Scale 0)
+    // Blit warped_input_image (output of AffineWarp; r32f) → octave_image_arr[0] layer 0,
+    // applying the input-to-octave-0 scale ratio via VK_FILTER_LINEAR.
     VkImageBlit region = {
         .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
         .srcOffsets = {{0, 0, 0}, {(int32_t)detector->mem->curr_input_image_width, (int32_t)detector->mem->curr_input_image_height, 1}},
         .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
         .dstOffsets = {{0, 0, 0},
                        {(int32_t)detector->mem->octave_resolutions[oct_idx].width, (int32_t)detector->mem->octave_resolutions[oct_idx].height, 1}}};
-    vkCmdBlitImage(cmdbuf, detector->mem->input_image, VK_IMAGE_LAYOUT_GENERAL, detector->mem->octave_image_arr[oct_idx], VK_IMAGE_LAYOUT_GENERAL, 1,
-                   &region, VK_FILTER_LINEAR);
+    vkCmdBlitImage(cmdbuf, detector->mem->warped_input_image, VK_IMAGE_LAYOUT_GENERAL,
+                   detector->mem->octave_image_arr[oct_idx], VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
 
     // Setup memory access (horizontal pass read from source scale and write to temporary restul image)
     image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->blur_tmp_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,

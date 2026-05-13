@@ -434,13 +434,16 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
   res = true;
   VkCommandBuffer layout_change_cmdbuf = NULL;
   res = res && vkenv_beginInstantCommandBuffer(memory->device->device, memory->general_command_pool, &layout_change_cmdbuf);
-  // Set the input image, blur temp images, octave images and DoG images to VK_LAYOUT_GENERAL
-  VkImageMemoryBarrier *layout_change_barriers = (VkImageMemoryBarrier *)malloc(sizeof(VkImageMemoryBarrier) * (1 + (memory->curr_nb_octaves * 3)));
+  // Set the input image, warped input image, blur temp images, octave images and DoG images to VK_LAYOUT_GENERAL
+  VkImageMemoryBarrier *layout_change_barriers = (VkImageMemoryBarrier *)malloc(sizeof(VkImageMemoryBarrier) * (2 + (memory->curr_nb_octaves * 3)));
   layout_change_barriers[0] =
       vkenv_genImageMemoryBarrier(memory->input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+  layout_change_barriers[1] =
+      vkenv_genImageMemoryBarrier(memory->warped_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                  VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
 
-  int layout_change_barrier_cnt = 1;
+  int layout_change_barrier_cnt = 2;
 
   for (uint32_t i = 0; i < memory->curr_nb_octaves; i++)
   {
