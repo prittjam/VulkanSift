@@ -50,6 +50,14 @@ typedef struct vksift_SiftDetector_T
   VkPipelineLayout affinewarp_pipeline_layout;
   VkPipeline affinewarp_pipeline;
 
+  // Affine matrix consumed by recScaleSpaceConstructionCmds for the AffineWarp
+  // dispatch on octave 0. Caller-settable via vksift_setPendingAffineWarp().
+  // Default value (set in createSiftDetector) is the identity matrix.
+  float pending_warp_a11, pending_warp_a12, pending_warp_a13;
+  float pending_warp_a21, pending_warp_a22, pending_warp_a23;
+  float pending_warp_fill;
+  bool  pending_warp_dirty;
+
   // Gaussian Blur set
   VkDescriptorSetLayout blur_desc_set_layout;
   VkDescriptorPool blur_desc_pool;
@@ -118,5 +126,17 @@ bool vksift_createSiftDetector(vkenv_Device device, vksift_SiftMemory memory, vk
 void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr);
 
 bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t target_buffer_idx, const bool memory_layout_updated);
+
+// Set the affine matrix that will be pushed to AffineWarp.comp on the next
+// detect dispatch. Marks the command buffer for re-record. Matrix layout:
+//   a_ij are entries of the 2x3 inverse affine A_inv mapping warped pixel
+//   (col_out, row_out) → input pixel (col_in, row_in):
+//       col_in = a11*col_out + a12*row_out + a13
+//       row_in = a21*col_out + a22*row_out + a23
+// fill_value is returned for out-of-bounds samples (in [0..1] normalized intensity).
+void vksift_setPendingAffineWarp(vksift_SiftDetector detector,
+                                 float a11, float a12, float a13,
+                                 float a21, float a22, float a23,
+                                 float fill_value);
 
 #endif // VKSIFT_SIFTDETECTOR

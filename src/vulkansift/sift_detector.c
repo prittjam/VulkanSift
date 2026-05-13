@@ -1343,9 +1343,9 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
     AffineWarpPushConsts aw_pc = {
         .output_width  = detector->mem->curr_input_image_width,
         .output_height = detector->mem->curr_input_image_height,
-        .a11 = 1.0f, .a12 = 0.0f, .a13 = 0.0f,
-        .a21 = 0.0f, .a22 = 1.0f, .a23 = 0.0f,
-        .fill_value = 0.0f,
+        .a11 = detector->pending_warp_a11, .a12 = detector->pending_warp_a12, .a13 = detector->pending_warp_a13,
+        .a21 = detector->pending_warp_a21, .a22 = detector->pending_warp_a22, .a23 = detector->pending_warp_a23,
+        .fill_value = detector->pending_warp_fill,
     };
     vkCmdPushConstants(cmdbuf, detector->affinewarp_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(AffineWarpPushConsts), &aw_pc);
@@ -1917,6 +1917,12 @@ bool vksift_createSiftDetector(vkenv_Device device, vksift_SiftMemory memory, vk
 
   detector->curr_buffer_idx = 0u; // Default target buffer is 0 (always available)
 
+  // AffineWarp pending matrix defaults to identity (no warp).
+  detector->pending_warp_a11 = 1.0f; detector->pending_warp_a12 = 0.0f; detector->pending_warp_a13 = 0.0f;
+  detector->pending_warp_a21 = 0.0f; detector->pending_warp_a22 = 1.0f; detector->pending_warp_a23 = 0.0f;
+  detector->pending_warp_fill = 0.0f;
+  detector->pending_warp_dirty = false;
+
   // Try to find GPU debug marker functions
   getGPUDebugMarkerFuncs(detector);
   // Compute the Gaussian kernels used to build the scalespaces
@@ -1936,13 +1942,14 @@ bool vksift_createSiftDetector(vkenv_Device device, vksift_SiftMemory memory, vk
 
 bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t target_buffer_idx, const bool memory_layout_updated)
 {
-  // We need to setup the descriptor sets and command buffers if the input resolution or target buffer changed
-  if (memory_layout_updated || detector->curr_buffer_idx != target_buffer_idx)
+  // We need to setup the descriptor sets and command buffers if the input resolution, target buffer,
+  // or pending AffineWarp matrix changed.
+  if (memory_layout_updated || detector->curr_buffer_idx != target_buffer_idx || detector->pending_warp_dirty)
   {
     detector->curr_buffer_idx = target_buffer_idx;
     writeDescriptorSets(detector);
     recordCommandBuffers(detector);
-    // logError(LOG_TAG, "rewrite stuff");
+    detector->pending_warp_dirty = false;
   }
 
   // Mark the detection pipeline as busy/GPU locked
@@ -2014,6 +2021,22 @@ bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t t
   }
 
   return true;
+}
+
+void vksift_setPendingAffineWarp(vksift_SiftDetector detector,
+                                 float a11, float a12, float a13,
+                                 float a21, float a22, float a23,
+                                 float fill_value)
+{
+  if (detector == NULL) return;
+  detector->pending_warp_a11 = a11;
+  detector->pending_warp_a12 = a12;
+  detector->pending_warp_a13 = a13;
+  detector->pending_warp_a21 = a21;
+  detector->pending_warp_a22 = a22;
+  detector->pending_warp_a23 = a23;
+  detector->pending_warp_fill = fill_value;
+  detector->pending_warp_dirty = true;
 }
 
 void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
