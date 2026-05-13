@@ -1,0 +1,67 @@
+#version 450
+//
+// CrossWarpSplat.comp — splat each ASIFT feature onto a 2D scratch image,
+// keeping the strongest |response| per pixel via imageAtomicMax.
+//
+// One thread per feature. The feature's rounded (x, y) in input-frame pixel
+// coords is the splat position. We pack the response magnitude into the
+// HIGH 16 bits and the feature index into the LOW 16 bits of a 32-bit uint
+// so that imageAtomicMax compares by response first, then breaks ties by
+// feature index — ensuring atomic, deterministic winner selection per pixel.
+//
+// CALLER must clear `splat_image` to 0 before this pass.
+//
+// Pipeline:
+//     CrossWarpSplatClear -> CrossWarpSplat -> CrossWarpNms -> compact
+//
+
+#define NB_HIST 4
+#define NB_ORI 8
+
+struct SIFT_Feat {
+  float x;
+  float y;
+  float scale_x;
+  float scale_y;
+  uint scale_idx;
+  int octave_idx;
+  float sigma;
+  float orientation;
+  float intensity;
+  uint descriptor[(NB_HIST*NB_HIST*NB_ORI)/4];
+};
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer InFeatures {
+    uint nb_in;
+    uint _max_nb_in;
+    SIFT_Feat features[];
+};
+layout(r32ui, binding = 1) uniform uimage2D splat_image;
+
+layout(push_constant) uniform PushConst {
+    // Multiplier converting |intensity| → 16-bit fixed-point. With
+    // intensities typically in [0, 0.1], 65535/0.5 ≈ 131000 maps the
+    // expected range to the full 16-bit grid while leaving slack for
+    // outliers up to ~0.5.
+    float intensity_scale;
+} push_const;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= nb_in) return;
+    SIFT_Feat f = features[i];
+
+    int x = int(round(f.x));
+    int y = int(round(f.y));
+    ivec2 sz = imageSize(splat_image);
+    if (x < 0 || x >= sz.x || y < 0 || y >= sz.y) return;
+
+    // Pack: high 16 = |intensity| × scale clamped to 0xFFFF; low 16 = idx.
+    // Lower-index features lose ties to higher-index features for the same
+    // |intensity|. We tolerate this — at most 65k features (2^16 - 1).
+    uint q = uint(clamp(abs(f.intensity) * push_const.intensity_scale, 0.0, 65535.0)) << 16;
+    uint idx16 = i & 0xFFFFu;
+    uint packed = q | idx16;
+    imageAtomicMax(splat_image, ivec2(x, y), packed);
+}

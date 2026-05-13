@@ -1,0 +1,81 @@
+#version 450
+//
+// CrossWarpNms.comp — 8-neighbor 2D NMS on a packed-response splat image.
+//
+// One thread per input feature. Reads the splat image at the feature's
+// rounded (x, y) and at its 8 neighbors. A feature survives iff:
+//   1. The center pixel's stored feature_idx == this thread's idx (it won
+//      the atomic-max splat at its own pixel).
+//   2. No neighbor pixel has a higher packed value (i.e., stronger
+//      |response|, with tie-break by larger idx).
+//
+// Surviving features are appended to the output buffer via atomicAdd.
+//
+// Same packing as CrossWarpSplat: high 16 bits = |response| in fixed point,
+// low 16 bits = feature index.
+//
+
+#define NB_HIST 4
+#define NB_ORI 8
+
+struct SIFT_Feat {
+  float x;
+  float y;
+  float scale_x;
+  float scale_y;
+  uint scale_idx;
+  int octave_idx;
+  float sigma;
+  float orientation;
+  float intensity;
+  uint descriptor[(NB_HIST*NB_HIST*NB_ORI)/4];
+};
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer InFeatures {
+    uint nb_in;
+    uint _max_nb_in;
+    SIFT_Feat features_in[];
+};
+layout(r32ui, binding = 1) readonly uniform uimage2D splat_image;
+layout(std430, binding = 2) buffer OutFeatures {
+    uint nb_out;
+    uint max_nb_out;
+    SIFT_Feat features_out[];
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= nb_in) return;
+    SIFT_Feat f = features_in[i];
+
+    int x = int(round(f.x));
+    int y = int(round(f.y));
+    ivec2 sz = imageSize(splat_image);
+    if (x < 0 || x >= sz.x || y < 0 || y >= sz.y) return;
+
+    uint me = imageLoad(splat_image, ivec2(x, y)).r;
+    // Did I win my own pixel? (feature_idx == low 16 bits)
+    if ((me & 0xFFFFu) != (i & 0xFFFFu)) return;
+
+    // Compare against 8 neighbors. The full 32-bit packed value lets us
+    // compare in one shot — strictly greater on any neighbor suppresses us.
+    // (Equal-value tie at a neighbor is treated as "not strictly greater",
+    // so the smaller-idx feature loses to the larger by definition of the
+    // packing — handled implicitly.)
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = x + dx, ny = y + dy;
+            if (nx < 0 || nx >= sz.x || ny < 0 || ny >= sz.y) continue;
+            uint nb = imageLoad(splat_image, ivec2(nx, ny)).r;
+            if (nb > me) return;   // beaten by a stronger neighbor
+        }
+    }
+
+    // Survived — append to the output buffer.
+    uint out_idx = atomicAdd(nb_out, 1);
+    if (out_idx < max_nb_out) {
+        features_out[out_idx] = f;
+    }
+}
