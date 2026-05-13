@@ -188,24 +188,32 @@ void main() {
                     }
                 }
 
-                if(is_refinement_valid) {
+                bool good_refine = is_refinement_valid &&
+                                   abs(offset_X) < 1.5f &&
+                                   abs(offset_Y) < 1.5f &&
+                                   abs(offset_S) < 1.5f;
+                if(good_refine) {
                     subpix_x = float(refined_x) + offset_X;
                     subpix_y = float(refined_y) + offset_Y;
                     subpix_s = float(refined_s) + offset_S;
                     new_val  = getVal(refined_s, refined_x, refined_y) + 0.5f * (gS*offset_S + gX*offset_X + gY*offset_Y);
+                } else {
+                    // Lenient refine pass-through: Newton walked off / det==0 /
+                    // |offset| >= 1.5. Keep the ORIGINAL discrete extremum and
+                    // let the edge filter below make the final call.
+                    refined_x = x; refined_y = y; refined_s = s;
+                    subpix_x = float(x); subpix_y = float(y); subpix_s = float(s);
+                    new_val  = center_value;
                 }
             }
 
-            // Validity checks (Lowe): final offset under 1.5, peak above
-            // threshold, refined position in bounds. Boundary detections
-            // (can_refine == false) skip the offset check because they have
-            // no refined offset to test.
+            // Validity: peak above threshold and refined position in bounds.
+            // The edge filter below catches saddle / edge-like features at
+            // either the refined or the lenient-fallback discrete pixel.
             if ( abs(new_val) > push_const.dog_threshold &&
                  subpix_x >= 0 && subpix_x <= float(image_width  - 1) &&
                  subpix_y >= 0 && subpix_y <= float(image_height - 1) &&
-                 subpix_s >= 0 && subpix_s <= float(num_slices   - 1) &&
-                 (!can_refine || (is_refinement_valid &&
-                                  abs(offset_X) < 1.5f && abs(offset_Y) < 1.5f && abs(offset_S) < 1.5f)))
+                 subpix_s >= 0 && subpix_s <= float(num_slices   - 1))
             {
                 // 2D Hessian edge filter on the spatial plane at the discrete pixel.
                 float h11 = getVal(refined_s,refined_x+1,refined_y) + getVal(refined_s,refined_x-1,refined_y) - 2.f * getVal(refined_s,refined_x,refined_y);
