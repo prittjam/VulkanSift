@@ -58,6 +58,15 @@ vksift_jl_handle vksift_jl_init(
     return h;
 }
 
+void vksift_jl_set_affine_warp(vksift_jl_handle h,
+    float a11, float a12, float a13,
+    float a21, float a22, float a23,
+    float fill_value)
+{
+    if (!h) return;
+    vksift_setPendingAffineWarpInstance(h->instance, a11, a12, a13, a21, a22, a23, fill_value);
+}
+
 uint32_t vksift_jl_detect(vksift_jl_handle h,
     const uint8_t* image, uint32_t width, uint32_t height)
 {

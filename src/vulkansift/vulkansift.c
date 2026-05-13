@@ -316,6 +316,15 @@ bool vksift_isBufferAvailable(vksift_Instance instance, const uint32_t gpu_buffe
   }
 }
 
+void vksift_setPendingAffineWarpInstance(vksift_Instance instance,
+                                          float a11, float a12, float a13,
+                                          float a21, float a22, float a23,
+                                          float fill_value)
+{
+  if (instance == NULL || instance->sift_detector == NULL) return;
+  vksift_setPendingAffineWarp(instance->sift_detector, a11, a12, a13, a21, a22, a23, fill_value);
+}
+
 void vksift_detectFeatures(vksift_Instance instance, const uint8_t *image_data, const uint32_t image_width, const uint32_t image_height,
                            const uint32_t gpu_buffer_id)
 {

@@ -30,6 +30,17 @@ vksift_jl_handle vksift_jl_init(
     int use_upsampling, int use_2d_nms,
     int use_rgba_input, int use_rgb_input);
 
+// Set the pending AffineWarp matrix used by the NEXT detect call.
+// 2x3 inverse affine mapping warped pixel → input pixel:
+//   col_in = a11*col_out + a12*row_out + a13
+//   row_in = a21*col_out + a22*row_out + a23
+// fill_value (normalized [0..1]) returned for out-of-bounds samples.
+// Identity (a11=a22=1, rest=0, fill=0) leaves the pipeline as-is.
+void vksift_jl_set_affine_warp(vksift_jl_handle h,
+    float a11, float a12, float a13,
+    float a21, float a22, float a23,
+    float fill_value);
+
 // Detect features in a grayscale uint8 image (row-major).
 // Returns number of detected features.
 uint32_t vksift_jl_detect(vksift_jl_handle h,

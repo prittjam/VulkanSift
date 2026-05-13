@@ -67,6 +67,7 @@ endif()
 set(VULKANSIFT_LIB_SHADERS
     # SIFT detector algorithm shaders
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/AffineWarp.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/PreBlur1D.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussianBlur.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussianBlurInterpolated.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/DifferenceOfGaussian.comp

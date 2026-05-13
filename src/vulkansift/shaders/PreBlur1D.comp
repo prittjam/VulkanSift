@@ -1,0 +1,74 @@
+#version 450
+//
+// PreBlur1D.comp — 1D oriented Gaussian blur with per-warp σ and direction.
+//
+// For each output pixel, samples the input image along a configurable
+// direction (dir_x, dir_y) with Gaussian weights of std `sigma`. Bilinear
+// filtering on the sampler handles sub-pixel offsets along the direction.
+//
+// Used by VulkanSift's ASIFT pipeline as the σ_aa pre-blur step:
+//   - σ        = 0.8 · √(t² − 1)  (Morel-Yu anti-alias constant)
+//   - direction = (sin φ, cos φ)  (squash direction of the affine tilt)
+//
+// At identity (σ = 0) the shader becomes a pass-through copy. For very
+// small σ (< 0.1) it skips the Gaussian sum entirely.
+//
+// Push constants:
+//   sigma   : Gaussian standard deviation in input pixels
+//   dir_x   : direction vector x-component (any length; renormalized in shader)
+//   dir_y   : direction vector y-component
+//
+// Input  : sampler2D (clamp-to-edge, bilinear)
+// Output : r32f / r8 image2D
+//
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D img_input;
+layout(r32f, binding = 1) uniform image2D img_output;
+
+layout(push_constant) uniform PushConst {
+    float sigma;
+    float dir_x;
+    float dir_y;
+} push_const;
+
+// Truncation factor (Lowe / IMAS uses GaussTruncate1 = 4.0)
+const float GAUSS_TRUNCATE = 4.0;
+const int   MAX_TAPS       = 33;   // half-width up to 16
+
+void main() {
+    ivec2 coords_out = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(img_output);
+    if (coords_out.x >= sz.x || coords_out.y >= sz.y) return;
+
+    vec2 in_size = vec2(textureSize(img_input, 0));
+    vec2 center  = (vec2(coords_out) + 0.5) / in_size;
+
+    float sigma = push_const.sigma;
+    if (sigma < 0.1) {
+        // Pass-through: identity blur (σ_aa = 0 at t = 1)
+        float val = texture(img_input, center).r;
+        imageStore(img_output, coords_out, vec4(val, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // Normalize direction; truncate kernel at ±GAUSS_TRUNCATE σ taps.
+    float len = max(length(vec2(push_const.dir_x, push_const.dir_y)), 1e-8);
+    vec2 dir = vec2(push_const.dir_x, push_const.dir_y) / len;
+    int half_taps = int(ceil(GAUSS_TRUNCATE * sigma));
+    if (half_taps > (MAX_TAPS - 1) / 2) half_taps = (MAX_TAPS - 1) / 2;
+
+    float inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma);
+
+    float sum   = 0.0;
+    float wsum  = 0.0;
+    for (int k = -half_taps; k <= half_taps; ++k) {
+        float w = exp(-float(k * k) * inv_two_sigma_sq);
+        vec2 sample_uv = center + (float(k) * dir) / in_size;
+        // clamp_to_edge sampler handles out-of-bounds naturally
+        float v = texture(img_input, sample_uv).r;
+        sum  += w * v;
+        wsum += w;
+    }
+    imageStore(img_output, coords_out, vec4(sum / wsum, 0.0, 0.0, 1.0));
+}

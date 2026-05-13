@@ -46,6 +46,18 @@ extern "C"
    * the end of the previous pipeline before starting the new one.
    **/
 
+  // Set the pending AffineWarp matrix used by the next vksift_detectFeatures() call.
+  // The 2x3 matrix is the INVERSE affine that maps warped output pixel coords to input
+  // pixel coords (the same convention as the AffineWarp.comp shader):
+  //   col_in = a11*col_out + a12*row_out + a13
+  //   row_in = a21*col_out + a22*row_out + a23
+  // fill_value (normalized [0..1]) is returned for out-of-bounds samples.
+  // Identity matrix (a11=a22=1, others 0) reproduces the standard non-ASIFT path.
+  VKSIFT_EXPORT void vksift_setPendingAffineWarpInstance(vksift_Instance instance,
+                                                        float a11, float a12, float a13,
+                                                        float a21, float a22, float a23,
+                                                        float fill_value);
+
   // Copy the image to the GPU and start the detection pipeline on the GPU. Detected features will be stored on the
   // specified GPU buffer. The parameter image_data must point to an array of uint8_t values representing a grayscale image (row-major).
   VKSIFT_EXPORT void vksift_detectFeatures(vksift_Instance instance, const uint8_t *image_data, const uint32_t image_width, const uint32_t image_height,
