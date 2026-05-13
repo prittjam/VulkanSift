@@ -41,6 +41,14 @@ typedef struct
   float    fill_value;
 } AffineWarpPushConsts;
 
+// Push constants for PreBlur1D.comp: sigma + direction vector (3 × float = 12 B).
+typedef struct
+{
+  float sigma;
+  float dir_x;
+  float dir_y;
+} PreBlur1DPushConsts;
+
 static void getGPUDebugMarkerFuncs(vksift_SiftDetector detector)
 {
   detector->vkCmdDebugMarkerBeginEXT = (PFN_vkCmdDebugMarkerBeginEXT)vkGetDeviceProcAddr(detector->dev->device, "vkCmdDebugMarkerBeginEXT");
@@ -261,8 +269,52 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
 {
   VkResult alloc_res;
   ///////////////////////////////////////////////////
-  // Descriptors for AffineWarp pipeline (ASIFT batch path)
-  // binding 0 = sampler2D (input image), binding 1 = image2D r32f (warped output)
+  // Resource bindings for PreBlur1D pipeline (ASIFT σ_aa pre-blur)
+  // binding 0 = sampler2D (input_image), binding 1 = image2D r32f (blurred_input_image)
+  ///////////////////////////////////////////////////
+  {
+    VkDescriptorSetLayoutBinding pb_in = {.binding = 0,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                          .descriptorCount = 1,
+                                          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                          .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding pb_out = {.binding = 1,
+                                           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                           .descriptorCount = 1,
+                                           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                           .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding pb_bindings[2] = {pb_in, pb_out};
+    VkDescriptorSetLayoutCreateInfo pb_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = pb_bindings};
+    if (vkCreateDescriptorSetLayout(detector->dev->device, &pb_layout_info, NULL, &detector->preblur_desc_set_layout) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create PreBlur1D descriptor set layout");
+      return false;
+    }
+    VkDescriptorPoolSize pb_pool_sizes[2] = {
+        {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1}};
+    VkDescriptorPoolCreateInfo pb_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = pb_pool_sizes};
+    if (vkCreateDescriptorPool(detector->dev->device, &pb_pool_info, NULL, &detector->preblur_desc_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create PreBlur1D descriptor pool");
+      return false;
+    }
+    VkDescriptorSetAllocateInfo pb_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                 .descriptorPool = detector->preblur_desc_pool,
+                                                 .descriptorSetCount = 1,
+                                                 .pSetLayouts = &detector->preblur_desc_set_layout};
+    if (vkAllocateDescriptorSets(detector->dev->device, &pb_alloc_info, &detector->preblur_desc_set) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to allocate PreBlur1D descriptor set");
+      return false;
+    }
+  }
+
+  ///////////////////////////////////////////////////
+  // Resource bindings for AffineWarp pipeline (ASIFT batch path)
+  // binding 0 = sampler2D (blurred_input_image), binding 1 = image2D r32f (warped_input_image)
   ///////////////////////////////////////////////////
   {
     VkDescriptorSetLayoutBinding aw_in = {.binding = 0,
@@ -695,6 +747,26 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
 static bool setupComputePipelines(vksift_SiftDetector detector)
 {
   //////////////////////////////////////
+  // Setup PreBlur1D pipeline (ASIFT σ_aa pre-blur)
+  //////////////////////////////////////
+  {
+    VkShaderModule pb_shader_module;
+    if (!vkenv_createShaderModule(detector->dev->device, "shaders/PreBlur1D.comp.spv", &pb_shader_module))
+    {
+      logError(LOG_TAG, "Failed to create PreBlur1D shader module");
+      return false;
+    }
+    if (!vkenv_createComputePipeline(detector->dev->device, pb_shader_module, detector->preblur_desc_set_layout, sizeof(PreBlur1DPushConsts),
+                                     &detector->preblur_pipeline_layout, &detector->preblur_pipeline))
+    {
+      logError(LOG_TAG, "Failed to create PreBlur1D pipeline");
+      vkDestroyShaderModule(detector->dev->device, pb_shader_module, NULL);
+      return false;
+    }
+    vkDestroyShaderModule(detector->dev->device, pb_shader_module, NULL);
+  }
+
+  //////////////////////////////////////
   // Setup AffineWarp pipeline (ASIFT batch path)
   //////////////////////////////////////
   {
@@ -912,11 +984,31 @@ static bool setupSyncObjects(vksift_SiftDetector detector)
 static bool writeDescriptorSets(vksift_SiftDetector detector)
 {
   /////////////////////////////////////////////////////
-  // Write set for AffineWarp pipeline (ASIFT batch path)
-  // Binds (sampler input_image_view) and (storage warped_input_image_view).
+  // Write bindings for PreBlur1D pipeline (ASIFT σ_aa pre-blur)
+  // Binds (sampler input_image_view) and (storage blurred_input_image_view).
+  {
+    VkDescriptorImageInfo pb_in_info = {
+        .sampler = detector->image_sampler, .imageView = detector->mem->input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo pb_out_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->blurred_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet pb_writes[2] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = detector->preblur_desc_set, .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &pb_in_info},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = detector->preblur_desc_set, .dstBinding = 1, .dstArrayElement = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &pb_out_info}};
+    vkUpdateDescriptorSets(detector->dev->device, 2, pb_writes, 0, NULL);
+  }
+
+  /////////////////////////////////////////////////////
+  // Write bindings for AffineWarp pipeline (ASIFT batch path)
+  // Binds (sampler blurred_input_image_view) and (storage warped_input_image_view).
+  // NOTE: AffineWarp now samples FROM the PreBlur1D output (blurred_input_image),
+  // not the raw input_image, so the σ_aa pre-blur is included in the warp.
   {
     VkDescriptorImageInfo aw_in_info = {
-        .sampler = detector->image_sampler, .imageView = detector->mem->input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = detector->image_sampler, .imageView = detector->mem->blurred_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo aw_out_info = {
         .sampler = VK_NULL_HANDLE, .imageView = detector->mem->warped_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet aw_writes[2] = {
@@ -1321,21 +1413,51 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
   uint32_t nb_scales = detector->mem->nb_scales_per_octave;
   GaussianBlurPushConsts blur_push_const;
 
-  // Octave 0: dispatch AffineWarp (input_image → warped_input_image) BEFORE the
-  // blur pipeline is bound. Phase 2b runs with an identity matrix only — Phase
-  // 2c will overwrite the matrix per-warp via push constants.
+  // Octave 0: dispatch PreBlur1D (input → blurred_input) then AffineWarp
+  // (blurred_input → warped_input) BEFORE the blur pipeline is bound. The
+  // pre-blur applies the Morel-Yu σ_aa filter so the warp samples from an
+  // anti-aliased version of the input. At σ=0 the PreBlur1D shader degenerates
+  // to a pass-through copy, keeping the original identity behavior intact.
   if (oct_idx == 0)
   {
-    beginMarkerRegion(detector, cmdbuf, "AffineWarp identity");
-    // warped_input_image: ensure SHADER_WRITE access is available (image is
-    // already in GENERAL layout from setupDynamicObjectsAndMemory's init pass).
+    beginMarkerRegion(detector, cmdbuf, "PreBlur1D + AffineWarp");
+
+    // PreBlur1D: input_image → blurred_input_image.
     image_barriers[0] = vkenv_genImageMemoryBarrier(
-        detector->mem->warped_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
+        detector->mem->blurred_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
+
+    vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->preblur_pipeline);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->preblur_pipeline_layout,
+                            0, 1, &detector->preblur_desc_set, 0, NULL);
+    PreBlur1DPushConsts pb_pc = {
+        .sigma = detector->pending_blur_sigma,
+        .dir_x = detector->pending_blur_dir_x,
+        .dir_y = detector->pending_blur_dir_y,
+    };
+    vkCmdPushConstants(cmdbuf, detector->preblur_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(PreBlur1DPushConsts), &pb_pc);
+    vkCmdDispatch(cmdbuf,
+                  (uint32_t)ceilf((float)detector->mem->curr_input_image_width  / 8.f),
+                  (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
+
+    // Barrier: blurred_input_image SHADER_WRITE → SHADER_READ for AffineWarp's sampler.
+    image_barriers[0] = vkenv_genImageMemoryBarrier(
+        detector->mem->blurred_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    image_barriers[1] = vkenv_genImageMemoryBarrier(
+        detector->mem->warped_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
 
     vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->affinewarp_pipeline);
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->affinewarp_pipeline_layout,
@@ -1917,6 +2039,13 @@ bool vksift_createSiftDetector(vkenv_Device device, vksift_SiftMemory memory, vk
 
   detector->curr_buffer_idx = 0u; // Default target buffer is 0 (always available)
 
+  // PreBlur1D defaults: σ=0 means the shader degenerates to a pass-through
+  // copy of input_image (no anti-alias). Direction is irrelevant when σ=0.
+  detector->pending_blur_sigma = 0.0f;
+  detector->pending_blur_dir_x = 0.0f;
+  detector->pending_blur_dir_y = 1.0f;
+  detector->pending_blur_dirty = false;
+
   // AffineWarp pending matrix defaults to identity (no warp).
   detector->pending_warp_a11 = 1.0f; detector->pending_warp_a12 = 0.0f; detector->pending_warp_a13 = 0.0f;
   detector->pending_warp_a21 = 0.0f; detector->pending_warp_a22 = 1.0f; detector->pending_warp_a23 = 0.0f;
@@ -1944,12 +2073,14 @@ bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t t
 {
   // We need to setup the descriptor sets and command buffers if the input resolution, target buffer,
   // or pending AffineWarp matrix changed.
-  if (memory_layout_updated || detector->curr_buffer_idx != target_buffer_idx || detector->pending_warp_dirty)
+  if (memory_layout_updated || detector->curr_buffer_idx != target_buffer_idx ||
+      detector->pending_warp_dirty || detector->pending_blur_dirty)
   {
     detector->curr_buffer_idx = target_buffer_idx;
     writeDescriptorSets(detector);
     recordCommandBuffers(detector);
     detector->pending_warp_dirty = false;
+    detector->pending_blur_dirty = false;
   }
 
   // Mark the detection pipeline as busy/GPU locked
@@ -2039,6 +2170,16 @@ void vksift_setPendingAffineWarp(vksift_SiftDetector detector,
   detector->pending_warp_dirty = true;
 }
 
+void vksift_setPendingPreBlur(vksift_SiftDetector detector,
+                              float sigma, float dir_x, float dir_y)
+{
+  if (detector == NULL) return;
+  detector->pending_blur_sigma = sigma;
+  detector->pending_blur_dir_x = dir_x;
+  detector->pending_blur_dir_y = dir_y;
+  detector->pending_blur_dirty = true;
+}
+
 void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
 {
   assert(detector_ptr != NULL);
@@ -2064,7 +2205,13 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
     VK_NULL_SAFE_DELETE(detector->async_transfer_command_pool, vkDestroyCommandPool(detector->dev->device, detector->async_transfer_command_pool, NULL));
   }
 
-  // Destroy pipelines and descriptors
+  // Destroy pipelines and resource bindings
+  // PreBlur1D (ASIFT σ_aa pre-blur)
+  VK_NULL_SAFE_DELETE(detector->preblur_pipeline, vkDestroyPipeline(detector->dev->device, detector->preblur_pipeline, NULL));
+  VK_NULL_SAFE_DELETE(detector->preblur_pipeline_layout, vkDestroyPipelineLayout(detector->dev->device, detector->preblur_pipeline_layout, NULL));
+  VK_NULL_SAFE_DELETE(detector->preblur_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->preblur_desc_pool, NULL));
+  VK_NULL_SAFE_DELETE(detector->preblur_desc_set_layout,
+                      vkDestroyDescriptorSetLayout(detector->dev->device, detector->preblur_desc_set_layout, NULL));
   // Affine warp (ASIFT batch path)
   VK_NULL_SAFE_DELETE(detector->affinewarp_pipeline, vkDestroyPipeline(detector->dev->device, detector->affinewarp_pipeline, NULL));
   VK_NULL_SAFE_DELETE(detector->affinewarp_pipeline_layout, vkDestroyPipelineLayout(detector->dev->device, detector->affinewarp_pipeline_layout, NULL));

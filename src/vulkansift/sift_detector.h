@@ -42,6 +42,22 @@ typedef struct vksift_SiftDetector_T
   uint32_t *gaussian_kernel_sizes;
   float *gaussian_kernels;
 
+  // PreBlur1D set — Morel-Yu σ_aa anti-alias 1D Gaussian blur on the input
+  // image. Runs BEFORE AffineWarp; writes blurred_input_image which AffineWarp
+  // then samples. σ=0 yields a pass-through copy (identity path).
+  VkDescriptorSetLayout preblur_desc_set_layout;
+  VkDescriptorPool preblur_desc_pool;
+  VkDescriptorSet preblur_desc_set;
+  VkPipelineLayout preblur_pipeline_layout;
+  VkPipeline preblur_pipeline;
+
+  // PreBlur params consumed by recScaleSpaceConstructionCmds. Caller-settable
+  // via vksift_setPendingPreBlur(). Default in createSiftDetector is σ=0
+  // (pass-through identity blur).
+  float pending_blur_sigma;
+  float pending_blur_dir_x, pending_blur_dir_y;
+  bool  pending_blur_dirty;
+
   // AffineWarp set — used by the ASIFT batch detect path to pre-warp the
   // input image before each pyramid build. Idle on the standard detect path.
   VkDescriptorSetLayout affinewarp_desc_set_layout;
@@ -134,6 +150,14 @@ bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t t
 //       col_in = a11*col_out + a12*row_out + a13
 //       row_in = a21*col_out + a22*row_out + a23
 // fill_value is returned for out-of-bounds samples (in [0..1] normalized intensity).
+// Set the σ_aa pre-blur applied to the input image before AffineWarp on the
+// next detect dispatch. Direction (dir_x, dir_y) is the 1D blur axis in
+// input pixel coords (ASIFT uses sin φ, cos φ for the squash direction).
+// σ = 0 yields a pass-through copy (no blur, identity-equivalent).
+// Marks the command buffer for re-record.
+void vksift_setPendingPreBlur(vksift_SiftDetector detector,
+                              float sigma, float dir_x, float dir_y);
+
 void vksift_setPendingAffineWarp(vksift_SiftDetector detector,
                                  float a11, float a12, float a13,
                                  float a21, float a22, float a23,

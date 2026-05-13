@@ -58,6 +58,13 @@ extern "C"
                                                         float a21, float a22, float a23,
                                                         float fill_value);
 
+  // Set the σ_aa pre-blur applied to the input image before AffineWarp on the
+  // next vksift_detectFeatures() call. Direction (dir_x, dir_y) is the 1D blur
+  // axis in input pixel coords (ASIFT uses (sin φ, cos φ) for the squash
+  // direction). σ = 0 yields a pass-through copy (identity-equivalent).
+  VKSIFT_EXPORT void vksift_setPendingPreBlurInstance(vksift_Instance instance,
+                                                     float sigma, float dir_x, float dir_y);
+
   // Copy the image to the GPU and start the detection pipeline on the GPU. Detected features will be stored on the
   // specified GPU buffer. The parameter image_data must point to an array of uint8_t values representing a grayscale image (row-major).
   VKSIFT_EXPORT void vksift_detectFeatures(vksift_Instance instance, const uint8_t *image_data, const uint32_t image_width, const uint32_t image_height,

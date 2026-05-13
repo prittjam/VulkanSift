@@ -325,6 +325,13 @@ void vksift_setPendingAffineWarpInstance(vksift_Instance instance,
   vksift_setPendingAffineWarp(instance->sift_detector, a11, a12, a13, a21, a22, a23, fill_value);
 }
 
+void vksift_setPendingPreBlurInstance(vksift_Instance instance,
+                                       float sigma, float dir_x, float dir_y)
+{
+  if (instance == NULL || instance->sift_detector == NULL) return;
+  vksift_setPendingPreBlur(instance->sift_detector, sigma, dir_x, dir_y);
+}
+
 void vksift_detectFeatures(vksift_Instance instance, const uint8_t *image_data, const uint32_t image_width, const uint32_t image_height,
                            const uint32_t gpu_buffer_id)
 {

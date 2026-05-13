@@ -67,6 +67,13 @@ void vksift_jl_set_affine_warp(vksift_jl_handle h,
     vksift_setPendingAffineWarpInstance(h->instance, a11, a12, a13, a21, a22, a23, fill_value);
 }
 
+void vksift_jl_set_preblur(vksift_jl_handle h,
+    float sigma, float dir_x, float dir_y)
+{
+    if (!h) return;
+    vksift_setPendingPreBlurInstance(h->instance, sigma, dir_x, dir_y);
+}
+
 uint32_t vksift_jl_detect(vksift_jl_handle h,
     const uint8_t* image, uint32_t width, uint32_t height)
 {

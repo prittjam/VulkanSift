@@ -41,6 +41,13 @@ void vksift_jl_set_affine_warp(vksift_jl_handle h,
     float a21, float a22, float a23,
     float fill_value);
 
+// Set the σ_aa pre-blur applied to the input image before AffineWarp on the
+// NEXT detect call. Direction (dir_x, dir_y) is the 1D blur axis in input
+// pixel coords (ASIFT uses (sin φ, cos φ) for the squash direction). σ = 0
+// yields a pass-through copy (no blur).
+void vksift_jl_set_preblur(vksift_jl_handle h,
+    float sigma, float dir_x, float dir_y);
+
 // Detect features in a grayscale uint8 image (row-major).
 // Returns number of detected features.
 uint32_t vksift_jl_detect(vksift_jl_handle h,
