@@ -24,6 +24,9 @@ typedef struct
   float seed_scale_sigma;
   float dog_threshold;
   float edge_threshold;
+  int32_t nb_scales;       // = nb_scales_per_octave; sigma divisor in shader,
+                           // independent of dispatch range so boundary-aware
+                           // 3D NMS (dispatch = nb_scales + 2) keeps σ correct.
 } ExtractKeypointsPushConsts;
 
 // Mirrors AffineWarp.comp's push_constant layout. Order matters:
@@ -1723,11 +1726,14 @@ static void recExtractKeypointsCmds(vksift_SiftDetector detector, VkCommandBuffe
     pushconst.seed_scale_sigma = detector->seed_scale_sigma;
     pushconst.dog_threshold = detector->intensity_threshold / detector->mem->nb_scales_per_octave;
     pushconst.edge_threshold = detector->edge_threshold;
+    pushconst.nb_scales = (int32_t)detector->mem->nb_scales_per_octave;
     vkCmdPushConstants(cmdbuf, detector->extractkpts_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ExtractKeypointsPushConsts), &pushconst);
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->extractkpts_pipeline_layout, 0, 1, &detector->extractkpts_desc_sets[oct_idx],
                             0, NULL);
-    // 2D NMS dispatches over all DoG scales; 3D dispatches over nb_scales_per_octave (interior only)
-    uint32_t z_dispatch = detector->use_2d_nms ? (detector->mem->nb_scales_per_octave + 2) : detector->mem->nb_scales_per_octave;
+    // Both 2D and boundary-aware 3D NMS now dispatch ALL DoG slices
+    // (nb_scales + 2). The 3D shader handles boundary slices (s == 0,
+    // s == num_slices - 1) by skipping the missing-side scale comparison.
+    uint32_t z_dispatch = detector->mem->nb_scales_per_octave + 2;
     vkCmdDispatch(cmdbuf, ceilf((float)(detector->mem->octave_resolutions[oct_idx].width) / 8.f),
                   ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), z_dispatch);
   }

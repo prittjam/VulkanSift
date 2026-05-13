@@ -1,4 +1,17 @@
 #version 450
+//
+// ExtractKeypoints.comp — boundary-aware 3D NMS + Newton subpixel refinement.
+//
+// For each (x, y, s) in the DoG scale-space cube of one octave, test whether
+// the value is a strict local extremum compared to the available 3×3×3
+// neighborhood. Boundary scale slices (s == 0 or s == num_slices - 1) only
+// compare against the 17 neighbors that exist (same slice + the one adjacent
+// slice). Newton subpixel refinement runs only on interior slices.
+//
+// Dispatch: groupCount.z == num_dog_slices (= nb_scales_per_octave + 2). The
+// caller pushes nb_scales_per_octave through push_const.nb_scales so the σ
+// formula stays correct regardless of the dispatch range.
+//
 
 #define NB_HIST 4
 #define NB_ORI 8
@@ -35,198 +48,194 @@ layout(push_constant) uniform PushConst {
   float seed_scale_sigma;
   float dog_threshold;
   float edge_threshold;
+  int nb_scales;     // = nb_scales_per_octave, used as divisor in sigma formula
 } push_const;
 
 
 float getVal(int scale_idx, int x, int y) {
     return imageLoad(dog_input, ivec3(x, y, scale_idx)).r;
 }
+
+// 8-neighbor strict-greater check on a single slice (excluding center pixel).
+bool greater_than_8(float c, int s, int x, int y) {
+    return c > getVal(s, x-1, y-1) && c > getVal(s, x  , y-1) && c > getVal(s, x+1, y-1) &&
+           c > getVal(s, x-1, y  )                            && c > getVal(s, x+1, y  ) &&
+           c > getVal(s, x-1, y+1) && c > getVal(s, x  , y+1) && c > getVal(s, x+1, y+1);
+}
+// 9-neighbor strict-greater (8-neighbor + center on the same slice). For
+// adjacent-scale comparisons, the center pixel at (x, y, s±1) is included.
+bool greater_than_9(float c, int s, int x, int y) {
+    return c > getVal(s, x  , y  ) && greater_than_8(c, s, x, y);
+}
+bool less_than_8(float c, int s, int x, int y) {
+    return c < getVal(s, x-1, y-1) && c < getVal(s, x  , y-1) && c < getVal(s, x+1, y-1) &&
+           c < getVal(s, x-1, y  )                            && c < getVal(s, x+1, y  ) &&
+           c < getVal(s, x-1, y+1) && c < getVal(s, x  , y+1) && c < getVal(s, x+1, y+1);
+}
+bool less_than_9(float c, int s, int x, int y) {
+    return c < getVal(s, x  , y  ) && less_than_8(c, s, x, y);
+}
+
 void main() {
 
     int x = int(gl_GlobalInvocationID.x);
     int y = int(gl_GlobalInvocationID.y);
-    int s = int(gl_GlobalInvocationID.z+1);
+    int s = int(gl_GlobalInvocationID.z);   // 0-indexed slice; range [0, num_slices-1]
 
-    int image_width = imageSize(dog_input).x;
+    int image_width  = imageSize(dog_input).x;
     int image_height = imageSize(dog_input).y;
+    int num_slices   = imageSize(dog_input).z;
+
+    if (s >= num_slices) return;
 
     if(x>=1 && x < (image_width-1) && y>=1 && y < (image_height-1)) {
 
-        // Check 3x3x3 neighborhood (x/y/s)
         float center_value = getVal(s, x, y);
-        bool is_best_in_neighborhood = (abs(center_value)>(push_const.dog_threshold*0.8f)) && ((
-        //bool is_best_in_neighborhood = ((
-                    center_value > getVal(s,   x-1,    y) &&
-                    center_value > getVal(s,   x+1,    y) &&
-                    center_value > getVal(s,   x-1,    y-1) &&
-                    center_value > getVal(s,   x,      y-1) &&
-                    center_value > getVal(s,   x+1,    y-1) &&
-                    center_value > getVal(s,   x-1,    y+1) &&
-                    center_value > getVal(s,   x,      y+1) &&
-                    center_value > getVal(s,   x+1,    y+1) &&
-                    // Superior prev scale
-                    center_value > getVal(s-1, x-1,    y) &&
-                    center_value > getVal(s-1, x,      y) &&
-                    center_value > getVal(s-1, x+1,    y) &&
-                    center_value > getVal(s-1, x-1,    y-1) &&
-                    center_value > getVal(s-1, x,      y-1) &&
-                    center_value > getVal(s-1, x+1,    y-1) &&
-                    center_value > getVal(s-1, x-1,    y+1) &&
-                    center_value > getVal(s-1, x,      y+1) &&
-                    center_value > getVal(s-1, x+1,    y+1) &&
-                    // Superior next scale
-                    center_value > getVal(s+1, x-1,    y) &&
-                    center_value > getVal(s+1, x,      y) &&
-                    center_value > getVal(s+1, x+1,    y) &&
-                    center_value > getVal(s+1, x-1,    y-1) &&
-                    center_value > getVal(s+1, x,      y-1) &&
-                    center_value > getVal(s+1, x+1,    y-1) &&
-                    center_value > getVal(s+1, x-1,    y+1) &&
-                    center_value > getVal(s+1, x,      y+1) &&
-                    center_value > getVal(s+1, x+1,    y+1)) || // OR
-                    // Inferior curr scale
-                    (
-                    center_value < getVal(s,   x-1,    y) &&
-                    center_value < getVal(s,   x+1,    y) &&
-                    center_value < getVal(s,   x-1,    y-1) &&
-                    center_value < getVal(s,   x,      y-1) &&
-                    center_value < getVal(s,   x+1,    y-1) &&
-                    center_value < getVal(s,   x-1,    y+1) &&
-                    center_value < getVal(s,   x,      y+1) &&
-                    center_value < getVal(s,   x+1,    y+1) &&
-                    // Inferior prev scale
-                    center_value < getVal(s-1, x-1,    y) &&
-                    center_value < getVal(s-1, x,      y) &&
-                    center_value < getVal(s-1, x+1,    y) &&
-                    center_value < getVal(s-1, x-1,    y-1) &&
-                    center_value < getVal(s-1, x,      y-1) &&
-                    center_value < getVal(s-1, x+1,    y-1) &&
-                    center_value < getVal(s-1, x-1,    y+1) &&
-                    center_value < getVal(s-1, x,      y+1) &&
-                    center_value < getVal(s-1, x+1,    y+1) &&
-                    // Inferior next scale
-                    center_value < getVal(s+1, x-1,    y) &&
-                    center_value < getVal(s+1, x,      y) &&
-                    center_value < getVal(s+1, x+1,    y) &&
-                    center_value < getVal(s+1, x-1,    y-1) &&
-                    center_value < getVal(s+1, x,      y-1) &&
-                    center_value < getVal(s+1, x+1,    y-1) &&
-                    center_value < getVal(s+1, x-1,    y+1) &&
-                    center_value < getVal(s+1, x,      y+1) &&
-                    center_value < getVal(s+1, x+1,    y+1)));
+        if (abs(center_value) <= (push_const.dog_threshold * 0.8f)) return;
 
-        //is_best_in_neighborhood = abs(center_value)>0.01;
+        // Boundary-aware 3D NMS: skip the missing-side comparison at scale
+        // boundaries (s == 0 has no s-1, s == num_slices-1 has no s+1).
+        bool has_below = (s > 0);
+        bool has_above = (s < num_slices - 1);
+
+        bool is_max = greater_than_8(center_value, s, x, y) &&
+                      (!has_below || greater_than_9(center_value, s - 1, x, y)) &&
+                      (!has_above || greater_than_9(center_value, s + 1, x, y));
+        bool is_min = false;
+        if (!is_max) {
+            is_min = less_than_8(center_value, s, x, y) &&
+                     (!has_below || less_than_9(center_value, s - 1, x, y)) &&
+                     (!has_above || less_than_9(center_value, s + 1, x, y));
+        }
+        bool is_best_in_neighborhood = is_max || is_min;
 
         if(is_best_in_neighborhood) {
 
-            // Refine keypoint
-            bool is_refinement_valid = true;
+            // Newton subpixel refinement requires neighbors on both sides
+            // (s-1 and s+1) for the scale Hessian. At boundary slices we skip
+            // refinement and emit an integer-scale detection at (x, y, s).
+            bool can_refine = has_below && has_above;
+
+            float subpix_x = float(x);
+            float subpix_y = float(y);
+            float subpix_s = float(s);
+            float new_val  = center_value;
             float offset_X = 0.f;
             float offset_Y = 0.f;
             float offset_S = 0.f;
-            int step_cnt = 0;
             int refined_x = x;
             int refined_y = y;
             int refined_s = s;
-            float gX,gY,gS;
+            bool is_refinement_valid = true;
 
-            for (step_cnt = 0; step_cnt < NB_REFINEMENT_STEP; step_cnt++)
-            {
-                // Check if point is in image boundaries otherwise stop ?
-                // Compute offset from gradient and Hessian
-
-                // Gradient
-                gS = 0.5f * (getVal(refined_s+1,refined_x,refined_y) - getVal(refined_s-1,refined_x,refined_y));
-                gX = 0.5f * (getVal(refined_s,refined_x+1,refined_y) - getVal(refined_s,refined_x-1,refined_y));
-                gY = 0.5f * (getVal(refined_s,refined_x,refined_y+1) - getVal(refined_s,refined_x,refined_y-1));
-                // Hessian
-                float h11 = getVal(refined_s+1,refined_x,refined_y) + getVal(refined_s-1,refined_x,refined_y) - 2.f * getVal(refined_s,refined_x,refined_y);
-                float h22 = getVal(refined_s,refined_x+1,refined_y) + getVal(refined_s,refined_x-1,refined_y) - 2.f * getVal(refined_s,refined_x,refined_y);
-                float h33 = getVal(refined_s,refined_x,refined_y+1) + getVal(refined_s,refined_x,refined_y-1) - 2.f * getVal(refined_s,refined_x,refined_y);
-
-                float h12 = 0.25f * (getVal(refined_s+1,refined_x+1,refined_y) - getVal(refined_s+1,refined_x-1,refined_y) -
-                                    getVal(refined_s-1,refined_x+1,refined_y) + getVal(refined_s-1,refined_x-1,refined_y));
-                float h13 = 0.25f * (getVal(refined_s+1,refined_x,refined_y+1) - getVal(refined_s+1,refined_x,refined_y-1) -
-                                    getVal(refined_s-1,refined_x,refined_y+1) + getVal(refined_s-1,refined_x,refined_y-1));
-                float h23 = 0.25f * (getVal(refined_s,refined_x+1,refined_y+1) - getVal(refined_s,refined_x+1,refined_y-1) -
-                                    getVal(refined_s,refined_x-1,refined_y+1) + getVal(refined_s,refined_x-1,refined_y-1));
-
-                // Inverted Hessian
-                float determinant = h11 * ((h22 * h33) - (h23 * h23)) - h12 * ((h12 * h33) - (h13 * h23)) + h13 * ((h12 * h23) - (h13 * h22));
-                if (determinant != 0.0f)
+            if (can_refine) {
+                float gX,gY,gS;
+                for (int step_cnt = 0; step_cnt < NB_REFINEMENT_STEP; step_cnt++)
                 {
-                    float inv_h11 = ((h22 * h33) - (h23 * h23)) / determinant;
-                    float inv_h12 = -1.f * ((h12 * h33) - (h13 * h23)) / determinant;
-                    float inv_h13 = ((h12 * h23) - (h13 * h22)) / determinant;
+                    // Gradient
+                    gS = 0.5f * (getVal(refined_s+1,refined_x,refined_y) - getVal(refined_s-1,refined_x,refined_y));
+                    gX = 0.5f * (getVal(refined_s,refined_x+1,refined_y) - getVal(refined_s,refined_x-1,refined_y));
+                    gY = 0.5f * (getVal(refined_s,refined_x,refined_y+1) - getVal(refined_s,refined_x,refined_y-1));
+                    // Hessian
+                    float h11 = getVal(refined_s+1,refined_x,refined_y) + getVal(refined_s-1,refined_x,refined_y) - 2.f * getVal(refined_s,refined_x,refined_y);
+                    float h22 = getVal(refined_s,refined_x+1,refined_y) + getVal(refined_s,refined_x-1,refined_y) - 2.f * getVal(refined_s,refined_x,refined_y);
+                    float h33 = getVal(refined_s,refined_x,refined_y+1) + getVal(refined_s,refined_x,refined_y-1) - 2.f * getVal(refined_s,refined_x,refined_y);
 
-                    float inv_h22 = ((h11 * h33) - (h13 * h13)) / determinant;
-                    float inv_h23 = -1.f * ((h11 * h23) - (h13 * h12)) / determinant;
-                    float inv_h33 = ((h11 * h22) - (h12 * h12)) / determinant;
+                    float h12 = 0.25f * (getVal(refined_s+1,refined_x+1,refined_y) - getVal(refined_s+1,refined_x-1,refined_y) -
+                                        getVal(refined_s-1,refined_x+1,refined_y) + getVal(refined_s-1,refined_x-1,refined_y));
+                    float h13 = 0.25f * (getVal(refined_s+1,refined_x,refined_y+1) - getVal(refined_s+1,refined_x,refined_y-1) -
+                                        getVal(refined_s-1,refined_x,refined_y+1) + getVal(refined_s-1,refined_x,refined_y-1));
+                    float h23 = 0.25f * (getVal(refined_s,refined_x+1,refined_y+1) - getVal(refined_s,refined_x+1,refined_y-1) -
+                                        getVal(refined_s,refined_x-1,refined_y+1) + getVal(refined_s,refined_x-1,refined_y-1));
 
-                    offset_S = -inv_h11 * gS - inv_h12 * gX - inv_h13 * gY;
-                    offset_X = -inv_h12 * gS - inv_h22 * gX - inv_h23 * gY;
-                    offset_Y = -inv_h13 * gS - inv_h23 * gX - inv_h33 * gY;
+                    // Inverted Hessian
+                    float determinant = h11 * ((h22 * h33) - (h23 * h23)) - h12 * ((h12 * h33) - (h13 * h23)) + h13 * ((h12 * h23) - (h13 * h22));
+                    if (determinant != 0.0f)
+                    {
+                        float inv_h11 = ((h22 * h33) - (h23 * h23)) / determinant;
+                        float inv_h22 = ((h11 * h33) - (h13 * h13)) / determinant;
+                        float inv_h33 = ((h11 * h22) - (h12 * h12)) / determinant;
+                        float inv_h12 = -((h12 * h33) - (h13 * h23)) / determinant;
+                        float inv_h13 = ((h12 * h23) - (h13 * h22)) / determinant;
+                        float inv_h23 = -((h11 * h23) - (h13 * h12)) / determinant;
+
+                        offset_S = -(inv_h11 * gS + inv_h12 * gX + inv_h13 * gY);
+                        offset_X = -(inv_h12 * gS + inv_h22 * gX + inv_h23 * gY);
+                        offset_Y = -(inv_h13 * gS + inv_h23 * gX + inv_h33 * gY);
+                    }
+                    else
+                    {
+                        is_refinement_valid = false;
+                        break;
+                    }
+
+                    if (abs(offset_X) < 0.6f && abs(offset_Y) < 0.6f && abs(offset_S) < 0.6f)
+                    {
+                        break;
+                    }
+                    else if(step_cnt<(NB_REFINEMENT_STEP-1))
+                    {
+                        refined_x = int(round(float(refined_x) + offset_X));
+                        refined_y = int(round(float(refined_y) + offset_Y));
+                        refined_s = int(round(float(refined_s) + offset_S));
+                        if (refined_x < 1 || refined_x >= image_width  - 1 ||
+                            refined_y < 1 || refined_y >= image_height - 1 ||
+                            refined_s < 1 || refined_s >= num_slices    - 1)
+                        {
+                            is_refinement_valid = false;
+                            break;
+                        }
+                    }
                 }
-                else
-                {
-                    // No solution for this
-                    is_refinement_valid = false;
-                    break;
-                }
 
-                if (abs(offset_X) < 0.6f && abs(offset_Y) < 0.6f && abs(offset_S) < 0.6f)
-                {
-                    // If all offset under 0.6 we can stop here, extremum is at (pos x_idx,y_idx,scale_idx)
-                    break;
-                }
-                else if(step_cnt<(NB_REFINEMENT_STEP-1)) // As in VLFeat do not increment keypoint pos in last iter
-                {
-                    refined_x += ((offset_X >= 0.6 && refined_x < (image_width - 2)) ? 1 : 0) + ((offset_X <= -0.6 && refined_x > 1) ? -1 : 0);
-                    refined_y += ((offset_Y >= 0.6 && refined_y < (image_height - 2)) ? 1 : 0) + ((offset_Y <= -0.6 && refined_y > 1) ? -1 : 0);
-                    refined_s += ((offset_S >= 0.6 && refined_s < (gl_NumWorkGroups.z + 1)) ? 1 : 0) + ((offset_S <= -0.6 && refined_s > 1) ? -1 : 0);
+                if(is_refinement_valid) {
+                    subpix_x = float(refined_x) + offset_X;
+                    subpix_y = float(refined_y) + offset_Y;
+                    subpix_s = float(refined_s) + offset_S;
+                    new_val  = getVal(refined_s, refined_x, refined_y) + 0.5f * (gS*offset_S + gX*offset_X + gY*offset_Y);
                 }
             }
-            if(is_refinement_valid) {
-                float subpix_x = float(refined_x) + offset_X;
-                float subpix_y = float(refined_y) + offset_Y;
-                float subpix_s = float(refined_s) + offset_S;
-                float new_val = getVal(refined_s,refined_x,refined_y) + 0.5f * (gX * offset_X + gY * offset_Y + gS * offset_S);
-                if( abs(new_val) > push_const.dog_threshold &&                      // DoG threshold
-                    abs(offset_X)<1.5 && abs(offset_Y)<1.5 && abs(offset_S)<1.5 &&  // Final displacement threshold
-                    subpix_x >= 0 && subpix_x < image_width &&                      // Keypoint pos in image 
-                    subpix_y >= 0 && subpix_y < image_height &&                     // and in valid scale
-                    subpix_s >= 0 && subpix_s<=(gl_NumWorkGroups.z+1)) {
 
-                    float h11 = getVal(refined_s,refined_x+1,refined_y) + getVal(refined_s,refined_x-1,refined_y) - 2.f * getVal(refined_s,refined_x,refined_y);
-                    float h22 = getVal(refined_s,refined_x,refined_y+1) + getVal(refined_s,refined_x,refined_y-1) - 2.f * getVal(refined_s,refined_x,refined_y);
-                    float h12 = 0.25f * (getVal(refined_s,refined_x+1,refined_y+1) - getVal(refined_s,refined_x+1,refined_y-1) -
-                        getVal(refined_s,refined_x-1,refined_y+1) + getVal(refined_s,refined_x-1,refined_y-1));
+            // Validity checks (Lowe): final offset under 1.5, peak above
+            // threshold, refined position in bounds. Boundary detections
+            // (can_refine == false) skip the offset check because they have
+            // no refined offset to test.
+            if ( abs(new_val) > push_const.dog_threshold &&
+                 subpix_x >= 0 && subpix_x <= float(image_width  - 1) &&
+                 subpix_y >= 0 && subpix_y <= float(image_height - 1) &&
+                 subpix_s >= 0 && subpix_s <= float(num_slices   - 1) &&
+                 (!can_refine || (is_refinement_valid &&
+                                  abs(offset_X) < 1.5f && abs(offset_Y) < 1.5f && abs(offset_S) < 1.5f)))
+            {
+                // 2D Hessian edge filter on the spatial plane at the discrete pixel.
+                float h11 = getVal(refined_s,refined_x+1,refined_y) + getVal(refined_s,refined_x-1,refined_y) - 2.f * getVal(refined_s,refined_x,refined_y);
+                float h22 = getVal(refined_s,refined_x,refined_y+1) + getVal(refined_s,refined_x,refined_y-1) - 2.f * getVal(refined_s,refined_x,refined_y);
+                float h12 = 0.25f * (getVal(refined_s,refined_x+1,refined_y+1) - getVal(refined_s,refined_x+1,refined_y-1) -
+                    getVal(refined_s,refined_x-1,refined_y+1) + getVal(refined_s,refined_x-1,refined_y-1));
 
-                    float edgeness = ((h11+h22)*(h11+h22)) / ((h11 * h22) - (h12 * h12));
-                    if ((edgeness < (pow(push_const.edge_threshold + 1, 2.0f) / push_const.edge_threshold))&&(edgeness>=0))
-                    {
-                        uint idx = atomicAdd(nb_elem, 1);
-                        if(idx<max_nb_feat) {
-                            // avoid out of bound memory writes
-                            atomicAdd(nb_x_group, 1);
-
-                            // this considers upsampling, octave_idx = -1 in the upscaled octave so the scale factor would be 0.5f
-                            float scale_factor = pow(2.f, push_const.octave_idx);
-                            data[idx].scale_x = subpix_x;
-                            data[idx].scale_y = subpix_y;
-                            data[idx].scale_idx = uint(round(subpix_s));
-                            data[idx].octave_idx = push_const.octave_idx;
-                            data[idx].sigma = push_const.seed_scale_sigma * pow(2.f, subpix_s/float(gl_NumWorkGroups.z)) * scale_factor;
-                            data[idx].orientation = 0.f;
-                            data[idx].intensity = new_val;
-                            data[idx].x = subpix_x*scale_factor;
-                            data[idx].y = subpix_y*scale_factor;
-                        }
+                float edgeness = ((h11+h22)*(h11+h22)) / ((h11 * h22) - (h12 * h12));
+                if ((edgeness < (pow(push_const.edge_threshold + 1, 2.0f) / push_const.edge_threshold)) && (edgeness >= 0))
+                {
+                    uint idx = atomicAdd(nb_elem, 1);
+                    if(idx<max_nb_feat) {
+                        atomicAdd(nb_x_group, 1);
+                        float scale_factor = pow(2.f, push_const.octave_idx);
+                        data[idx].scale_x   = subpix_x;
+                        data[idx].scale_y   = subpix_y;
+                        data[idx].scale_idx = uint(round(subpix_s));
+                        data[idx].octave_idx = push_const.octave_idx;
+                        // Sigma divisor is the SIFT octave_resolution (= nb_scales),
+                        // independent of dispatch range. Passed via push constant
+                        // so the boundary-aware dispatch (nb_scales + 2) doesn't
+                        // break the formula.
+                        data[idx].sigma     = push_const.seed_scale_sigma * pow(2.f, subpix_s/float(push_const.nb_scales)) * scale_factor;
+                        data[idx].orientation = 0.f;
+                        data[idx].intensity = new_val;
+                        data[idx].x = subpix_x*scale_factor;
+                        data[idx].y = subpix_y*scale_factor;
                     }
                 }
             }
         }
     }
-
-
 }
