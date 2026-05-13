@@ -61,6 +61,16 @@ typedef struct vksift_SiftMemory_T
   VkDeviceMemory input_image_memory;
   VkDeviceSize input_image_memory_size;
 
+  // Pre-blurred input image (r32f). Output of the per-warp PreBlur1D.comp
+  // pass that applies the Morel-Yu σ_aa = 0.8·√(t²−1) anti-alias filter
+  // along the warp's squash direction. Sized at the input resolution; serves
+  // as the sampler source for the AffineWarp pass below. At σ ≈ 0 the
+  // PreBlur1D shader degenerates to a pass-through copy of input_image.
+  VkImage blurred_input_image;
+  VkImageView blurred_input_image_view;
+  VkDeviceMemory blurred_input_image_memory;
+  VkDeviceSize blurred_input_image_memory_size;
+
   // Warped input image (r32f). Output of the optional AffineWarp.comp pass;
   // becomes the source of the first Gaussian blur for ASIFT-style detection.
   // Sized at curr_input_image_width × curr_input_image_height to fit the
