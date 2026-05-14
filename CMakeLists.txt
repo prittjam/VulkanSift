@@ -46,6 +46,7 @@ set(VULKANSIFT_LIB_SRC
     src/vulkansift/vulkansift.c
     src/vulkansift/sift_memory.c
     src/vulkansift/sift_detector.c
+    src/vulkansift/sift_imas.c
     src/vulkansift/sift_matcher.c
     # vkenv files (currently from git submodule)
     src/vulkansift/vkenv/vulkan_device.c

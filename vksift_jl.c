@@ -154,3 +154,28 @@ void vksift_jl_destroy(vksift_jl_handle h)
     vksift_unloadVulkan();
     free(h);
 }
+
+// ============================================================================
+// IMAS (ASIFT) tilt-warp entrypoint. Caller must have uploaded the source
+// image via vksift_jl_detect() first (any peak threshold; detection result
+// discarded). Then calls:
+//   vksift_jl_run_imas(h, W, H, t, phi, &out_w, &out_h)
+// which runs the 5-shader GPU chain and writes the tilted Float32 result to
+// a host-mapped buffer. Caller retrieves the buffer via
+//   vksift_jl_get_imas_buffer(h)
+// (must be read before the next vksift_jl_run_imas / vksift_jl_detect call).
+// ============================================================================
+
+int vksift_jl_run_imas(vksift_jl_handle h, uint32_t W, uint32_t H,
+                       float t_factor, float theta_rad,
+                       uint32_t *out_w, uint32_t *out_h)
+{
+    if (!h) return 0;
+    return vksift_runImas(h->instance, W, H, t_factor, theta_rad, out_w, out_h) ? 1 : 0;
+}
+
+const float *vksift_jl_get_imas_buffer(vksift_jl_handle h)
+{
+    if (!h) return NULL;
+    return vksift_getImasReadbackPtr(h->instance);
+}

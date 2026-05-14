@@ -70,6 +70,17 @@ extern "C"
   VKSIFT_EXPORT void vksift_detectFeatures(vksift_Instance instance, const uint8_t *image_data, const uint32_t image_width, const uint32_t image_height,
                                            const uint32_t gpu_buffer_id);
 
+  // Run the IMAS (ASIFT) tilt-simulation chain on the input image currently
+  // residing in the instance's input_image buffer (uploaded by the most recent
+  // vksift_detectFeatures call). Lazy-creates the IMAS pipeline on first call.
+  // Outputs the tilted Float32 result to a host-mapped readback buffer; caller
+  // reads (out_w × out_h) floats from vksift_getImasReadbackPtr().
+  VKSIFT_EXPORT bool vksift_runImas(vksift_Instance instance,
+                                    uint32_t input_w, uint32_t input_h,
+                                    float t_factor, float theta_rad,
+                                    uint32_t *out_w, uint32_t *out_h);
+  VKSIFT_EXPORT const float *vksift_getImasReadbackPtr(vksift_Instance instance);
+
   // For each SIFT feature in the buffer A, find the 2-nearest neighbors in the buffer B, store feature index and descriptors L2 distance
   // for the two neighbors.
   VKSIFT_EXPORT void vksift_matchFeatures(vksift_Instance instance, const uint32_t gpu_buffer_id_A, const uint32_t gpu_buffer_id_B);

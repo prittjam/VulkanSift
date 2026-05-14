@@ -9,6 +9,7 @@
 
 // vksift
 #include "vulkansift/sift_detector.h"
+#include "vulkansift/sift_imas.h"
 #include "vulkansift/sift_matcher.h"
 #include "vulkansift/sift_memory.h"
 
@@ -166,6 +167,12 @@ typedef struct vksift_Instance_T
   vksift_SiftMatcher sift_matcher;
   vkenv_DebugPresenter debug_presenter; // NULL if vksift_ExternalWindowInfo is not provided
 
+  // Lazy-initialised IMAS (ASIFT) pipeline. NULL until first vksift_runImas
+  // call. Owns its own Vulkan objects + readback buffer; samples from the
+  // shared input_image and writes the final tilted result to a host-mapped
+  // buffer accessible via vksift_getImasReadbackPtr().
+  vksift_ImasPipeline imas_pipeline;
+
   void (*error_cb_func)(vksift_Result);
 } vksift_Instance_T;
 
@@ -274,6 +281,12 @@ void vksift_destroyInstance(vksift_Instance *instance_ptr)
   {
     // Wait for anything running on the GPU to finish
     vkDeviceWaitIdle(instance->vulkan_device->device);
+  }
+
+  // Destroy IMAS pipeline (if lazy-created)
+  if (instance->imas_pipeline != NULL)
+  {
+    vksift_destroyImasPipeline(&instance->imas_pipeline);
   }
 
   // Destroy SiftMatcher
@@ -678,4 +691,33 @@ static bool isInputScaleIdxValid(vksift_Instance instance, const uint32_t scale_
   {
     return true;
   }
+}
+// =============================================================================
+// IMAS (ASIFT) tilt-simulation API — lazy-creates the pipeline on first call.
+// =============================================================================
+
+// Caller must have uploaded the source image to input_image already (via
+// vksift_detectFeatures, which doubles as the upload path). Runs the 5-shader
+// IMAS chain for (t_factor, theta_rad) and writes the tilted Float32 result
+// to the readback buffer; returns dimensions via out_w / out_h.
+bool vksift_runImas(vksift_Instance instance, uint32_t input_w, uint32_t input_h,
+                    float t_factor, float theta_rad, uint32_t *out_w, uint32_t *out_h)
+{
+  if (instance == NULL) return false;
+  if (instance->imas_pipeline == NULL)
+  {
+    instance->imas_pipeline = vksift_createImasPipeline(
+        instance->vulkan_device, instance->sift_memory, instance->sift_detector->image_sampler);
+    if (instance->imas_pipeline == NULL) return false;
+  }
+  return vksift_runImasWarp(instance->imas_pipeline, input_w, input_h, t_factor, theta_rad, out_w, out_h);
+}
+
+// Returns a host-mapped pointer to the Float32 tilted result from the most
+// recent vksift_runImas call. Layout: row-major, stride = out_w pixels,
+// total = out_w × out_h floats.
+const float *vksift_getImasReadbackPtr(vksift_Instance instance)
+{
+  if (instance == NULL || instance->imas_pipeline == NULL) return NULL;
+  return (const float *)instance->imas_pipeline->readback_ptr;
 }
