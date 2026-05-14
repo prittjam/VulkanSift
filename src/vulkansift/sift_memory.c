@@ -258,6 +258,97 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
     return false;
   }
 
+  // Create rotated working image (r32f). Worst-case rotated canvas for a W×H
+  // input is sqrt(2)·max(W,H) per side at 45°. We size at curr_W+curr_H per
+  // side to cover all IMAS-25 tilts (still smaller than 2·max but safe). Used
+  // as scratch for: AffineWarp(rotate) → rotated; PreBlur1D(vertical σ_aa)
+  // in-place; FprojBilinearY samples FROM here to produce tilted_image.
+  {
+    uint32_t rot_max = memory->curr_input_image_width + memory->curr_input_image_height;
+    memory->rotated_image_max_width = rot_max;
+    memory->rotated_image_max_height = rot_max;
+    res = true;
+    res = res && vkenv_createImage(&memory->rotated_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
+                                   (VkExtent3D){.width = rot_max, .height = rot_max, .depth = 1}, 1, 1,
+                                   VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (is_init)
+    {
+      res = res && estimateHighestMemoryRequirement(memory, rot_max * rot_max * 4u, &memory_requirement, 0,
+                                                    VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+    else if (res)
+    {
+      vkGetImageMemoryRequirements(memory->device->device, memory->rotated_image, &memory_requirement);
+    }
+    if (memory_requirement.size > memory->rotated_image_memory_size)
+    {
+      VK_NULL_SAFE_DELETE(memory->rotated_image_memory, vkFreeMemory(memory->device->device, memory->rotated_image_memory, NULL));
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->rotated_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+      memory->rotated_image_memory_size = memory_requirement.size;
+      logDebug(LOG_TAG, "Rotated image (%d,%d) allocation", rot_max, rot_max);
+    }
+    res = res && vkenv_bindImageMemory(memory->device, memory->rotated_image, memory->rotated_image_memory, 0u);
+    res = res && vkenv_createImageView(&memory->rotated_image_view, memory->device, 0, memory->rotated_image, VK_IMAGE_VIEW_TYPE_2D,
+                                       VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    if (!res)
+    {
+      logError(LOG_TAG, "An error occured when setting up the rotated image");
+      return false;
+    }
+  }
+
+  // Create tilted image (r32f). Output of FprojBilinearY at W_rot × ⌊H_rot/t⌋.
+  // Worst case dimension = rotated_image_max_width × rotated_image_max_height
+  // (when t=1 the fproj is a pass-through). We oversize to the rotated extent
+  // for simplicity.
+  {
+    uint32_t tilt_max = memory->rotated_image_max_width;
+    memory->tilted_image_max_width = tilt_max;
+    memory->tilted_image_max_height = tilt_max;
+    res = true;
+    res = res && vkenv_createImage(&memory->tilted_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
+                                   (VkExtent3D){.width = tilt_max, .height = tilt_max, .depth = 1}, 1, 1,
+                                   VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                       VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (is_init)
+    {
+      res = res && estimateHighestMemoryRequirement(memory, tilt_max * tilt_max * 4u, &memory_requirement, 0,
+                                                    VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+    else if (res)
+    {
+      vkGetImageMemoryRequirements(memory->device->device, memory->tilted_image, &memory_requirement);
+    }
+    if (memory_requirement.size > memory->tilted_image_memory_size)
+    {
+      VK_NULL_SAFE_DELETE(memory->tilted_image_memory, vkFreeMemory(memory->device->device, memory->tilted_image_memory, NULL));
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->tilted_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+      memory->tilted_image_memory_size = memory_requirement.size;
+      logDebug(LOG_TAG, "Tilted image (%d,%d) allocation", tilt_max, tilt_max);
+    }
+    res = res && vkenv_bindImageMemory(memory->device, memory->tilted_image, memory->tilted_image_memory, 0u);
+    res = res && vkenv_createImageView(&memory->tilted_image_view, memory->device, 0, memory->tilted_image, VK_IMAGE_VIEW_TYPE_2D,
+                                       VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    if (!res)
+    {
+      logError(LOG_TAG, "An error occured when setting up the tilted image");
+      return false;
+    }
+  }
+
   // Create RGBA input image if using RGBA input mode
   if (memory->use_rgba_input)
   {
@@ -1026,6 +1117,12 @@ void vksift_destroySiftMemory(vksift_SiftMemory *memory_ptr)
   VK_NULL_SAFE_DELETE(memory->warped_input_image_view, vkDestroyImageView(memory->device->device, memory->warped_input_image_view, NULL));
   VK_NULL_SAFE_DELETE(memory->warped_input_image, vkDestroyImage(memory->device->device, memory->warped_input_image, NULL));
   VK_NULL_SAFE_DELETE(memory->warped_input_image_memory, vkFreeMemory(memory->device->device, memory->warped_input_image_memory, NULL));
+  VK_NULL_SAFE_DELETE(memory->rotated_image_view, vkDestroyImageView(memory->device->device, memory->rotated_image_view, NULL));
+  VK_NULL_SAFE_DELETE(memory->rotated_image, vkDestroyImage(memory->device->device, memory->rotated_image, NULL));
+  VK_NULL_SAFE_DELETE(memory->rotated_image_memory, vkFreeMemory(memory->device->device, memory->rotated_image_memory, NULL));
+  VK_NULL_SAFE_DELETE(memory->tilted_image_view, vkDestroyImageView(memory->device->device, memory->tilted_image_view, NULL));
+  VK_NULL_SAFE_DELETE(memory->tilted_image, vkDestroyImage(memory->device->device, memory->tilted_image, NULL));
+  VK_NULL_SAFE_DELETE(memory->tilted_image_memory, vkFreeMemory(memory->device->device, memory->tilted_image_memory, NULL));
   if (memory->use_rgba_input)
   {
     VK_NULL_SAFE_DELETE(memory->rgba_input_image_view, vkDestroyImageView(memory->device->device, memory->rgba_input_image_view, NULL));
@@ -1099,6 +1196,10 @@ bool vksift_prepareSiftMemoryForDetection(vksift_SiftMemory memory, const uint8_
     VK_NULL_SAFE_DELETE(memory->blurred_input_image, vkDestroyImage(memory->device->device, memory->blurred_input_image, NULL));
     VK_NULL_SAFE_DELETE(memory->warped_input_image_view, vkDestroyImageView(memory->device->device, memory->warped_input_image_view, NULL));
     VK_NULL_SAFE_DELETE(memory->warped_input_image, vkDestroyImage(memory->device->device, memory->warped_input_image, NULL));
+    VK_NULL_SAFE_DELETE(memory->rotated_image_view, vkDestroyImageView(memory->device->device, memory->rotated_image_view, NULL));
+    VK_NULL_SAFE_DELETE(memory->rotated_image, vkDestroyImage(memory->device->device, memory->rotated_image, NULL));
+    VK_NULL_SAFE_DELETE(memory->tilted_image_view, vkDestroyImageView(memory->device->device, memory->tilted_image_view, NULL));
+    VK_NULL_SAFE_DELETE(memory->tilted_image, vkDestroyImage(memory->device->device, memory->tilted_image, NULL));
     if (memory->use_rgba_input)
     {
       VK_NULL_SAFE_DELETE(memory->rgba_input_image_view, vkDestroyImageView(memory->device->device, memory->rgba_input_image_view, NULL));
