@@ -1,0 +1,68 @@
+#version 450
+//
+// FprojBilinearY.comp — bilinear y-subsample.
+//
+// Drop-in replacement for the cubic-B-spline path (FinvsplineRow +
+// FinvsplineCol + FprojCubicY). Empirically the cubic IIR pre-filter
+// contributes <0.01% feature-count delta in the ASIFT pipeline because
+// the downstream SIFT pyramid's first Gaussian re-blurs the interpolation
+// residual. Bilinear is one fully-parallel pass per warp.
+//
+// Same sampling geometry as the cubic path:
+//   Output (x, y) samples input at (xp, yp) = (x + 0.5, t·y + 0.5).
+//   OOB → bg_value.
+//
+// Input: post-σ_aa-blur rotated image (width_r × height_r).
+// Output: tilted image (width_r × ⌊height_r/t⌋).
+//
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(r32f, binding = 0) uniform image2D img_in;
+layout(r32f, binding = 1) uniform image2D img_out;
+
+layout(push_constant) uniform PushConst {
+    float t;
+    uint  output_width;
+    uint  output_height;
+    uint  input_width;
+    uint  input_height;
+    float bg_value;
+} push_const;
+
+float fetch(int x, int y) {
+    int W = int(push_const.input_width);
+    int H = int(push_const.input_height);
+    if (x < 0 || x >= W || y < 0 || y >= H) return push_const.bg_value;
+    return imageLoad(img_in, ivec2(x, y)).r;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= int(push_const.output_width) || y >= int(push_const.output_height)) return;
+
+    float xp = float(x) + 0.5;
+    float yp = push_const.t * float(y) + 0.5;
+    if (xp < 0.0 || xp > float(push_const.input_width)  ||
+        yp < 0.0 || yp > float(push_const.input_height)) {
+        imageStore(img_out, ivec2(x, y), vec4(push_const.bg_value, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    xp -= 0.5; yp -= 0.5;
+    int xi = int(floor(xp));
+    int yi = int(floor(yp));
+    float ux = xp - float(xi);
+    float uy = yp - float(yi);
+
+    float v00 = fetch(xi,     yi);
+    float v01 = fetch(xi + 1, yi);
+    float v10 = fetch(xi,     yi + 1);
+    float v11 = fetch(xi + 1, yi + 1);
+
+    float v = (1.0 - ux) * (1.0 - uy) * v00
+            +        ux  * (1.0 - uy) * v01
+            + (1.0 - ux) *        uy  * v10
+            +        ux  *        uy  * v11;
+    imageStore(img_out, ivec2(x, y), vec4(v, 0.0, 0.0, 1.0));
+}

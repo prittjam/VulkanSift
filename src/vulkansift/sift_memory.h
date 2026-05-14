@@ -71,6 +71,29 @@ typedef struct vksift_SiftMemory_T
   VkDeviceMemory blurred_input_image_memory;
   VkDeviceSize blurred_input_image_memory_size;
 
+  // Rotated working image (r32f) sized at WORST-CASE rotated dimensions for
+  // the IMAS-25 covering: max(W_rot × H_rot) ≈ (W + H) × (W + H). Used as a
+  // scratch buffer holding the chain output of:
+  //   AffineWarp(rotation only)  → rotated image
+  //   GaussianBlur(σ_aa vertical)→ blurred-rotated image (in-place)
+  // Matches `frot` + `GaussianBlur1D` from libSimuTilts/digital_tilt.cpp.
+  VkImage rotated_image;
+  VkImageView rotated_image_view;
+  VkDeviceMemory rotated_image_memory;
+  VkDeviceSize rotated_image_memory_size;
+  uint32_t rotated_image_max_width;
+  uint32_t rotated_image_max_height;
+
+  // Final tilted image (r32f) sized at W_rot × ⌊H_rot/t_min⌋ for the IMAS-25
+  // covering's smallest non-identity tilt. Output of FprojBilinearY.comp;
+  // serves as the detection-pipeline input for per-warp pyramid construction.
+  VkImage tilted_image;
+  VkImageView tilted_image_view;
+  VkDeviceMemory tilted_image_memory;
+  VkDeviceSize tilted_image_memory_size;
+  uint32_t tilted_image_max_width;
+  uint32_t tilted_image_max_height;
+
   // Warped input image (r32f). Output of the optional AffineWarp.comp pass;
   // becomes the source of the first Gaussian blur for ASIFT-style detection.
   // Sized at curr_input_image_width × curr_input_image_height to fit the
