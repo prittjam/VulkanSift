@@ -1,0 +1,99 @@
+#version 450
+//
+// FprojCubicY.comp — cubic B-spline y-subsample (order 3).
+//
+// Direct port of `libSimuTilts/fproj.cpp` with `i` non-NULL branch, order=3,
+// and the specific geometry used by simulate_digital_tilt:
+//   X1=Y1=0, X2=width_t=width_r, Y2=0, X3=0, Y3=height_t=height_r/t,
+//   a=b=0 (no projective). This makes the output pixel (x, y) sample input
+//   at (xp, yp) = (x + 0.5, t·y + 0.5).
+//
+// Uses spline3 coefficients from splines.cpp:169-178:
+//   c[0] = (1/6)·t³
+//   c[1] = 2/3 - (1/2)(1-t)²(1+t)
+//   c[2] = 2/3 - (1/2)t²(2-t)
+//   c[3] = (1/6)(1-t)³
+//
+// Input: B-spline coefficient image from FinvsplineCol (width × height,
+// where height = H_rot of the rotated image).
+// Output: tilted image (width × height_t = H_rot/t).
+//
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(r32f, binding = 0) uniform image2D img_coeffs;
+layout(r32f, binding = 1) uniform image2D img_out;
+
+layout(push_constant) uniform PushConst {
+    float t;                  // subsample factor (height_t = ⌊height/t⌋)
+    uint  output_width;       // = input width (= width_r)
+    uint  output_height;      // = ⌊input height / t⌋
+    uint  input_width;
+    uint  input_height;
+    float bg_value;           // fill for OOB samples
+} push_const;
+
+// spline3 coefficients (splines.cpp:169-178)
+void spline3(float u, out float c0, out float c1, out float c2, out float c3) {
+    float tmp = 1.0 - u;
+    c0 = 0.16666667 * u * u * u;
+    c1 = 0.66666667 - 0.5 * tmp * tmp * (1.0 + u);
+    c2 = 0.66666667 - 0.5 * u * u * (2.0 - u);
+    c3 = 0.16666667 * tmp * tmp * tmp;
+}
+
+float fetch_coeff(int x, int y) {
+    int W = int(push_const.input_width);
+    int H = int(push_const.input_height);
+    if (x < 0 || x >= W || y < 0 || y >= H) return push_const.bg_value;
+    return imageLoad(img_coeffs, ivec2(x, y)).r;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= int(push_const.output_width) || y >= int(push_const.output_height)) return;
+
+    // fproj with `i` non-NULL, identity rectangular mapping:
+    //   xp = x + 0.5,  yp = t·y + 0.5
+    // (matches the derivation in fproj.cpp:104-110 with our specific corners)
+    float xp = float(x) + 0.5;
+    float yp = push_const.t * float(y) + 0.5;
+
+    // OOB check (fproj.cpp:130)
+    if (xp < 0.0 || xp > float(push_const.input_width)  ||
+        yp < 0.0 || yp > float(push_const.input_height)) {
+        imageStore(img_out, ivec2(x, y), vec4(push_const.bg_value, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // fproj.cpp:132 — shift by 0.5 for the spline evaluation
+    xp -= 0.5; yp -= 0.5;
+    int xi = int(floor(xp));
+    int yi = int(floor(yp));
+    float ux = xp - float(xi);
+    float uy = yp - float(yi);
+
+    float cx0, cx1, cx2, cx3;
+    float cy0, cy1, cy2, cy3;
+    spline3(ux, cx0, cx1, cx2, cx3);
+    spline3(uy, cy0, cy1, cy2, cy3);
+
+    // 4×4 cubic-B-spline sum. fproj loop is dy in n1..n2 (n2=2, n1=-1) with
+    // weight cy[n2-dy]·cx[n2-dx]·ref[adr + nx·dy + dx]. We unroll inline.
+    // For dy = -1, 0, 1, 2: row = yi + dy; weight cy[n2-dy] = cy[2-dy]
+    //   dy = -1 → cy[3] = cy3,  dy = 0 → cy[2] = cy2,
+    //   dy =  1 → cy[1] = cy1,  dy = 2 → cy[0] = cy0
+    // For dx = -1, 0, 1, 2 similarly.
+    float row_wts[4] = float[4](cy3, cy2, cy1, cy0);
+    float col_wts[4] = float[4](cx3, cx2, cx1, cx0);
+
+    float result = 0.0;
+    for (int dy = 0; dy < 4; ++dy) {
+        int row = yi + (dy - 1);
+        for (int dx = 0; dx < 4; ++dx) {
+            int col = xi + (dx - 1);
+            result += row_wts[dy] * col_wts[dx] * fetch_coeff(col, row);
+        }
+    }
+    imageStore(img_out, ivec2(x, y), vec4(result, 0.0, 0.0, 1.0));
+}

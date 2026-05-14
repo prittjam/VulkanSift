@@ -70,6 +70,9 @@ set(VULKANSIFT_LIB_SHADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/PreBlur1D.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/CrossWarpSplat.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/CrossWarpNms.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/FinvsplineRow.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/FinvsplineCol.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/FprojCubicY.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/FprojBilinearY.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussianBlur.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussianBlurInterpolated.comp

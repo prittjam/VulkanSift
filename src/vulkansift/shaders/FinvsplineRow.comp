@@ -1,0 +1,79 @@
+#version 450
+//
+// FinvsplineRow.comp — cubic B-spline coefficient row IIR pass.
+//
+// Direct port of `libSimuTilts/splines.cpp::invspline1D` with order=3 and
+// pole z = -0.26794919 (= √3 − 2). One thread per IMAGE ROW; each thread
+// runs the causal + anticausal IIR filter SEQUENTIALLY along its row of W
+// pixels. Different rows are independent, so dispatched as a 1D grid of
+// (height) threads.
+//
+// In/out same buffer (read row → IIR-filter → write back). Out-of-place not
+// needed — we write c[r, i] after reading the row's previous c values.
+//
+// Push constants:
+//   width  : image width in pixels (length of the IIR loop)
+//   height : image height (used for bounds; thread.x must be < height)
+//
+
+layout(local_size_x = 64) in;
+layout(r32f, binding = 0) uniform image2D img;
+
+layout(push_constant) uniform PushConst {
+    uint width;
+    uint height;
+} push_const;
+
+const float POLE   = -0.26794919;          // √3 - 2
+const float INV_Z  = -3.7320508;            // 1/POLE
+const float LAMBDA = 6.0;                  // (1-z)(1-1/z) = 6 for cubic
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= push_const.height) return;
+    int W = int(push_const.width);
+
+    // 1. Multiply this row by λ (matches splines.cpp:36-37 inside invspline1D)
+    for (int i = 0; i < W; ++i) {
+        float v = imageLoad(img, ivec2(i, int(r))).r;
+        imageStore(img, ivec2(i, int(r)), vec4(v * LAMBDA, 0.0, 0.0, 1.0));
+    }
+
+    // 2. initcausal: c[0] = Σ_{n=0..N-1} z^n c[n] / (1 - z^(2N-2))
+    //    matches initcausal() in splines.cpp:7-22.
+    float zk  = POLE;
+    float z2k = pow(POLE, float(W - 1));
+    float s   = imageLoad(img, ivec2(0,     int(r))).r
+              + z2k * imageLoad(img, ivec2(W - 1, int(r))).r;
+    z2k = z2k * z2k * INV_Z;
+    for (int k = 1; k <= W - 2; ++k) {
+        s   += (zk + z2k) * imageLoad(img, ivec2(k, int(r))).r;
+        zk  *= POLE;
+        z2k *= INV_Z;
+    }
+    float c0 = s / (1.0 - zk * zk);
+    imageStore(img, ivec2(0, int(r)), vec4(c0, 0.0, 0.0, 1.0));
+
+    // 3. Forward (causal) recursion: c[n] += z·c[n-1]
+    float prev = c0;
+    for (int n = 1; n < W; ++n) {
+        float cur = imageLoad(img, ivec2(n, int(r))).r + POLE * prev;
+        imageStore(img, ivec2(n, int(r)), vec4(cur, 0.0, 0.0, 1.0));
+        prev = cur;
+    }
+
+    // 4. initanticausal: c[N-1] = (z/(z²-1))·(z·c[N-2] + c[N-1])
+    float cN1 = prev;                                        // current c[W-1]
+    float cN2 = imageLoad(img, ivec2(W - 2, int(r))).r;
+    float cN1_new = (POLE / (POLE * POLE - 1.0)) * (POLE * cN2 + cN1);
+    imageStore(img, ivec2(W - 1, int(r)), vec4(cN1_new, 0.0, 0.0, 1.0));
+
+    // 5. Anticausal: c[n] = z·(c[n+1] - c[n])
+    prev = cN1_new;
+    for (int n = W - 2; n >= 0; --n) {
+        float cn  = imageLoad(img, ivec2(n, int(r))).r;
+        float new_cn = POLE * (prev - cn);
+        imageStore(img, ivec2(n, int(r)), vec4(new_cn, 0.0, 0.0, 1.0));
+        prev = new_cn;
+    }
+}
