@@ -200,6 +200,23 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
                      &p->fproj_pipeline_layout, &p->fproj_pipeline)) goto fail;
   write_two_storage(device, p->fproj_set, mem->tilted_image_view, mem->rotated_image_view);
 
+  // Bilinear-fproj alternate pipeline (same layout + descriptor set).
+  // FprojBilinearY.comp reads input as storage image (binding 0, r32f) and
+  // writes output as storage image (binding 1, r32f), matching the cubic
+  // shader's binding signature.
+  {
+    VkShaderModule bl_module;
+    if (!vkenv_createShaderModule(device, "shaders/FprojBilinearY.comp.spv", &bl_module)) goto fail;
+    VkComputePipelineCreateInfo cpi = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .layout = p->fproj_pipeline_layout,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = bl_module, .pName = "main"}};
+    VkResult br = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpi, NULL, &p->fproj_bilinear_pipeline);
+    vkDestroyShaderModule(device, bl_module, NULL);
+    if (br != VK_SUCCESS) goto fail;
+  }
+
   // ----- Readback buffer (host-visible, persistent map) -----
   p->readback_size = (VkDeviceSize)mem->rotated_image_max_width * mem->rotated_image_max_height * sizeof(float);
   if (!vkenv_createBuffer(&p->readback_buffer, dev, 0, p->readback_size,
@@ -263,6 +280,7 @@ void vksift_destroyImasPipeline(vksift_ImasPipeline *pipeline_ptr)
     }
     if (p->readback_buffer) vkDestroyBuffer(device, p->readback_buffer, NULL);
 
+    if (p->fproj_bilinear_pipeline) vkDestroyPipeline(device, p->fproj_bilinear_pipeline, NULL);
     if (p->fproj_pipeline)        vkDestroyPipeline(device, p->fproj_pipeline, NULL);
     if (p->fproj_pipeline_layout) vkDestroyPipelineLayout(device, p->fproj_pipeline_layout, NULL);
     if (p->fproj_pool)            vkDestroyDescriptorPool(device, p->fproj_pool, NULL);
@@ -350,10 +368,20 @@ static int imas_stage_limit(void)
   return s ? atoi(s) : 0;
 }
 
+// Bilinear-fproj selector. Set VKSIFT_IMAS_BILINEAR=1 to skip the cubic
+// IIR (FinvsplineRow + FinvsplineCol) and use a parallel bilinear resample
+// in step 5 instead of FprojCubicY. Saves the serial IIR cost.
+static bool imas_bilinear_mode(void)
+{
+  const char *s = getenv("VKSIFT_IMAS_BILINEAR");
+  return s && atoi(s) != 0;
+}
+
 bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
                         float t_factor, float theta_rad, uint32_t *out_w, uint32_t *out_h)
 {
-  int stage_limit = imas_stage_limit();
+  int  stage_limit  = imas_stage_limit();
+  bool use_bilinear = imas_bilinear_mode();
   if (!p || !p->created) return false;
 
   float ca = cosf(theta_rad);
@@ -472,47 +500,50 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
     goto submit;
   }
 
-  // ----- 3. FinvsplineRow : tilted_image in-place per-row IIR -----
+  if (!use_bilinear)
   {
-    FinvsplinePushConsts pc = {.width = W_rot, .height = H_rot};
-    vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_row_pipeline);
-    vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
-                            0, 1, &p->finvspline_row_set, 0, NULL);
-    vkCmdPushConstants(p->cmd_buf, p->finvspline_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(pc), &pc);
-    // One thread per row.
-    vkCmdDispatch(p->cmd_buf, (H_rot + 63) / 64, 1, 1);
-  }
-  barrier_storage_to_sampled(p->cmd_buf, p->mem->tilted_image);
+    // ----- 3. FinvsplineRow : tilted_image in-place per-row IIR -----
+    {
+      FinvsplinePushConsts pc = {.width = W_rot, .height = H_rot};
+      vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_row_pipeline);
+      vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
+                              0, 1, &p->finvspline_row_set, 0, NULL);
+      vkCmdPushConstants(p->cmd_buf, p->finvspline_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                         0, sizeof(pc), &pc);
+      vkCmdDispatch(p->cmd_buf, (H_rot + 63) / 64, 1, 1);
+    }
+    barrier_storage_to_sampled(p->cmd_buf, p->mem->tilted_image);
 
-  if (stage_limit == 3) {
-    VkBufferImageCopy region = {.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                                .imageExtent = {W_rot, H_rot, 1}};
-    vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->tilted_image, VK_IMAGE_LAYOUT_GENERAL,
-                           p->readback_buffer, 1, &region);
-    *out_h = H_rot;
-    goto submit;
+    if (stage_limit == 3) {
+      VkBufferImageCopy region = {.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                  .imageExtent = {W_rot, H_rot, 1}};
+      vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->tilted_image, VK_IMAGE_LAYOUT_GENERAL,
+                             p->readback_buffer, 1, &region);
+      *out_h = H_rot;
+      goto submit;
+    }
+
+    // ----- 4. FinvsplineCol : tilted_image in-place per-col IIR -----
+    {
+      FinvsplinePushConsts pc = {.width = W_rot, .height = H_rot};
+      vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_col_pipeline);
+      vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
+                              0, 1, &p->finvspline_col_set, 0, NULL);
+      vkCmdPushConstants(p->cmd_buf, p->finvspline_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                         0, sizeof(pc), &pc);
+      vkCmdDispatch(p->cmd_buf, (W_rot + 63) / 64, 1, 1);
+    }
+    barrier_storage_to_sampled(p->cmd_buf, p->mem->tilted_image);
   }
 
-  // ----- 4. FinvsplineCol : tilted_image in-place per-col IIR -----
-  {
-    FinvsplinePushConsts pc = {.width = W_rot, .height = H_rot};
-    vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_col_pipeline);
-    vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
-                            0, 1, &p->finvspline_col_set, 0, NULL);
-    vkCmdPushConstants(p->cmd_buf, p->finvspline_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(pc), &pc);
-    vkCmdDispatch(p->cmd_buf, (W_rot + 63) / 64, 1, 1);
-  }
-  barrier_storage_to_sampled(p->cmd_buf, p->mem->tilted_image);
-
-  // ----- 5. FprojCubicY : tilted_image → rotated_image (final tilted) -----
+  // ----- 5. Fproj{Cubic|Bilinear}Y : tilted_image → rotated_image -----
   {
     FprojCubicPushConsts pc = {.t_factor = t_factor,
                                .output_width = W_rot, .output_height = H_t,
                                .input_width = W_rot, .input_height = H_rot,
                                .bg_value = 0.0f};
-    vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->fproj_pipeline);
+    VkPipeline fproj_pipe = use_bilinear ? p->fproj_bilinear_pipeline : p->fproj_pipeline;
+    vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, fproj_pipe);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->fproj_pipeline_layout,
                             0, 1, &p->fproj_set, 0, NULL);
     vkCmdPushConstants(p->cmd_buf, p->fproj_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,

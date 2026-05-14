@@ -62,13 +62,17 @@ typedef struct vksift_ImasPipeline_T
   VkPipeline            finvspline_row_pipeline;
   VkPipeline            finvspline_col_pipeline;
 
-  // FprojCubicY.comp — final cubic resample.
-  // Bound (tilted_image → rotated_image, swapping output buffer).
+  // FprojCubicY.comp — final cubic resample. Bound (tilted → rotated).
   VkDescriptorSetLayout fproj_layout;
   VkDescriptorPool      fproj_pool;
   VkDescriptorSet       fproj_set;
   VkPipelineLayout      fproj_pipeline_layout;
   VkPipeline            fproj_pipeline;
+
+  // FprojBilinearY.comp — alternate parallel 2×2 resample. Same descriptor
+  // set + pipeline layout as cubic (identical bindings + push-const struct).
+  // When selected, the IIR finvspline passes are skipped.
+  VkPipeline            fproj_bilinear_pipeline;
 
   // Host-mapped staging buffer to read back the tilted (Float32) result.
   // Sized at worst-case rotated_image extent × Float32. Mapped persistent.
