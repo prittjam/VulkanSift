@@ -198,18 +198,22 @@ void main() {
                     subpix_s = float(refined_s) + offset_S;
                     new_val  = getVal(refined_s, refined_x, refined_y) + 0.5f * (gS*offset_S + gX*offset_X + gY*offset_Y);
                 } else {
-                    // Lenient refine pass-through: Newton walked off / det==0 /
-                    // |offset| >= 1.5. Keep the ORIGINAL discrete extremum and
-                    // let the edge filter below make the final call.
-                    refined_x = x; refined_y = y; refined_s = s;
-                    subpix_x = float(x); subpix_y = float(y); subpix_s = float(s);
-                    new_val  = center_value;
+                    // Strict refine: Newton failed → reject. Matches the
+                    // original VulkanSift behavior (which validated at 194
+                    // inliers on board 336 identity-only). Lenient pass-through
+                    // was admitting too many noise features when compounded
+                    // across the 25-warp IMAS loop.
+                    return;
                 }
+            } else {
+                // Boundary slice (s == 0 or s == num_slices - 1). No 3D Hessian
+                // available, so we emit the extremum at the integer pixel and
+                // let the spatial edge filter decide.
+                subpix_x = float(x); subpix_y = float(y); subpix_s = float(s);
+                new_val  = center_value;
             }
 
             // Validity: peak above threshold and refined position in bounds.
-            // The edge filter below catches saddle / edge-like features at
-            // either the refined or the lenient-fallback discrete pixel.
             if ( abs(new_val) > push_const.dog_threshold &&
                  subpix_x >= 0 && subpix_x <= float(image_width  - 1) &&
                  subpix_y >= 0 && subpix_y <= float(image_height - 1) &&
