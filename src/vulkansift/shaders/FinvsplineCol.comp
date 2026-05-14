@@ -34,9 +34,10 @@ void main() {
         imageStore(img, ivec2(int(c), i), vec4(v * LAMBDA, 0.0, 0.0, 1.0));
     }
 
-    // 2. initcausal
+    // 2. initcausal — POLE negative; GLSL pow() undefined for negative base.
     float zk  = POLE;
-    float z2k = pow(POLE, float(H - 1));
+    float z2k_mag = pow(abs(POLE), float(H - 1));
+    float z2k = (((H - 1) & 1) != 0) ? -z2k_mag : z2k_mag;
     float s   = imageLoad(img, ivec2(int(c), 0)).r
               + z2k * imageLoad(img, ivec2(int(c), H - 1)).r;
     z2k = z2k * z2k * INV_Z;

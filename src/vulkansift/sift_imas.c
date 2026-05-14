@@ -20,13 +20,15 @@ typedef struct
   float    fill_value;
 } ImasAffineWarpPushConsts;
 
-// Mirrors PreBlur1D.comp's push_constant layout.
+// Mirrors GaussBlur1DStorage.comp's push_constant layout (20 B).
 typedef struct
 {
-  float sigma;
-  float dir_x;
-  float dir_y;
-} ImasPreBlur1DPushConsts;
+  float    sigma;
+  float    dir_x;
+  float    dir_y;
+  uint32_t in_w;
+  uint32_t in_h;
+} ImasGaussBlur1DPushConsts;
 
 // =============================================================================
 // Helpers — descriptor layout + pipeline construction
@@ -147,18 +149,17 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
                      &p->warp_pipeline_layout, &p->warp_pipeline)) goto fail;
   write_sampler_storage(device, p->warp_set, sampler, mem->input_image_view, mem->rotated_image_view);
 
-  // ----- GaussianBlur1D layout/pool/set/pipeline (vertical σ_aa) -----
-  if (!create_two_image_layout(device, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+  // ----- GaussBlur1DStorage — two storage images (rotated → tilted) -----
+  if (!create_two_image_layout(device, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                &p->blur_layout)) goto fail;
   {
-    VkDescriptorPoolSize sizes[2] = {{.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1},
-                                     {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1}};
-    if (!create_pool_with_sizes(device, sizes, 2, 1, &p->blur_pool)) goto fail;
+    VkDescriptorPoolSize sizes[1] = {{.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 2}};
+    if (!create_pool_with_sizes(device, sizes, 1, 1, &p->blur_pool)) goto fail;
   }
   if (!alloc_set(device, p->blur_pool, p->blur_layout, &p->blur_set)) goto fail;
-  if (!make_pipeline(device, "shaders/PreBlur1D.comp.spv", p->blur_layout, sizeof(ImasPreBlur1DPushConsts),
+  if (!make_pipeline(device, "shaders/GaussBlur1DStorage.comp.spv", p->blur_layout, sizeof(ImasGaussBlur1DPushConsts),
                      &p->blur_pipeline_layout, &p->blur_pipeline)) goto fail;
-  write_sampler_storage(device, p->blur_set, sampler, mem->rotated_image_view, mem->tilted_image_view);
+  write_two_storage(device, p->blur_set, mem->rotated_image_view, mem->tilted_image_view);
 
   // ----- FinvsplineRow / FinvsplineCol — single storage image, in-place IIR -----
   if (!create_one_image_layout(device, &p->finvspline_layout)) goto fail;
@@ -341,9 +342,18 @@ static void barrier_to_general_undef(VkCommandBuffer cmd, VkImage image)
                        0, 0, NULL, 0, NULL, 1, &b);
 }
 
+// Debug stage gate. Set the env var VKSIFT_IMAS_STAGE=1|2|3|4|5 to stop after
+// that stage and read back the intermediate. Unset/0 = full pipeline.
+static int imas_stage_limit(void)
+{
+  const char *s = getenv("VKSIFT_IMAS_STAGE");
+  return s ? atoi(s) : 0;
+}
+
 bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
                         float t_factor, float theta_rad, uint32_t *out_w, uint32_t *out_h)
 {
+  int stage_limit = imas_stage_limit();
   if (!p || !p->created) return false;
 
   float ca = cosf(theta_rad);
@@ -386,7 +396,31 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
     if (vkBeginCommandBuffer(p->cmd_buf, &bi) != VK_SUCCESS) return false;
   }
 
-  // Layout transitions: rotated_image, tilted_image to GENERAL.
+  // Layout transitions:
+  // - input_image: must be GENERAL for sampler reads. After vksift_detectFeatures
+  //   finishes, the previous pipeline leaves it in SHADER_READ_ONLY_OPTIMAL or
+  //   GENERAL depending on which stage was last. We force GENERAL with a
+  //   barrier from UNDEFINED → GENERAL, which preserves contents (Vulkan
+  //   spec says contents preserved if old_layout == GENERAL, undefined
+  //   otherwise — but vkCmdPipelineBarrier with src access = 0 doesn't
+  //   actually invalidate data; only the layout transition matters here).
+  //   To be safe, we transition from whatever (SHADER_READ_ONLY_OPTIMAL is
+  //   commonly used post-detect) → GENERAL using GENERAL as old_layout
+  //   (no-op transition that just emits memory-barrier semantics).
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(p->mem->input_image,
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(p->cmd_buf,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, &b);
+  }
+  // rotated/tilted scratch images: ensure GENERAL layout. We don't preserve
+  // contents (overwritten in step 1 / step 2 fully).
   barrier_to_general_undef(p->cmd_buf, p->mem->rotated_image);
   barrier_to_general_undef(p->cmd_buf, p->mem->tilted_image);
 
@@ -405,20 +439,38 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
   }
   barrier_storage_to_sampled(p->cmd_buf, p->mem->rotated_image);
 
-  // ----- 2. GaussianBlur1D vertical : rotated_image → tilted_image -----
-  // (skip if sigma_aa == 0 → just copy rotated → tilted via a blur with σ=0,
-  // which the PreBlur1D shader handles as pass-through identity.)
+  if (stage_limit == 1) {
+    // Read back rotated_image directly
+    VkBufferImageCopy region = {.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                .imageExtent = {W_rot, H_rot, 1}};
+    vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->rotated_image, VK_IMAGE_LAYOUT_GENERAL,
+                           p->readback_buffer, 1, &region);
+    *out_h = H_rot;
+    goto submit;
+  }
+
+  // ----- 2. GaussBlur1DStorage vertical : rotated_image → tilted_image -----
+  // At σ_aa = 0 (identity tilt) shader degenerates to a copy via fetch_clamped.
   {
-    ImasPreBlur1DPushConsts pc = {.sigma = sigma_aa, .dir_x = 0.0f, .dir_y = 1.0f};
+    ImasGaussBlur1DPushConsts pc = {.sigma = sigma_aa, .dir_x = 0.0f, .dir_y = 1.0f,
+                                    .in_w = W_rot, .in_h = H_rot};
     vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->blur_pipeline);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->blur_pipeline_layout,
                             0, 1, &p->blur_set, 0, NULL);
     vkCmdPushConstants(p->cmd_buf, p->blur_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    // PreBlur1D dispatches at the INPUT size (rotated W_rot × H_rot).
-    vkCmdDispatch(p->cmd_buf, (W_rot + 15) / 16, (H_rot + 15) / 16, 1);
+    vkCmdDispatch(p->cmd_buf, (W_rot + 7) / 8, (H_rot + 7) / 8, 1);
   }
   barrier_storage_to_sampled(p->cmd_buf, p->mem->tilted_image);
+
+  if (stage_limit == 2) {
+    VkBufferImageCopy region = {.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                .imageExtent = {W_rot, H_rot, 1}};
+    vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->tilted_image, VK_IMAGE_LAYOUT_GENERAL,
+                           p->readback_buffer, 1, &region);
+    *out_h = H_rot;
+    goto submit;
+  }
 
   // ----- 3. FinvsplineRow : tilted_image in-place per-row IIR -----
   {
@@ -432,6 +484,15 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
     vkCmdDispatch(p->cmd_buf, (H_rot + 63) / 64, 1, 1);
   }
   barrier_storage_to_sampled(p->cmd_buf, p->mem->tilted_image);
+
+  if (stage_limit == 3) {
+    VkBufferImageCopy region = {.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                .imageExtent = {W_rot, H_rot, 1}};
+    vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->tilted_image, VK_IMAGE_LAYOUT_GENERAL,
+                           p->readback_buffer, 1, &region);
+    *out_h = H_rot;
+    goto submit;
+  }
 
   // ----- 4. FinvsplineCol : tilted_image in-place per-col IIR -----
   {
@@ -471,6 +532,7 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
                            p->readback_buffer, 1, &region);
   }
 
+submit:
   if (vkEndCommandBuffer(p->cmd_buf) != VK_SUCCESS) return false;
 
   // ===== Submit + wait =====

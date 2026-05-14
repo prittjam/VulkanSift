@@ -1,0 +1,72 @@
+#version 450
+//
+// GaussBlur1DStorage.comp — 1D Gaussian blur using storage-image reads.
+//
+// Drop-in replacement for PreBlur1D.comp in the IMAS pipeline where the
+// source image is allocated larger than its written region. PreBlur1D's
+// textureSize() returns the full allocation, producing OOB samples in the
+// uninitialised area of the scratch buffer.
+//
+// This variant uses imageLoad with explicit (in_w, in_h) push-const bounds,
+// supports only axis-aligned blur direction (assumed integer-offset
+// along dir), and replicates pixels at the boundary by clamping coords.
+//
+// Push constants (16 B):
+//   sigma : Gaussian std
+//   dir_x : 0 or 1 (axis-aligned)
+//   dir_y : 0 or 1
+//   in_w  : valid width
+//   in_h  : valid height
+//
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(r32f, binding = 0) uniform image2D img_in;
+layout(r32f, binding = 1) uniform image2D img_out;
+
+layout(push_constant) uniform PushConst {
+    float sigma;
+    float dir_x;
+    float dir_y;
+    uint  in_w;
+    uint  in_h;
+} push_const;
+
+const float GAUSS_TRUNCATE = 4.0;
+const int   MAX_TAPS       = 33;
+
+float fetch_clamped(int x, int y) {
+    int W = int(push_const.in_w);
+    int H = int(push_const.in_h);
+    int xc = clamp(x, 0, W - 1);
+    int yc = clamp(y, 0, H - 1);
+    return imageLoad(img_in, ivec2(xc, yc)).r;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= int(push_const.in_w) || y >= int(push_const.in_h)) return;
+
+    float sigma = push_const.sigma;
+    if (sigma < 0.1) {
+        // Pass-through (σ_aa = 0 at identity tilt)
+        imageStore(img_out, ivec2(x, y), vec4(fetch_clamped(x, y), 0.0, 0.0, 1.0));
+        return;
+    }
+
+    int dx = int(push_const.dir_x);  // 0 or 1
+    int dy = int(push_const.dir_y);
+    int half_taps = int(ceil(GAUSS_TRUNCATE * sigma));
+    if (half_taps > (MAX_TAPS - 1) / 2) half_taps = (MAX_TAPS - 1) / 2;
+
+    float inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma);
+
+    float sum = 0.0, wsum = 0.0;
+    for (int k = -half_taps; k <= half_taps; ++k) {
+        float w = exp(-float(k * k) * inv_two_sigma_sq);
+        float v = fetch_clamped(x + k * dx, y + k * dy);
+        sum  += w * v;
+        wsum += w;
+    }
+    imageStore(img_out, ivec2(x, y), vec4(sum / wsum, 0.0, 0.0, 1.0));
+}

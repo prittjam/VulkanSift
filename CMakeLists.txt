@@ -75,6 +75,7 @@ set(VULKANSIFT_LIB_SHADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/FinvsplineCol.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/FprojCubicY.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/FprojBilinearY.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussBlur1DStorage.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussianBlur.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussianBlurInterpolated.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/DifferenceOfGaussian.comp
