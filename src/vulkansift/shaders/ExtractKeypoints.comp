@@ -86,35 +86,38 @@ void main() {
     int image_height = imageSize(dog_input).y;
     int num_slices   = imageSize(dog_input).z;
 
-    if (s >= num_slices) return;
+    // Interior-only 3D NMS: boundary slices (s=0, s=num_slices-1) are NEVER
+    // candidates. A candidate at a boundary slice lacks one z-neighbor; the
+    // response may still be rising or falling on the missing side (the true
+    // peak sits in the adjacent octave). Cube layout has overlap built in:
+    // octave o's top slice coincides with octave o+1's bottom slice in σ,
+    // so restricting candidates to interior slices still covers the full σ
+    // range across the pyramid without cross-octave duplicates.
+    if (s <= 0 || s >= num_slices - 1) return;
 
     if(x>=1 && x < (image_width-1) && y>=1 && y < (image_height-1)) {
 
         float center_value = getVal(s, x, y);
         if (abs(center_value) <= (push_const.dog_threshold * 0.8f)) return;
 
-        // Boundary-aware 3D NMS: skip the missing-side comparison at scale
-        // boundaries (s == 0 has no s-1, s == num_slices-1 has no s+1).
-        bool has_below = (s > 0);
-        bool has_above = (s < num_slices - 1);
-
+        // Full 3D NMS — both s-1 and s+1 always exist (guarded above).
         bool is_max = greater_than_8(center_value, s, x, y) &&
-                      (!has_below || greater_than_9(center_value, s - 1, x, y)) &&
-                      (!has_above || greater_than_9(center_value, s + 1, x, y));
+                      greater_than_9(center_value, s - 1, x, y) &&
+                      greater_than_9(center_value, s + 1, x, y);
         bool is_min = false;
         if (!is_max) {
             is_min = less_than_8(center_value, s, x, y) &&
-                     (!has_below || less_than_9(center_value, s - 1, x, y)) &&
-                     (!has_above || less_than_9(center_value, s + 1, x, y));
+                     less_than_9(center_value, s - 1, x, y) &&
+                     less_than_9(center_value, s + 1, x, y);
         }
         bool is_best_in_neighborhood = is_max || is_min;
 
         if(is_best_in_neighborhood) {
 
             // Newton subpixel refinement requires neighbors on both sides
-            // (s-1 and s+1) for the scale Hessian. At boundary slices we skip
-            // refinement and emit an integer-scale detection at (x, y, s).
-            bool can_refine = has_below && has_above;
+            // (s-1 and s+1) for the scale Hessian. We're always interior here
+            // (boundary slices were filtered out at the dispatch entry).
+            bool can_refine = true;
 
             float subpix_x = float(x);
             float subpix_y = float(y);
@@ -198,12 +201,19 @@ void main() {
                     subpix_s = float(refined_s) + offset_S;
                     new_val  = getVal(refined_s, refined_x, refined_y) + 0.5f * (gS*offset_S + gX*offset_X + gY*offset_Y);
                 } else {
-                    // Strict refine: Newton failed → reject. Matches the
-                    // original VulkanSift behavior (which validated at 194
-                    // inliers on board 336 identity-only). Lenient pass-through
-                    // was admitting too many noise features when compounded
-                    // across the 25-warp IMAS loop.
-                    return;
+                    // Lenient refine: Newton failed → keep the ORIGINAL discrete
+                    // extremum at (x, y, s) — the pre-walk integer position — and
+                    // let the spatial edge filter below re-test. Mirrors VGF's
+                    // _refine!{Val{true}} commit d28cb2f, which preserves soft
+                    // peaks / saddle-walk / boundary-walk extrema that strict
+                    // Newton can't fit cleanly but are still real 3D NMS extrema.
+                    subpix_x = float(x);
+                    subpix_y = float(y);
+                    subpix_s = float(s);
+                    new_val  = center_value;
+                    refined_x = x;
+                    refined_y = y;
+                    refined_s = s;
                 }
             } else {
                 // Boundary slice (s == 0 or s == num_slices - 1). No 3D Hessian
@@ -243,8 +253,14 @@ void main() {
                         data[idx].sigma     = push_const.seed_scale_sigma * pow(2.f, subpix_s/float(push_const.nb_scales)) * scale_factor;
                         data[idx].orientation = 0.f;
                         data[idx].intensity = new_val;
-                        data[idx].x = subpix_x*scale_factor;
-                        data[idx].y = subpix_y*scale_factor;
+                        // Convert octave-pixel position to INPUT pixel index
+                        // (Vulkan 0-indexed convention). Each downsample via
+                        // vkCmdBlitImage with VK_FILTER_NEAREST samples source
+                        // texel (2i + 1) for destination texel i, accumulating
+                        // an offset of (2^o - 1) input pixels per octave.
+                        // Caller adds +0.5 to convert to COLMAP center.
+                        data[idx].x = subpix_x*scale_factor + (scale_factor - 1.0);
+                        data[idx].y = subpix_y*scale_factor + (scale_factor - 1.0);
                     }
                 }
             }
