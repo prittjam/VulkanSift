@@ -114,9 +114,7 @@ void main() {
 
         if(is_best_in_neighborhood) {
 
-            // Newton subpixel refinement requires neighbors on both sides
-            // (s-1 and s+1) for the scale Hessian. We're always interior here
-            // (boundary slices were filtered out at the dispatch entry).
+            // Newton subpixel refinement; always interior here.
             bool can_refine = true;
 
             float subpix_x = float(x);

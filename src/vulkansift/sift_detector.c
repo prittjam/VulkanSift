@@ -1611,7 +1611,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
             {0, 0, 0},
             {(int32_t)detector->mem->octave_resolutions[oct_idx + 1].width, (int32_t)detector->mem->octave_resolutions[oct_idx + 1].height, 1}}};
     vkCmdBlitImage(cmdbuf, detector->mem->octave_image_arr[oct_idx], VK_IMAGE_LAYOUT_GENERAL, detector->mem->octave_image_arr[oct_idx + 1],
-                   VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
+                   VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
 
     // Make sure the transfer if done
     image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx], VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
