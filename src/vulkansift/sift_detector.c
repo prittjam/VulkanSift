@@ -52,6 +52,15 @@ typedef struct
   float dir_y;
 } PreBlur1DPushConsts;
 
+// Push constants for Downsample2x.comp: layer indices + dst dims (16 B).
+typedef struct
+{
+  int32_t src_layer;
+  int32_t dst_layer;
+  int32_t dst_width;
+  int32_t dst_height;
+} Downsample2xPushConsts;
+
 static void getGPUDebugMarkerFuncs(vksift_SiftDetector detector)
 {
   detector->vkCmdDebugMarkerBeginEXT = (PFN_vkCmdDebugMarkerBeginEXT)vkGetDeviceProcAddr(detector->dev->device, "vkCmdDebugMarkerBeginEXT");
@@ -468,6 +477,56 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
   }
 
   ///////////////////////////////////////////////////
+  // Descriptors for Downsample2x pipeline (octave transitions). One descriptor
+  // set per octave i in [0, max_nb_octaves-1]; transition i reads from
+  // octave_image_view_arr[i] (layer nb_scales) and writes to
+  // octave_image_view_arr[i+1] (layer 0). The last set goes unused.
+  ///////////////////////////////////////////////////
+  {
+    VkDescriptorSetLayoutBinding ds_in = {.binding = 0,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .descriptorCount = 1,
+                                          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                          .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding ds_out = {.binding = 1,
+                                           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                           .descriptorCount = 1,
+                                           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                           .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding ds_bindings[2] = {ds_in, ds_out};
+    VkDescriptorSetLayoutCreateInfo ds_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = ds_bindings};
+    if (vkCreateDescriptorSetLayout(detector->dev->device, &ds_layout_info, NULL, &detector->downsample_desc_set_layout) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create Downsample2x descriptor set layout");
+      return false;
+    }
+    VkDescriptorPoolSize ds_pool_sizes[2] = {
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = detector->mem->max_nb_octaves},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = detector->mem->max_nb_octaves}};
+    VkDescriptorPoolCreateInfo ds_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = detector->mem->max_nb_octaves, .poolSizeCount = 2, .pPoolSizes = ds_pool_sizes};
+    if (vkCreateDescriptorPool(detector->dev->device, &ds_pool_info, NULL, &detector->downsample_desc_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create Downsample2x descriptor pool");
+      return false;
+    }
+    VkDescriptorSetLayout *ds_layouts = allocMultLayoutCopy(detector->downsample_desc_set_layout, detector->mem->max_nb_octaves);
+    detector->downsample_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * detector->mem->max_nb_octaves);
+    VkDescriptorSetAllocateInfo ds_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                 .descriptorPool = detector->downsample_desc_pool,
+                                                 .descriptorSetCount = detector->mem->max_nb_octaves,
+                                                 .pSetLayouts = ds_layouts};
+    alloc_res = vkAllocateDescriptorSets(detector->dev->device, &ds_alloc_info, detector->downsample_desc_sets);
+    free(ds_layouts);
+    if (alloc_res != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to allocate Downsample2x descriptor set");
+      return false;
+    }
+  }
+
+  ///////////////////////////////////////////////////
   // Descriptors for ExtractKeypoints pipeline
   ///////////////////////////////////////////////////
   VkDescriptorSetLayoutBinding extkpts_dog_image_layout_binding = {.binding = 0,
@@ -834,6 +893,26 @@ static bool setupComputePipelines(vksift_SiftDetector detector)
   vkDestroyShaderModule(detector->dev->device, dog_shader_module, NULL);
 
   //////////////////////////////////////
+  // Setup Downsample2x pipeline (Lowe pixel-aligned octave downsample)
+  //////////////////////////////////////
+  {
+    VkShaderModule ds_shader_module;
+    if (!vkenv_createShaderModule(detector->dev->device, "shaders/Downsample2x.comp.spv", &ds_shader_module))
+    {
+      logError(LOG_TAG, "Failed to create Downsample2x shader module");
+      return false;
+    }
+    if (!vkenv_createComputePipeline(detector->dev->device, ds_shader_module, detector->downsample_desc_set_layout, sizeof(Downsample2xPushConsts),
+                                     &detector->downsample_pipeline_layout, &detector->downsample_pipeline))
+    {
+      logError(LOG_TAG, "Failed to create Downsample2x pipeline");
+      vkDestroyShaderModule(detector->dev->device, ds_shader_module, NULL);
+      return false;
+    }
+    vkDestroyShaderModule(detector->dev->device, ds_shader_module, NULL);
+  }
+
+  //////////////////////////////////////
   // Setup ExtractKeypoints pipeline
   //////////////////////////////////////
   VkShaderModule extractkpts_shader_module;
@@ -1091,6 +1170,37 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
                                                       .pBufferInfo = NULL,
                                                       .pTexelBufferView = NULL};
     vkUpdateDescriptorSets(detector->dev->device, 2, dog_descriptor_writes, 0, NULL);
+  }
+
+  /////////////////////////////////////////////////////
+  // Write sets for Downsample2x pipeline. Transition i reads
+  // octave_image_view_arr[i] and writes octave_image_view_arr[i+1].
+  for (uint32_t i = 0; i + 1 < detector->mem->curr_nb_octaves; i++)
+  {
+    VkDescriptorImageInfo ds_input_image_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo ds_output_image_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->octave_image_view_arr[i + 1], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet ds_writes[2];
+    ds_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                          .dstSet = detector->downsample_desc_sets[i],
+                                          .dstBinding = 0,
+                                          .dstArrayElement = 0,
+                                          .descriptorCount = 1,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .pImageInfo = &ds_input_image_info,
+                                          .pBufferInfo = NULL,
+                                          .pTexelBufferView = NULL};
+    ds_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                          .dstSet = detector->downsample_desc_sets[i],
+                                          .dstBinding = 1,
+                                          .dstArrayElement = 0,
+                                          .descriptorCount = 1,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .pImageInfo = &ds_output_image_info,
+                                          .pBufferInfo = NULL,
+                                          .pTexelBufferView = NULL};
+    vkUpdateDescriptorSets(detector->dev->device, 2, ds_writes, 0, NULL);
   }
 
   /////////////////////////////////////////////////////
@@ -1592,35 +1702,32 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
 
   if (oct_idx != (detector->mem->curr_nb_octaves - 1))
   {
-    // If this is not the first octave, downscale the scale (Octave i-1,Scale nb_scale_per_octave) to get (Octave i,Scale 0)
+    // Downsample seed scale of octave oct_idx → scale 0 of octave oct_idx + 1
+    // via the Downsample2x compute shader: dst(i, j) = src(2*i + 1, 2*j + 1).
+    // This replaces the prior vkCmdBlitImage; the blit's half-input-pixel
+    // sampling offset caused Newton refinement to walk systematically +x, +y
+    // at higher octaves. The compute shader is pixel-aligned with the
+    // keypoint coord-conversion formula.
 
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                                                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-                                                    (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, nb_scales, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
 
-    VkImageBlit region = {
-        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = nb_scales, .layerCount = 1},
-        .srcOffsets = {{0, 0, 0},
-                       {(int32_t)detector->mem->octave_resolutions[oct_idx].width, (int32_t)detector->mem->octave_resolutions[oct_idx].height, 1}},
-        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
-        .dstOffsets = {
-            {0, 0, 0},
-            {(int32_t)detector->mem->octave_resolutions[oct_idx + 1].width, (int32_t)detector->mem->octave_resolutions[oct_idx + 1].height, 1}}};
-    vkCmdBlitImage(cmdbuf, detector->mem->octave_image_arr[oct_idx], VK_IMAGE_LAYOUT_GENERAL, detector->mem->octave_image_arr[oct_idx + 1],
-                   VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
+    vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->downsample_pipeline);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->downsample_pipeline_layout, 0, 1,
+                            &detector->downsample_desc_sets[oct_idx], 0, NULL);
+    Downsample2xPushConsts ds_pc = {.src_layer = (int32_t)nb_scales,
+                                    .dst_layer = 0,
+                                    .dst_width = (int32_t)detector->mem->octave_resolutions[oct_idx + 1].width,
+                                    .dst_height = (int32_t)detector->mem->octave_resolutions[oct_idx + 1].height};
+    vkCmdPushConstants(cmdbuf, detector->downsample_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Downsample2xPushConsts), &ds_pc);
+    vkCmdDispatch(cmdbuf, ceilf((float)ds_pc.dst_width / 8.f), ceilf((float)ds_pc.dst_height / 8.f), 1);
 
-    // Make sure the transfer if done
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx], VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
-                                                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-                                                    (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, nb_scales, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx + 1], VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
   }
 
   endMarkerRegion(detector, cmdbuf);
@@ -2234,6 +2341,13 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   VK_NULL_SAFE_DELETE(detector->dog_pipeline_layout, vkDestroyPipelineLayout(detector->dev->device, detector->dog_pipeline_layout, NULL));
   VK_NULL_SAFE_DELETE(detector->dog_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->dog_desc_pool, NULL));
   VK_NULL_SAFE_DELETE(detector->dog_desc_set_layout, vkDestroyDescriptorSetLayout(detector->dev->device, detector->dog_desc_set_layout, NULL));
+  // Downsample2x (Lowe pixel-aligned octave downsample)
+  VK_NULL_SAFE_DELETE(detector->downsample_pipeline, vkDestroyPipeline(detector->dev->device, detector->downsample_pipeline, NULL));
+  VK_NULL_SAFE_DELETE(detector->downsample_pipeline_layout,
+                      vkDestroyPipelineLayout(detector->dev->device, detector->downsample_pipeline_layout, NULL));
+  VK_NULL_SAFE_DELETE(detector->downsample_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->downsample_desc_pool, NULL));
+  VK_NULL_SAFE_DELETE(detector->downsample_desc_set_layout,
+                      vkDestroyDescriptorSetLayout(detector->dev->device, detector->downsample_desc_set_layout, NULL));
   // Extract keypoints
   VK_NULL_SAFE_DELETE(detector->extractkpts_pipeline, vkDestroyPipeline(detector->dev->device, detector->extractkpts_pipeline, NULL));
   VK_NULL_SAFE_DELETE(detector->extractkpts_2d_pipeline, vkDestroyPipeline(detector->dev->device, detector->extractkpts_2d_pipeline, NULL));
@@ -2279,6 +2393,7 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   VK_NULL_SAFE_DELETE(detector->gaussian_kernel_sizes, free(detector->gaussian_kernel_sizes));
   VK_NULL_SAFE_DELETE(detector->blur_desc_sets, free(detector->blur_desc_sets));
   VK_NULL_SAFE_DELETE(detector->dog_desc_sets, free(detector->dog_desc_sets));
+  VK_NULL_SAFE_DELETE(detector->downsample_desc_sets, free(detector->downsample_desc_sets));
   VK_NULL_SAFE_DELETE(detector->extractkpts_desc_sets, free(detector->extractkpts_desc_sets));
   VK_NULL_SAFE_DELETE(detector->orientation_desc_sets, free(detector->orientation_desc_sets));
   VK_NULL_SAFE_DELETE(detector->descriptor_desc_sets, free(detector->descriptor_desc_sets));

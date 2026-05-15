@@ -1,0 +1,44 @@
+#version 450
+//
+// Downsample2x.comp — Lowe-convention pixel-aligned 2× octave downsample.
+//
+// Replaces vkCmdBlitImage between octaves. For each output pixel (i, j) at
+// dst_layer of the destination image array, samples src_layer of the source
+// image array at (2*i + 1, 2*j + 1). This recursively yields, for octave o
+// counted from oct 0:
+//
+//     oct-o pixel (i, j) <- oct-0 pixel (2^o * i + (2^o - 1),
+//                                        2^o * j + (2^o - 1))
+//
+// which matches the keypoint coord-conversion formula in
+// ExtractKeypoints.comp:
+//
+//     data.x = subpix_x * scale_factor + (scale_factor - 1)
+//
+// The earlier blit (VK_FILTER_LINEAR or _NEAREST) introduced a half-input-
+// pixel offset between the position the detector reported and the position
+// the value was actually sampled from. That mismatch caused Newton refine-
+// ment to walk systematically +x, +y at higher octaves (the gradient at the
+// discrete max became asymmetric because the cell's "geometric centre" and
+// the blob's true peak were offset by half an input pixel).
+//
+// Bindings: src and dst are both image2DArray with r32f format.
+//
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(r32f, binding = 0) uniform image2DArray img_input;
+layout(r32f, binding = 1) uniform image2DArray img_output;
+
+layout(push_constant) uniform PushConst {
+    int src_layer;
+    int dst_layer;
+    int dst_width;
+    int dst_height;
+} push_const;
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= push_const.dst_width || coords.y >= push_const.dst_height) return;
+    ivec3 src_coords = ivec3(2 * coords.x + 1, 2 * coords.y + 1, push_const.src_layer);
+    float v = imageLoad(img_input, src_coords).r;
+    imageStore(img_output, ivec3(coords, push_const.dst_layer), vec4(v, 0.0, 0.0, 1.0));
+}

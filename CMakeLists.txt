@@ -79,6 +79,7 @@ set(VULKANSIFT_LIB_SHADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussianBlur.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussianBlurInterpolated.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/DifferenceOfGaussian.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/Downsample2x.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ExtractKeypoints.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ExtractKeypoints2D.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/RGBAtoGray.comp

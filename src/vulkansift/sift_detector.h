@@ -88,6 +88,12 @@ typedef struct vksift_SiftDetector_T
   VkDescriptorSet *dog_desc_sets;
   VkPipelineLayout dog_pipeline_layout;
   VkPipeline dog_pipeline;
+  // Downsample2x set (Lowe pixel-aligned octave downsample, replaces blit)
+  VkDescriptorSetLayout downsample_desc_set_layout;
+  VkDescriptorPool downsample_desc_pool;
+  VkDescriptorSet *downsample_desc_sets;
+  VkPipelineLayout downsample_pipeline_layout;
+  VkPipeline downsample_pipeline;
   // ExtractKeypoints set
   VkDescriptorSetLayout extractkpts_desc_set_layout;
   VkDescriptorPool extractkpts_desc_pool;
