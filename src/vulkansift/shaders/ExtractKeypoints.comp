@@ -114,8 +114,8 @@ void main() {
 
         if(is_best_in_neighborhood) {
 
-            // NO REFINEMENT (testing).
-            bool can_refine = false;
+            // Newton subpixel refinement; always interior here.
+            bool can_refine = true;
 
             float subpix_x = float(x);
             float subpix_y = float(y);
