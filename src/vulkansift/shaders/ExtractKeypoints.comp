@@ -114,8 +114,8 @@ void main() {
 
         if(is_best_in_neighborhood) {
 
-            // Newton subpixel refinement; always interior here.
-            bool can_refine = true;
+            // NO REFINEMENT (testing).
+            bool can_refine = false;
 
             float subpix_x = float(x);
             float subpix_y = float(y);
@@ -248,7 +248,17 @@ void main() {
                         // independent of dispatch range. Passed via push constant
                         // so the boundary-aware dispatch (nb_scales + 2) doesn't
                         // break the formula.
-                        data[idx].sigma     = push_const.seed_scale_sigma * pow(2.f, subpix_s/float(push_const.nb_scales)) * scale_factor;
+                        // σ-slice convention:
+                        //   At octaves > 0, the DoG cube inherits a downsampled "subdiv -1"
+                        //   boundary slice from the previous octave's top. Cube slot z therefore
+                        //   corresponds to subdivision (z - 1), and the standard Lowe-formula
+                        //   σ = σ_seed * 2^(subdiv_idx / S) * 2^o evaluates as σ_seed *
+                        //   2^(subpix_s / S) * 2^o — exactly what's below.
+                        //   At octave 0 there is no preceding octave: cube slot z corresponds
+                        //   to subdivision z (no -1 offset). To keep the σ formula correct we
+                        //   add +1 to subpix_s for octave 0 only.
+                        float sigma_subdiv = (push_const.octave_idx == 0) ? (subpix_s + 1.0) : subpix_s;
+                        data[idx].sigma     = push_const.seed_scale_sigma * pow(2.f, sigma_subdiv/float(push_const.nb_scales)) * scale_factor;
                         data[idx].orientation = 0.f;
                         data[idx].intensity = new_val;
                         // Convert octave-pixel position to INPUT pixel index
