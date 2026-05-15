@@ -10,14 +10,23 @@ extern "C" {
 // Opaque handle
 typedef struct vksift_jl_context* vksift_jl_handle;
 
-// Per-feature result (no descriptor, no orientation — detection only)
+// Per-feature result (no descriptor, no orientation — detection only).
+//
+// DoG sign convention (matches VLFeat / BlobBoards / VGF):
+//   DoG[s] = G[s+1] − G[s], so polarity follows the local extremum:
+//     - DARK blob (intensity valley): DoG response is a local MAXIMUM
+//       in scale space, intensity > 0 here.
+//     - LIGHT blob (intensity peak): DoG response is a local MINIMUM,
+//       intensity < 0 here.
+//   To filter by polarity Julia-side use `f.intensity > 0` for dark
+//   blobs (typical SIFT default), `f.intensity < 0` for light blobs.
 typedef struct {
     float x;
     float y;
     float sigma;
     int32_t octave_idx;
     uint32_t scale_idx;
-    float intensity;  // peak score (DoG value)
+    float intensity;  // signed DoG response; sign = polarity (see above)
 } vksift_jl_feature;
 
 // Initialize VulkanSift with detection-only, 2D NMS configuration.

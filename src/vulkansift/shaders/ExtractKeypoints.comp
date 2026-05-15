@@ -245,21 +245,18 @@ void main() {
                         data[idx].scale_idx = uint(round(subpix_s));
                         data[idx].octave_idx = push_const.octave_idx;
                         // Sigma divisor is the SIFT octave_resolution (= nb_scales),
-                        // independent of dispatch range. Passed via push constant
-                        // so the boundary-aware dispatch (nb_scales + 2) doesn't
-                        // break the formula.
-                        // σ-slice convention:
-                        //   At octaves > 0, the DoG cube inherits a downsampled "subdiv -1"
-                        //   boundary slice from the previous octave's top. Cube slot z therefore
-                        //   corresponds to subdivision (z - 1), and the standard Lowe-formula
-                        //   σ = σ_seed * 2^(subdiv_idx / S) * 2^o evaluates as σ_seed *
-                        //   2^(subpix_s / S) * 2^o — exactly what's below.
-                        //   At octave 0 there is no preceding octave: cube slot z corresponds
-                        //   to subdivision z (no -1 offset). To keep the σ formula correct we
-                        //   add +1 to subpix_s for octave 0 only.
-                        float sigma_subdiv = (push_const.octave_idx == 0) ? (subpix_s + 1.0) : subpix_s;
-                        data[idx].sigma     = push_const.seed_scale_sigma * pow(2.f, sigma_subdiv/float(push_const.nb_scales)) * scale_factor;
+                        // independent of dispatch range. Standard Lowe formula:
+                        //   σ = σ_seed * 2^(subpix_s / S) * 2^o
+                        // Reports the DoG peak in σ-space — for a Gaussian blob of
+                        // std σ_b this is σ_b / √k where k = 2^(1/S), matching
+                        // OpenCV/VLFeat/VGF SIFT convention.
+                        data[idx].sigma     = push_const.seed_scale_sigma * pow(2.f, subpix_s/float(push_const.nb_scales)) * scale_factor;
                         data[idx].orientation = 0.f;
+                        // Signed DoG response at the (sub-pixel) extremum.
+                        // With DifferenceOfGaussian.comp's DoG[s] = G[s+1] − G[s]
+                        // convention, polarity follows: dark blob → is_max →
+                        // intensity > 0; light blob → is_min → intensity < 0.
+                        // Matches VLFeat/BlobBoards/VGF sign convention.
                         data[idx].intensity = new_val;
                         // Convert octave-pixel position to INPUT pixel index
                         // (Vulkan 0-indexed convention). Each downsample via
