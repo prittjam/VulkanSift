@@ -27,6 +27,10 @@ typedef struct
   int32_t nb_scales;       // = nb_scales_per_octave; sigma divisor in shader,
                            // independent of dispatch range so boundary-aware
                            // 3D NMS (dispatch = nb_scales + 2) keeps σ correct.
+  int32_t use_upsampling;  // 1 if first_octave=-1; shader compensates the
+                           // +0.25 input-pixel bias from the VK_FILTER_LINEAR
+                           // upsample blit (which propagates through every
+                           // Downsample2x).
 } ExtractKeypointsPushConsts;
 
 // Mirrors AffineWarp.comp's push_constant layout. Order matters:
@@ -1834,6 +1838,7 @@ static void recExtractKeypointsCmds(vksift_SiftDetector detector, VkCommandBuffe
     pushconst.dog_threshold = detector->intensity_threshold / detector->mem->nb_scales_per_octave;
     pushconst.edge_threshold = detector->edge_threshold;
     pushconst.nb_scales = (int32_t)detector->mem->nb_scales_per_octave;
+    pushconst.use_upsampling = detector->mem->use_upsampling ? 1 : 0;
     vkCmdPushConstants(cmdbuf, detector->extractkpts_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ExtractKeypointsPushConsts), &pushconst);
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->extractkpts_pipeline_layout, 0, 1, &detector->extractkpts_desc_sets[oct_idx],
                             0, NULL);

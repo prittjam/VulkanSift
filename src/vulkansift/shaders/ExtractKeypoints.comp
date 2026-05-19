@@ -49,6 +49,10 @@ layout(push_constant) uniform PushConst {
   float dog_threshold;
   float edge_threshold;
   int nb_scales;     // = nb_scales_per_octave, used as divisor in sigma formula
+  int use_upsampling; // 1 if first_octave=-1 (input→oct-1 via bilinear blit),
+                      // 0 otherwise. Compensates the +0.25 input-pixel shift
+                      // accumulated by VK_FILTER_LINEAR upsample which then
+                      // propagates through every Downsample2x.
 } push_const;
 
 
@@ -86,36 +90,58 @@ void main() {
     int image_height = imageSize(dog_input).y;
     int num_slices   = imageSize(dog_input).z;
 
-    // Interior-only 3D NMS: boundary slices (s=0, s=num_slices-1) are NEVER
-    // candidates. A candidate at a boundary slice lacks one z-neighbor; the
-    // response may still be rising or falling on the missing side (the true
-    // peak sits in the adjacent octave). Cube layout has overlap built in:
-    // octave o's top slice coincides with octave o+1's bottom slice in σ,
-    // so restricting candidates to interior slices still covers the full σ
-    // range across the pyramid without cross-octave duplicates.
-    if (s <= 0 || s >= num_slices - 1) return;
+    // Boundary-aware 3D NMS: all slices (incl. boundary s=0 and s=num_slices-1)
+    // are candidates. Interior slices test against the full 3×3×3 − 1 = 26
+    // neighbors. Boundary slices lack one z-neighbor, so they test against
+    // the 17 that exist (8 same-slice + 9 adjacent-slice). Newton subpixel
+    // refinement requires the 3D Hessian, so it runs only on interior slices;
+    // boundary candidates keep the discrete pixel position and let the
+    // spatial edge filter decide.
+    if (s < 0 || s >= num_slices) return;
+    bool at_low_boundary  = (s == 0);
+    bool at_high_boundary = (s == num_slices - 1);
+    bool at_boundary      = at_low_boundary || at_high_boundary;
 
     if(x>=1 && x < (image_width-1) && y>=1 && y < (image_height-1)) {
 
         float center_value = getVal(s, x, y);
         if (abs(center_value) <= (push_const.dog_threshold * 0.8f)) return;
 
-        // Full 3D NMS — both s-1 and s+1 always exist (guarded above).
-        bool is_max = greater_than_8(center_value, s, x, y) &&
-                      greater_than_9(center_value, s - 1, x, y) &&
-                      greater_than_9(center_value, s + 1, x, y);
+        bool is_max = false;
         bool is_min = false;
-        if (!is_max) {
-            is_min = less_than_8(center_value, s, x, y) &&
-                     less_than_9(center_value, s - 1, x, y) &&
-                     less_than_9(center_value, s + 1, x, y);
+        if (at_low_boundary) {
+            // 17-neighbor: 8 same-slice + 9 in slice s+1 (no s-1)
+            is_max = greater_than_8(center_value, s, x, y) &&
+                     greater_than_9(center_value, s + 1, x, y);
+            if (!is_max) {
+                is_min = less_than_8(center_value, s, x, y) &&
+                         less_than_9(center_value, s + 1, x, y);
+            }
+        } else if (at_high_boundary) {
+            // 17-neighbor: 8 same-slice + 9 in slice s-1 (no s+1)
+            is_max = greater_than_8(center_value, s, x, y) &&
+                     greater_than_9(center_value, s - 1, x, y);
+            if (!is_max) {
+                is_min = less_than_8(center_value, s, x, y) &&
+                         less_than_9(center_value, s - 1, x, y);
+            }
+        } else {
+            // 26-neighbor: 8 same-slice + 9 above + 9 below
+            is_max = greater_than_8(center_value, s, x, y) &&
+                     greater_than_9(center_value, s - 1, x, y) &&
+                     greater_than_9(center_value, s + 1, x, y);
+            if (!is_max) {
+                is_min = less_than_8(center_value, s, x, y) &&
+                         less_than_9(center_value, s - 1, x, y) &&
+                         less_than_9(center_value, s + 1, x, y);
+            }
         }
         bool is_best_in_neighborhood = is_max || is_min;
 
         if(is_best_in_neighborhood) {
 
-            // Newton subpixel refinement; always interior here.
-            bool can_refine = true;
+            // Newton subpixel refinement only at interior slices (need 3D Hessian).
+            bool can_refine = !at_boundary;
 
             float subpix_x = float(x);
             float subpix_y = float(y);
@@ -245,12 +271,14 @@ void main() {
                         data[idx].scale_idx = uint(round(subpix_s));
                         data[idx].octave_idx = push_const.octave_idx;
                         // Sigma divisor is the SIFT octave_resolution (= nb_scales),
-                        // independent of dispatch range. Standard Lowe formula:
-                        //   σ = σ_seed * 2^(subpix_s / S) * 2^o
-                        // Reports the DoG peak in σ-space — for a Gaussian blob of
-                        // std σ_b this is σ_b / √k where k = 2^(1/S), matching
-                        // OpenCV/VLFeat/VGF SIFT convention.
-                        data[idx].sigma     = push_const.seed_scale_sigma * pow(2.f, subpix_s/float(push_const.nb_scales)) * scale_factor;
+                        // independent of dispatch range. DoG slice s represents
+                        // the geometric mean σ between Gaussians G[s] and G[s+1]:
+                        //   σ = σ_seed * 2^((subpix_s + 0.5) / S) * 2^o
+                        // The +0.5 offset matches BB/VGF's "adjusted_base_sigma"
+                        // convention (scalespace.jl:292) where base_sigma is
+                        // pre-multiplied by 2^(1/S), shifting the σ labels by
+                        // half a subdivision toward the DoG midpoint.
+                        data[idx].sigma     = push_const.seed_scale_sigma * pow(2.f, (subpix_s + 0.5f)/float(push_const.nb_scales)) * scale_factor;
                         data[idx].orientation = 0.f;
                         // Signed DoG response at the (sub-pixel) extremum.
                         // With DifferenceOfGaussian.comp's DoG[s] = G[s+1] − G[s]
@@ -259,13 +287,34 @@ void main() {
                         // Matches VLFeat/BlobBoards/VGF sign convention.
                         data[idx].intensity = new_val;
                         // Convert octave-pixel position to INPUT pixel index
-                        // (Vulkan 0-indexed convention). Each downsample via
-                        // vkCmdBlitImage with VK_FILTER_NEAREST samples source
-                        // texel (2i + 1) for destination texel i, accumulating
-                        // an offset of (2^o - 1) input pixels per octave.
+                        // (Vulkan 0-indexed convention). Two conventions are
+                        // in play depending on octave direction:
+                        //   - Downsample (oct ≥ 1) uses Downsample2x.comp,
+                        //     which is pixel-aligned: dst(i) = src(2i+1). This
+                        //     accumulates +1 source pixel per octave, so the
+                        //     offset is (scale_factor - 1).
+                        //   - Upsample (oct = -1, when first_octave=-1) is
+                        //     reached via vkCmdBlitImage with VK_FILTER_LINEAR,
+                        //     which places upsampled pixel j at source position
+                        //     (j+0.5)/2 - 0.5 = j/2 - 0.25, accumulating only
+                        //     HALF the per-octave offset compared to the Lowe
+                        //     pixel-aligned convention. So the offset for
+                        //     scale_factor < 1 is (scale_factor - 1) / 2.
                         // Caller adds +0.5 to convert to COLMAP center.
-                        data[idx].x = subpix_x*scale_factor + (scale_factor - 1.0);
-                        data[idx].y = subpix_y*scale_factor + (scale_factor - 1.0);
+                        // Coordinate-frame convention: when use_upsampling=1
+                        // (first_octave=-1), the input→octave-(-1) step uses
+                        // vkCmdBlitImage VK_FILTER_LINEAR which places
+                        // upsampled pixel j at source position (j+0.5)/2 - 0.5,
+                        // shifting content by +0.25 input pixels. That shift
+                        // then propagates through every Downsample2x: each
+                        // downsampled pixel inherits the same +0.25 input-px
+                        // bias, so reported positions are uniformly LOW by
+                        // 0.25 in input coords. Compensate by adding +0.25
+                        // at every octave when upsampling is on.
+                        // Caller adds +0.5 to convert to COLMAP center.
+                        float upsample_bias = (push_const.use_upsampling != 0) ? 0.25 : 0.0;
+                        data[idx].x = subpix_x*scale_factor + (scale_factor - 1.0) + upsample_bias;
+                        data[idx].y = subpix_y*scale_factor + (scale_factor - 1.0) + upsample_bias;
                     }
                 }
             }
