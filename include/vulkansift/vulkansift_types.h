@@ -98,14 +98,38 @@ extern "C"
   {
     // Input/Output configuration
 
-    // Maximum size (in bytes) for the input grayscale images
-    // (defined as input_image_max_size = max_width*max_height)
-    // (default: 1920*1080)
+    // Maximum size (in pixels) for the input grayscale images.
+    //
+    // Two ways to express this:
+    //   - Legacy: set `input_image_max_size = max_width * max_height` and leave
+    //     `input_image_max_width / _height` at 0. SIFT allocates a SQUARE buffer
+    //     of side ceil(sqrt(input_image_max_size)) — fine for square inputs but
+    //     over-budgets when the max output is non-square (e.g. an ASIFT tilted
+    //     image at W_rot × H_rot/t with W_rot ≫ H_rot/t).
+    //   - Explicit: set `input_image_max_width` and `input_image_max_height` to
+    //     the actual maximum dims you'll ever pass. `input_image_max_size` is
+    //     re-derived as the product. No square over-budgeting.
+    //
+    // Default: 1920×1080 = legacy form for backward compat.
     uint32_t input_image_max_size;
+    // Explicit non-square sizing. Both must be > 0 to take effect; otherwise
+    // the legacy square ceiling is used.
+    uint32_t input_image_max_width;
+    uint32_t input_image_max_height;
     // Number of SIFT buffers (stored on the GPU) to be reserved by the application (default: 2)
     uint32_t sift_buffer_count;
     // Maximum number of SIFT features stored by a GPU SIFT bufer (default: 100000)
     uint32_t max_nb_sift_per_buffer;
+
+    // Number of independent pyramid slots used by the parallel IMAS+detect
+    // pipeline (default: 1). Each slot owns its own per-pyramid GPU memory
+    // (rotated_image, input_image, blurred/warped, octave arrays, DoG arrays,
+    // blur tmp, sift_buffer) — allowing N IMAS+detect chains to be submitted
+    // simultaneously and overlap on the GPU scheduler. Memory cost: ~3-4 GB
+    // per slot at a 4K input with upsample=true; 5 slots fit in a 24 GB
+    // 4090 with headroom. Set to 1 to disable parallel processing (single
+    // pyramid, classic behavior).
+    uint32_t nb_pyramid_slots;
 
     // SIFT algorithm configuration
 
