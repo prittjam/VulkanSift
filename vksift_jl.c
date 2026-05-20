@@ -361,6 +361,9 @@ void vksift_jl_dispatch_parallel_imas(
                 out[i].octave_idx= raw[i].octave_idx;
                 out[i].scale_idx = raw[i].scale_idx;
                 out[i].intensity = raw[i].intensity;
+                out[i].s_xx      = raw[i].s_xx;
+                out[i].s_xy      = raw[i].s_xy;
+                out[i].s_yy      = raw[i].s_yy;
             }
             free(raw);
             h->parallel_features[base + s] = out;

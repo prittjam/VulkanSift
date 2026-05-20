@@ -26,7 +26,13 @@ typedef struct {
     float sigma;
     int32_t octave_idx;
     uint32_t scale_idx;
-    float intensity;  // signed DoG response; sign = polarity (see above)
+    float intensity;     // signed DoG response; sign = polarity (see above)
+    // Input-frame ellipse shape S = σ · A_inv (symmetric). Populated by
+    // BackProjectFeatures.comp from the IMAS warp's inverse-tilt matrix.
+    // Identity warp gives s_xx = s_yy = σ, s_xy = 0 (circle).
+    float s_xx;
+    float s_xy;
+    float s_yy;
 } vksift_jl_feature;
 
 // Initialize VulkanSift with detection-only, 2D NMS configuration.

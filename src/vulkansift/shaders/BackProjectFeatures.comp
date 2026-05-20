@@ -53,6 +53,7 @@ struct SIFT_Feat {
   float sigma;
   float orientation;
   float intensity;
+  float s_xx, s_xy, s_yy;  // Input-frame ellipse shape S = sigma * A_inv (symmetric)
   uint  descriptor[(NB_HIST*NB_HIST*NB_ORI)/4];
 };
 
@@ -102,6 +103,10 @@ layout(std140, set = 1, binding = 0) uniform WarpParamsBlock {
   uint  bp_input_H;
   uint  bp_is_identity;
   uint  bp_nb_octaves;
+  float bp_shape_a11;   // Symmetric input-frame shape matrix: σ·A_inv where
+  float bp_shape_a12;   // A_inv = R(-φ)·diag(1,t)·R(φ). Multiplied by σ per
+  float bp_shape_a22;   // feature below to produce s_xx/s_xy/s_yy.
+  float _bp_shape_pad;
 } ubo;
 
 void main() {
@@ -138,11 +143,15 @@ void main() {
     }
 
     if (keep) {
-      // Overwrite tilted-frame (x, y) with input-frame (xi, yi). σ stays
-      // in warped units — the Julia side multiplies by A_inv to build the
-      // 2×2 input-frame shape matrix.
+      // Overwrite tilted-frame (x, y) with input-frame (xi, yi).
+      // Also write the input-frame ellipse shape S = σ · A_inv (symmetric)
+      // so downstream consumers don't need to know A_inv per warp. For the
+      // identity warp the shape collapses to σ·I (circle).
       data[i].x = xi;
       data[i].y = yi;
+      data[i].s_xx = sigma * ubo.bp_shape_a11;
+      data[i].s_xy = sigma * ubo.bp_shape_a12;
+      data[i].s_yy = sigma * ubo.bp_shape_a22;
     } else {
       // Mark feature as rejected. The host reads octave_idx < 0 and skips.
       data[i].octave_idx = -1;

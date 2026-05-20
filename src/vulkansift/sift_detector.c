@@ -3877,6 +3877,15 @@ void vksift_fillFusedWarpState(vksift_SiftDetector detector,
     ubo.bp_is_identity = ((t_factor == 1.0f) && (theta_rad == 0.0f)) ? 1u : 0u;
     ubo.bp_nb_octaves  = detector->mem->curr_nb_octaves;
 
+    // Input-frame shape matrix S = σ · A_inv where
+    // A_inv = R(-φ) · diag(1, t) · R(φ) (symmetric). BackProjectFeatures.comp
+    // multiplies these by the feature's σ to stamp s_xx / s_xy / s_yy onto
+    // each kept SIFT_Feat record. Identity warp (t=1, φ=0) collapses to I.
+    ubo.bp_shape_a11   = cf * cf + t_factor * sf * sf;
+    ubo.bp_shape_a12   = (t_factor - 1.0f) * cf * sf;
+    ubo.bp_shape_a22   = sf * sf + t_factor * cf * cf;
+    ubo._bp_shape_pad  = 0.0f;
+
     memcpy(detector->mem->slots[slot_idx].warp_params_ubo_ptr, &ubo, sizeof(WarpParamsUBO));
   }
 

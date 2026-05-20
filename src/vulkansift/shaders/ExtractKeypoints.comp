@@ -27,6 +27,7 @@ struct SIFT_Feat {
   float sigma;
   float orientation;
   float intensity;
+  float s_xx, s_xy, s_yy;  // Input-frame ellipse shape S = sigma * A_inv (symmetric, populated by BackProjectFeatures for ASIFT-warp features; zero otherwise)
   uint descriptor[(NB_HIST*NB_HIST*NB_ORI)/4];
 };
 

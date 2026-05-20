@@ -26,6 +26,9 @@ extern "C"
     float sigma;        // blur level of the gaussian scale image (this value is divided by two if upsampling was used)
     float orientation;  // feature orientation (rad)
     float intensity;    // keypoint pixel intensity in the Difference of Gaussian image
+    float s_xx;         // Input-frame ellipse shape matrix S = σ · A_inv (symmetric, 3 floats).
+    float s_xy;         // Set per-feature by BackProjectFeatures.comp from the IMAS warp's
+    float s_yy;         // inverse-tilt matrix. Identity warp: s = σ·I (a circle).
 
     uint8_t descriptor[VKSIFT_FEATURE_NB_HIST * VKSIFT_FEATURE_NB_HIST * VKSIFT_FEATURE_NB_ORI]; // Feature descriptor
   } vksift_Feature;

@@ -114,6 +114,18 @@ typedef struct
   uint32_t bp_input_H;          // original input image height
   uint32_t bp_is_identity;      // 1 for the t=1, φ=0 warp (skip boundary check)
   uint32_t bp_nb_octaves;       // mem->curr_nb_octaves — shader walks this many sections
+
+  // [bytes 144..159] — Symmetric inverse-tilt SHAPE matrix (16 B, 1 padding).
+  // The shape matrix S of an ASIFT feature in the INPUT frame is σ · A_inv
+  // where A_inv = R(-φ)·diag(1, t)·R(φ) is symmetric. BackProjectFeatures.comp
+  // multiplies by σ and writes s_xx, s_xy, s_yy onto each feature record so
+  // downstream consumers receive an input-frame ellipse rather than a
+  // tilted-frame circle. The position back-projection (bp_a*) uses a different
+  // (asymmetric) matrix because the IMAS forward warp itself is asymmetric.
+  float    bp_shape_a11;        // cφ² + t·sφ²
+  float    bp_shape_a12;        // (t-1)·cφ·sφ   (=bp_shape_a21 by symmetry)
+  float    bp_shape_a22;        // sφ² + t·cφ²
+  float    _bp_shape_pad;
 } WarpParamsUBO;
 
 #endif // VKSIFT_WARP_UBO_H
