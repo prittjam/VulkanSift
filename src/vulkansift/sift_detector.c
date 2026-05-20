@@ -1300,8 +1300,11 @@ static bool setupComputePipelines(vksift_SiftDetector detector)
       logError(LOG_TAG, "Failed to create SiftSeedFromInput shader module");
       return false;
     }
-    if (!vkenv_createComputePipeline(detector->dev->device, sf_shader_module, detector->seed_from_input_desc_set_layout, sizeof(Upsample2xLinearPushConsts),
-                                     &detector->seed_from_input_pipeline_layout, &detector->seed_from_input_pipeline))
+    if (!vkenv_createComputePipeline2(detector->dev->device, sf_shader_module,
+                                      detector->seed_from_input_desc_set_layout,
+                                      detector->warp_ubo_desc_set_layout,
+                                      sizeof(Upsample2xLinearPushConsts),
+                                      &detector->seed_from_input_pipeline_layout, &detector->seed_from_input_pipeline))
     {
       logError(LOG_TAG, "Failed to create SiftSeedFromInput pipeline");
       vkDestroyShaderModule(detector->dev->device, sf_shader_module, NULL);
@@ -1798,12 +1801,15 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
 
   /////////////////////////////////////////////////////
   // Write set for SiftSeedFromInput pipeline (per-slot). Binds:
-  //   0: slots[s].input_image_view (R8_UNORM image2D, post-Quantize)
+  //   0: slots[s].rotated_image_view (R32F image2D, IMAS fproj output)
   //   1: slots[s].octave_image_view_arr[0] (R32F image2DArray, octave 0)
+  // Reads R32F directly to skip the QuantizeF32ToInput R32F→R8 roundtrip on
+  // the fused IMAS path. The shader uses the WarpParamsUBO (set=1) to
+  // apply valid_w/valid_h/quantize_fill replicating Quantize's fill rule.
   for (uint32_t s = 0u; s < N; ++s)
   {
     VkDescriptorImageInfo sf_in_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].rotated_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo sf_out_info = {
         .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_image_view_arr[0], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet sf_writes[2];
@@ -3251,9 +3257,15 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
   vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                       detector->shader_timestamp_pools[slot_idx], VKSIFT_TS_AFTER_IMAS);
 
-  // ---- 6. Quantize : slot.rotated_image (R32F) → slot.input_image (R8) ----
-  // Reuses recQuantizeImasToInputCmds's barrier sequence + indirect dispatch.
-  beginMarkerRegion(detector, cmd, "Quantize IMAS → input (fused)");
+  // (Quantize step removed on the fused IMAS path — SiftSeedFromInput now
+  // reads rotated_image R32F directly, applying valid-region fill via the
+  // WarpParamsUBO. The non-fused detect_command_buffer_from_imas still uses
+  // Quantize. We emit the AFTER_QUANT timestamp at the same point as before
+  // so the per-region accounting stays valid; it now effectively measures
+  // the rotated_image SHADER_WRITE→SHADER_READ barrier alone (~µs).)
+
+  // Make slot.rotated_image readable by the next compute shader (the
+  // SiftSeedFromInput dispatch below).
   {
     VkImageMemoryBarrier rotated_barrier = vkenv_genImageMemoryBarrier(
         slot->rotated_image,
@@ -3266,50 +3278,17 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, NULL, 0, NULL, 1, &rotated_barrier);
-
-    VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
-        slot->input_image,
-        0, VK_ACCESS_SHADER_WRITE_BIT,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, NULL, 0, NULL, 1, &input_barrier);
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
-                            0, 1, &detector->quantize_desc_set[slot_idx], 0, NULL);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
-                            1, 1, &detector->warp_ubo_desc_sets[slot_idx], 0, NULL);
-    vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
-                          offsetof(SlotDispatchBuffer, quantize));
-
-    VkImageMemoryBarrier post_barrier = vkenv_genImageMemoryBarrier(
-        slot->input_image,
-        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, NULL, 0, NULL, 1, &post_barrier);
   }
-  endMarkerRegion(detector, cmd);
-
-  // Timestamp: end of Quantize.
   vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                       detector->shader_timestamp_pools[slot_idx], VKSIFT_TS_AFTER_QUANT);
 
   // ---- 6b. (Optional, VKSIFT_FUSED_OCT0=1) Seed-from-input fast path. ----
   // Replaces the PreBlur1D + AffineWarp + (CopyImage|Upsample2xLinear) chain
-  // at oct_idx==0 with a single SiftSeedFromInput dispatch that writes
-  // input_image (R8) directly into octave_image_arr[0] layer 0 (R32F),
-  // with optional 2× upsample built in. Also corrects a latent bug where the
-  // OLD path's AffineWarp double-applied the IMAS rotation matrix — feature
-  // counts change vs. the default path, so this is opt-in pending validation.
+  // at oct_idx==0 with a single SiftSeedFromInput dispatch that reads
+  // rotated_image (R32F, IMAS fproj output) and writes octave_image_arr[0]
+  // layer 0 (R32F). Skips Quantize entirely — the shader applies the
+  // valid-region fill itself via WarpParamsUBO (set=1). Also corrects the
+  // latent oct-0 double-rotation bug from the old PreBlur+AffineWarp path.
   if (detector->fused_oct0_enabled)
   {
     const uint32_t in_w  = detector->mem->curr_input_image_width;
@@ -3330,6 +3309,9 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             detector->seed_from_input_pipeline_layout, 0, 1,
                             &detector->seed_from_input_desc_set[slot_idx], 0, NULL);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            detector->seed_from_input_pipeline_layout, 1, 1,
+                            &detector->warp_ubo_desc_sets[slot_idx], 0, NULL);
     Upsample2xLinearPushConsts sf_pc = {
         .dst_layer  = 0,
         .dst_width  = (int32_t)oct_w,
@@ -3339,10 +3321,6 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
     vkCmdPushConstants(cmd, detector->seed_from_input_pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(Upsample2xLinearPushConsts), &sf_pc);
-    // Indirect dispatch via the slot's SlotDispatchBuffer.seed_from_input
-    // field (populated host-side per warp in vksift_fillFusedWarpState).
-    // The cmd buffer recording becomes independent of oct-0 dims, matching
-    // the rest of the IMAS chain's indirect pattern.
     vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
                           offsetof(SlotDispatchBuffer, seed_from_input));
   }
