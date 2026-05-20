@@ -30,6 +30,22 @@ typedef struct vksift_SiftDetector_T
   // (mem->rotated_image, the IMAS pipeline's output) via the quantize shader.
   // Used by vksift_detectFeaturesOnImas() — no host roundtrip.
   VkCommandBuffer detection_command_buffer_from_imas;
+  // Phase B-3: fully-fused IMAS-chain + Quantize + SIFT detect command buffer,
+  // pre-recorded once per pyramid slot. Combines the work that previously ran
+  // on the IMAS pipeline's cmd buffer (run_imas) AND
+  // detection_command_buffer_from_imas into a single GPU submission per warp,
+  // eliminating one fence wait. IMAS-chain dispatch dimensions come from the
+  // slot's indirect-dispatch buffer (mem->slots[s].dispatch_buffer); affine
+  // matrix + canvas dims come from mem->slots[s].warp_params_ubo. Host updates
+  // both buffers before each submission and reuses the recording.
+  VkCommandBuffer fused_imas_detect_command_buffer[VKSIFT_MAX_PYRAMID_SLOTS];
+
+  // Phase B-3: external reference to the lazy-created IMAS pipeline (owned by
+  // vksift_Instance_T, set by vulkansift.c when the pipeline first comes up).
+  // The fused-cmd-buffer recording needs to bind the IMAS shaders' pipelines
+  // and descriptor sets; without this pointer the detector cannot record the
+  // IMAS chain. NULL until first use of the fused path.
+  struct vksift_ImasPipeline_T *imas_pipeline_ref;
   VkCommandBuffer acquire_buffer_ownership_command_buffer;
   VkCommandBuffer release_buffer_ownership_command_buffer;
 
@@ -187,6 +203,30 @@ bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t t
 // IMAS-tilted Float32 content and set detector->quantize_width / _height to
 // the actual sub-region the IMAS pipeline wrote into.
 bool vksift_dispatchSiftDetectionFromImas(vksift_SiftDetector detector, const uint32_t target_buffer_idx, const bool memory_layout_updated);
+
+// Phase B-3: dispatch the fully-fused IMAS-chain + Quantize + SIFT-detect
+// command buffer for the given slot. The host first populates the slot's
+// WarpParamsUBO (affine matrix, sigma_aa, canvas dims, valid sub-region, ...)
+// and the slot's indirect-dispatch buffer (group counts for AffineWarp,
+// GaussBlur1D, Finvspline{Row,Col}, Fproj, Quantize), then submits the
+// pre-recorded fused command buffer on detector->general_queue with
+// detector->end_of_detection_fence. Detection results land in sift_buffer_arr[
+// target_buffer_idx] and can be read via the existing
+// vksift_getFeaturesNumber / vksift_downloadFeatures path.
+//
+// (W, H) are the input image dims (= curr_input_image_*; same for every warp
+// in a run). (t_factor, theta_rad) define the IMAS warp. (canvas_w, canvas_h)
+// is the SIFT pyramid input canvas (keep stable across warps).
+//
+// Note (Phase B-3): only slot_idx == 0 is actually exercised, since the SIFT
+// detect descriptor sets (blur, dog, extractkpts, ...) are still bound to
+// mem->slots[0]'s image views. Phase C will rebind those per slot.
+bool vksift_dispatchFusedImasWarpForSlot(vksift_SiftDetector detector,
+                                         uint32_t slot_idx, const uint32_t target_buffer_idx,
+                                         uint32_t W, uint32_t H,
+                                         float t_factor, float theta_rad,
+                                         uint32_t canvas_w, uint32_t canvas_h,
+                                         bool memory_layout_updated);
 
 // Set the affine matrix that will be pushed to AffineWarp.comp on the next
 // detect dispatch. Marks the command buffer for re-record. Matrix layout:

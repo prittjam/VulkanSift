@@ -1,10 +1,12 @@
 #include "sift_detector.h"
+#include "sift_imas.h"
 
 #include "vkenv/logger.h"
 #include "vkenv/vulkan_utils.h"
 
 #include <assert.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -213,6 +215,18 @@ static bool allocateCommandBuffers(vksift_SiftDetector detector)
   {
     logError(LOG_TAG, "Failed to allocate the detection-from-IMAS command buffer");
     return false;
+  }
+  // Phase B-3: per-slot fused IMAS-chain + Quantize + SIFT-detect command
+  // buffers. Allocated up-front for every slot so the parallel-wave driver
+  // (Phase C) can submit them concurrently without further allocation churn.
+  for (uint32_t s = 0u; s < VKSIFT_MAX_PYRAMID_SLOTS; ++s)
+  {
+    if (vkAllocateCommandBuffers(detector->dev->device, &allocate_info,
+                                 &detector->fused_imas_detect_command_buffer[s]) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to allocate the fused IMAS+detect command buffer (slot %u)", s);
+      return false;
+    }
   }
 
   // If the async tranfer queue is available the SIFT buffers are owned by the transfer queue family
@@ -2287,6 +2301,276 @@ static void recBufferOwnershipTransferCmds(vksift_SiftDetector detector, VkComma
   endMarkerRegion(detector, cmdbuf);
 }
 
+// =============================================================================
+// Phase B-3 — fused IMAS-chain + Quantize + SIFT-detect command buffer per slot
+// =============================================================================
+//
+// Records the union of vksift_runImasWarp's chain (sift_imas.c) and
+// recordCommandBuffers's detection_command_buffer_from_imas branch into a
+// single pre-recorded primary command buffer for `slot_idx`. Re-recorded
+// whenever the memory layout changes (input resolution → pyramid resize) or
+// the IMAS pipeline first comes up.
+//
+// All IMAS-chain dispatches use vkCmdDispatchIndirect against the slot's
+// host-mapped dispatch_buffer (SlotDispatchBuffer layout in sift_warp_ubo.h);
+// host fills the group counts per warp before submitting. SIFT-detect
+// dispatches stay direct — their canvas is curr_input_image_* which is stable
+// across warps. The SIFT detect descriptor sets bind slots[0]'s image views
+// (Phase A holdover); slot_idx > 0 is allocated but not yet exercised here.
+static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t slot_idx)
+{
+  // No-op until the IMAS pipeline has been lazily created by the first
+  // fused-dispatch call. The cmd buffer stays empty (but valid — we still
+  // begin/end it so it's safe to leave allocated).
+  if (detector->imas_pipeline_ref == NULL)
+  {
+    VkCommandBuffer cmd = detector->fused_imas_detect_command_buffer[slot_idx];
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return false;
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+    return true;
+  }
+
+  struct vksift_ImasPipeline_T *imas = detector->imas_pipeline_ref;
+  VkCommandBuffer cmd = detector->fused_imas_detect_command_buffer[slot_idx];
+  vksift_SiftPyramidSlot *slot = &detector->mem->slots[slot_idx];
+
+  VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return false;
+
+  // ---- Acquire SIFT buffer ownership if async transfer is enabled ----
+  if (detector->dev->async_transfer_available)
+  {
+    recBufferOwnershipTransferCmds(detector, cmd, 0, detector->mem->curr_nb_octaves,
+                                   detector->dev->async_transfer_queues_family_idx,
+                                   detector->dev->general_queues_family_idx,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  }
+
+  // ---- Layout transitions for IMAS scratch images + cached input ----
+  // cached_input_image must be GENERAL for sampler reads (single shared
+  // resource — not per-slot). rotated/tilted scratch start UNDEFINED → GENERAL
+  // (contents overwritten by IMAS chain).
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(
+        detector->mem->cached_input_image,
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, &b);
+  }
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(slot->rotated_image,
+        0, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+  }
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(slot->tilted_image,
+        0, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+  }
+
+  // The slot's WarpParamsUBO descriptor (set = 1) is the same for every IMAS
+  // shader. Bind it once via each pipeline layout below — we still have to
+  // re-bind through each pipeline_layout since they're distinct VkPipelineLayout
+  // objects (Vulkan binds descriptor sets per pipeline layout).
+  VkDescriptorSet ubo_set = imas->warp_ubo_desc_sets[slot_idx];
+
+  beginMarkerRegion(detector, cmd, "IMAS chain (indirect)");
+
+  // ---- 1. AffineWarp (rotate) : cached_input_image → slot.rotated_image ----
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->warp_pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->warp_pipeline_layout,
+                          0, 1, &imas->warp_set, 0, NULL);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->warp_pipeline_layout,
+                          1, 1, &ubo_set, 0, NULL);
+  vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
+                        offsetof(SlotDispatchBuffer, affinewarp));
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(slot->rotated_image,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+  }
+
+  // ---- 2. GaussBlur1D vertical : slot.rotated_image → slot.tilted_image ----
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->blur_pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->blur_pipeline_layout,
+                          0, 1, &imas->blur_set, 0, NULL);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->blur_pipeline_layout,
+                          1, 1, &ubo_set, 0, NULL);
+  vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
+                        offsetof(SlotDispatchBuffer, gaussblur));
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(slot->tilted_image,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+  }
+
+  // ---- 3. FinvsplineRow : in-place per-row IIR on slot.tilted_image ----
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_row_pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
+                          0, 1, &imas->finvspline_row_set, 0, NULL);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
+                          1, 1, &ubo_set, 0, NULL);
+  vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
+                        offsetof(SlotDispatchBuffer, finvspline_row));
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(slot->tilted_image,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+  }
+
+  // ---- 4. FinvsplineCol : in-place per-col IIR on slot.tilted_image ----
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_col_pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
+                          0, 1, &imas->finvspline_col_set, 0, NULL);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
+                          1, 1, &ubo_set, 0, NULL);
+  vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
+                        offsetof(SlotDispatchBuffer, finvspline_col));
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(slot->tilted_image,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+  }
+
+  // ---- 5. FprojCubicY : slot.tilted_image → slot.rotated_image (sub-region) ----
+  // NOTE: Phase B-3 always uses the cubic Fproj. The bilinear variant
+  // (controlled by VKSIFT_IMAS_BILINEAR in vksift_runImasWarp) requires
+  // skipping the two Finvspline passes — that's a future optimization for the
+  // fused path, not landed here. The bilinear pipeline shares the cubic's
+  // descriptor set + pipeline layout so it would be a one-line swap.
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->fproj_pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->fproj_pipeline_layout,
+                          0, 1, &imas->fproj_set, 0, NULL);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->fproj_pipeline_layout,
+                          1, 1, &ubo_set, 0, NULL);
+  vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
+                        offsetof(SlotDispatchBuffer, fproj));
+  endMarkerRegion(detector, cmd);
+
+  // ---- 6. Quantize : slot.rotated_image (R32F) → slot.input_image (R8) ----
+  // Reuses recQuantizeImasToInputCmds's barrier sequence + indirect dispatch.
+  beginMarkerRegion(detector, cmd, "Quantize IMAS → input (fused)");
+  {
+    VkImageMemoryBarrier rotated_barrier = vkenv_genImageMemoryBarrier(
+        slot->rotated_image,
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, &rotated_barrier);
+
+    VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
+        slot->input_image,
+        0, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, &input_barrier);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
+                            0, 1, &detector->quantize_desc_set, 0, NULL);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
+                            1, 1, &detector->warp_ubo_desc_sets[slot_idx], 0, NULL);
+    vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
+                          offsetof(SlotDispatchBuffer, quantize));
+
+    VkImageMemoryBarrier post_barrier = vkenv_genImageMemoryBarrier(
+        slot->input_image,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, &post_barrier);
+  }
+  endMarkerRegion(detector, cmd);
+
+  // ---- 7. SIFT detect chain ----
+  // Direct dispatches; canvas is curr_input_image_* which is stable across
+  // warps. recExtractKeypointsCmds / recCopySIFTCountCmds use
+  // detector->curr_buffer_idx (host sets it before re-recording) so the
+  // target sift_buffer is the caller-requested one. SIFT-detect descriptor
+  // sets bind mem->slots[0]'s image views (Phase A holdover) — that's why
+  // Phase B-3 only exercises slot_idx == 0.
+  recClearBufferDataCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
+  for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+  {
+    recScaleSpaceConstructionCmds(detector, cmd, i);
+  }
+  recDifferenceOfGaussianCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
+  recExtractKeypointsCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
+  if (!detector->detection_only)
+  {
+    recComputeOrientationsCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
+    recComputeDestriptorsCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
+  }
+  recCopySIFTCountCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
+
+  if (detector->dev->async_transfer_available)
+  {
+    recBufferOwnershipTransferCmds(detector, cmd, 0, detector->mem->curr_nb_octaves,
+                                   detector->dev->general_queues_family_idx,
+                                   detector->dev->async_transfer_queues_family_idx,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+  }
+
+  if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
+  {
+    logError(LOG_TAG, "Failed to record fused IMAS+detect command buffer (slot %u)", slot_idx);
+    return false;
+  }
+  return true;
+}
+
 static bool recordCommandBuffers(vksift_SiftDetector detector)
 {
   VkCommandBufferBeginInfo begin_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = 0, .pInheritanceInfo = NULL};
@@ -2427,6 +2711,18 @@ static bool recordCommandBuffers(vksift_SiftDetector detector)
   {
     logError(LOG_TAG, "Failed to record on-IMAS detection command buffer");
     return false;
+  }
+
+  /////////////////////////////////////////////////////
+  // Phase B-3: record fused IMAS-chain + Quantize + SIFT-detect cmd buffer
+  // per slot. The recording is no-op until imas_pipeline_ref is wired up by
+  // vksift_detectFeaturesFusedImas's lazy-init path (see vulkansift.c). After
+  // that, every call to recordCommandBuffers re-records the fused buffers as
+  // well so they pick up new pyramid resolutions / IMAS pipeline objects.
+  /////////////////////////////////////////////////////
+  for (uint32_t s = 0u; s < detector->mem->nb_pyramid_slots; ++s)
+  {
+    if (!recFusedImasDetectCmdsForSlot(detector, s)) return false;
   }
 
   return true;
@@ -2634,6 +2930,159 @@ bool vksift_dispatchSiftDetectionFromImas(vksift_SiftDetector detector, const ui
 {
   return dispatchDetectionCmdBuffer(detector, target_buffer_idx, memory_layout_updated,
                                     &detector->detection_command_buffer_from_imas);
+}
+
+// Phase B-3 — see sift_detector.h for the contract. Builds the WarpParamsUBO
+// + SlotDispatchBuffer for the requested warp, writes them into the slot's
+// host-mapped buffers, then submits the pre-recorded fused command buffer for
+// the slot. The host populates exactly the fields each shader (IMAS chain +
+// Quantize) reads; the SIFT-detect chain has no per-warp params (its canvas
+// is curr_input_image_*).
+bool vksift_dispatchFusedImasWarpForSlot(vksift_SiftDetector detector,
+                                         uint32_t slot_idx, const uint32_t target_buffer_idx,
+                                         uint32_t W, uint32_t H,
+                                         float t_factor, float theta_rad,
+                                         uint32_t canvas_w, uint32_t canvas_h,
+                                         bool memory_layout_updated)
+{
+  if (detector == NULL || slot_idx >= VKSIFT_MAX_PYRAMID_SLOTS) return false;
+
+  // ---- 1. Compute rotated canvas + inverse-rotation affine (same formula
+  // as vksift_runImasWarp). Float math is single-precision throughout to
+  // match the shader's f32 input. ----
+  float ca = cosf(theta_rad);
+  float sa = sinf(theta_rad);
+  int xmin, xmax, ymin, ymax;
+  uint32_t W_rot, H_rot;
+  vksift_imasComputeRotatedCanvas(W, H, ca, sa, &xmin, &xmax, &ymin, &ymax, &W_rot, &H_rot);
+
+  uint32_t H_t = (t_factor > 1.0f) ? (uint32_t)floorf((float)H_rot / t_factor) : H_rot;
+  if (H_t < 1u) H_t = 1u;
+
+  // Inverse rotation matrix (matches vksift_runImasWarp).
+  const float a11 = ca;
+  const float a12 = -sa;
+  const float a13 = ca * (float)xmin - sa * (float)ymin;
+  const float a21 = sa;
+  const float a22 = ca;
+  const float a23 = sa * (float)xmin + ca * (float)ymin;
+  const float fill = 0.5f;
+  const float sigma_aa = (t_factor > 1.0f) ? 0.8f * sqrtf(t_factor * t_factor - 1.0f) : 0.0f;
+
+  // ---- 2. Populate the slot's WarpParamsUBO ----
+  {
+    WarpParamsUBO ubo = {0};
+    ubo.a11 = a11; ubo.a12 = a12; ubo.a13 = a13;
+    ubo.a21 = a21; ubo.a22 = a22; ubo.a23 = a23;
+    ubo.fill_value     = fill;
+    ubo.fproj_bg_value = 0.0f;
+    ubo.W_rot          = W_rot;
+    ubo.H_rot          = H_rot;
+    ubo.H_sub          = H_t;
+    ubo.canvas_w       = canvas_w;
+    ubo.canvas_h       = canvas_h;
+    ubo.valid_w        = W_rot;
+    ubo.valid_h        = H_t;
+    ubo.sigma_aa       = sigma_aa;
+    ubo.t_factor       = t_factor;
+    ubo.quantize_fill  = 0.5f;
+    ubo.gauss_dir_x    = 0.0f;
+    ubo.gauss_dir_y    = 1.0f;  // IMAS vertical σ_aa blur
+    ubo.warp_idx       = slot_idx;
+    memcpy(detector->mem->slots[slot_idx].warp_params_ubo_ptr, &ubo, sizeof(WarpParamsUBO));
+  }
+
+  // ---- 3. Populate the slot's indirect-dispatch buffer ----
+  {
+    SlotDispatchBuffer disp = {0};
+    disp.affinewarp       = (VkDispatchIndirectCommand){(W_rot + 7u) / 8u, (H_rot + 7u) / 8u, 1u};
+    disp.gaussblur        = (VkDispatchIndirectCommand){(W_rot + 7u) / 8u, (H_rot + 7u) / 8u, 1u};
+    disp.finvspline_row   = (VkDispatchIndirectCommand){(H_rot + 63u) / 64u, 1u, 1u};
+    disp.finvspline_col   = (VkDispatchIndirectCommand){(W_rot + 63u) / 64u, 1u, 1u};
+    disp.fproj            = (VkDispatchIndirectCommand){(W_rot + 7u) / 8u, (H_t + 7u) / 8u, 1u};
+    disp.quantize         = (VkDispatchIndirectCommand){(canvas_w + 7u) / 8u, (canvas_h + 7u) / 8u, 1u};
+    memcpy(detector->mem->slots[slot_idx].dispatch_buffer_ptr, &disp, sizeof(SlotDispatchBuffer));
+  }
+
+  // ---- 4. Re-record the fused cmd buffer if the memory layout changed,
+  // pending_warp_dirty is set (e.g. caller switched paths), or the target
+  // buffer changed. The recording references detector->curr_buffer_idx and
+  // mem->curr_nb_octaves so it must be re-emitted when either changes. ----
+  bool need_record = memory_layout_updated || detector->pending_warp_dirty ||
+                     detector->curr_buffer_idx != target_buffer_idx ||
+                     detector->pending_blur_dirty;
+  detector->curr_buffer_idx = target_buffer_idx;
+  if (need_record)
+  {
+    writeDescriptorSets(detector);
+    if (!recordCommandBuffers(detector)) return false;
+    detector->pending_warp_dirty = false;
+    detector->pending_blur_dirty = false;
+  }
+
+  // ---- 5. Submit the fused command buffer. Mirrors dispatchDetectionCmdBuffer's
+  // non-async-transfer branch (the fused buffer includes its own ownership
+  // transfer barriers if async transfer is enabled). ----
+  vkResetFences(detector->dev->device, 1, &detector->end_of_detection_fence);
+
+  VkPipelineStageFlags wait_dst_transfer_bit_stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  VkPipelineStageFlags wait_dst_compute_shader_bit_stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+  VkSubmitInfo submit_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = NULL};
+
+  if (detector->dev->async_transfer_available)
+  {
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &detector->release_buffer_ownership_command_buffer;
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = &detector->buffer_ownership_released_by_transfer_semaphore;
+    if (vkQueueSubmit(detector->async_ownership_transfer_queue, 1, &submit_info, NULL) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to submit ownership-release cmd buf (fused path)");
+      return false;
+    }
+
+    submit_info.waitSemaphoreCount = 1;
+    submit_info.pWaitSemaphores = &detector->buffer_ownership_released_by_transfer_semaphore;
+    submit_info.pWaitDstStageMask = &wait_dst_compute_shader_bit_stage_mask;
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = &detector->end_of_detection_semaphore;
+  }
+  else
+  {
+    submit_info.waitSemaphoreCount = 0;
+    submit_info.pWaitSemaphores = NULL;
+    submit_info.pWaitDstStageMask = NULL;
+    submit_info.signalSemaphoreCount = 0;
+    submit_info.pSignalSemaphores = NULL;
+  }
+
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &detector->fused_imas_detect_command_buffer[slot_idx];
+  VkFence detect_submit_fence = detector->dev->async_transfer_available
+                                 ? NULL : detector->end_of_detection_fence;
+  if (vkQueueSubmit(detector->general_queue, 1, &submit_info, detect_submit_fence) != VK_SUCCESS)
+  {
+    logError(LOG_TAG, "Failed to submit fused IMAS+detect cmd buffer (slot %u)", slot_idx);
+    return false;
+  }
+
+  if (detector->dev->async_transfer_available)
+  {
+    submit_info.waitSemaphoreCount = 1;
+    submit_info.pWaitSemaphores = &detector->end_of_detection_semaphore;
+    submit_info.pWaitDstStageMask = &wait_dst_transfer_bit_stage_mask;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &detector->acquire_buffer_ownership_command_buffer;
+    submit_info.signalSemaphoreCount = 0;
+    submit_info.pSignalSemaphores = NULL;
+    if (vkQueueSubmit(detector->async_ownership_transfer_queue, 1, &submit_info,
+                      detector->end_of_detection_fence) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to submit ownership-acquire cmd buf (fused path)");
+      return false;
+    }
+  }
+  return true;
 }
 
 void vksift_setPendingAffineWarp(vksift_SiftDetector detector,

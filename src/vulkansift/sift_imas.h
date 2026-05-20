@@ -112,6 +112,26 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
 
 void vksift_destroyImasPipeline(vksift_ImasPipeline *pipeline_ptr);
 
+// Refresh the IMAS pipeline's set-0 image-view bindings. The IMAS shaders'
+// descriptor sets reference per-slot rotated_image/tilted_image image views
+// + the single-instance cached_input_image_view; when
+// vksift_prepareSiftMemoryForDetection resizes the per-slot images on a
+// canvas change, the old image views are destroyed and the descriptor sets
+// become stale. Callers must invoke this whenever memory_layout_updated is
+// reported, BEFORE submitting any cmd buffer that uses an IMAS pipeline.
+void vksift_imasRefreshDescriptorSets(vksift_ImasPipeline pipeline);
+
+// Phase B-3 helper: compute the IMAS rotated canvas extent (W_rot × H_rot)
+// for input dims (nx, ny) at rotation angle (ca = cos θ, sa = sin θ). Also
+// returns the offset of the rotated-canvas origin in input-image coords
+// (xmin, ymin) so callers can derive the inverse-rotation affine matrix
+// matching the IMAS AffineWarp shader's convention. Exposed for use by
+// vksift_dispatchFusedImasWarpForSlot (sift_detector.c), which builds the
+// WarpParamsUBO + SlotDispatchBuffer in one place.
+void vksift_imasComputeRotatedCanvas(uint32_t nx, uint32_t ny, float ca, float sa,
+                                     int *xmin, int *xmax, int *ymin, int *ymax,
+                                     uint32_t *sx, uint32_t *sy);
+
 // Run the 5-dispatch IMAS chain for the given (t, θ_rad) tilt.
 // Reads from mem->input_image (caller's responsibility to have uploaded the
 // original image). Writes the final tilted Float32 result into the readback

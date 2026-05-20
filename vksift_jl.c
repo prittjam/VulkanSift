@@ -194,3 +194,19 @@ uint32_t vksift_jl_detect_on_imas(vksift_jl_handle h,
     h->last_nb_features = vksift_getFeaturesNumber(h->instance, 0);
     return h->last_nb_features;
 }
+
+// Phase B-3 FFI — fused IMAS + Quantize + SIFT-detect, single GPU submission.
+// Mirrors vksift_jl_detect_on_imas's pattern: wraps the public C entrypoint
+// and returns the feature count for the caller to allocate the download
+// buffer. See vksift_jl.h for usage.
+uint32_t vksift_jl_detect_fused_imas(vksift_jl_handle h,
+                                     uint32_t W, uint32_t H,
+                                     float t_factor, float theta_rad,
+                                     uint32_t canvas_w, uint32_t canvas_h)
+{
+    if (!h) return 0;
+    vksift_detectFeaturesFusedImas(h->instance, W, H, t_factor, theta_rad,
+                                   canvas_w, canvas_h, 0);
+    h->last_nb_features = vksift_getFeaturesNumber(h->instance, 0);
+    return h->last_nb_features;
+}

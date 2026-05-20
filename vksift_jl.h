@@ -123,6 +123,25 @@ uint32_t vksift_jl_detect_on_imas(vksift_jl_handle h,
                                   uint32_t valid_w,  uint32_t valid_h,
                                   float    fill_value);
 
+// Phase B-3: fully-fused IMAS + Quantize + SIFT-detect in a single GPU
+// submission. Combines what vksift_jl_run_imas + vksift_jl_detect_on_imas did
+// separately into one pre-recorded command buffer per slot — one queue submit,
+// one fence wait, no host roundtrip.
+//
+// Caller must have uploaded the original (untilted) image via
+// vksift_jl_detect() first to populate cached_input_image. After that,
+// vksift_jl_detect_fused_imas builds the per-warp IMAS params (rotated canvas,
+// affine matrix, sigma_aa, dispatch counts) and submits the fused chain.
+//
+// (W, H)             : input-image dims used at upload.
+// (t_factor, theta)  : IMAS warp params.
+// (canvas_w, canvas_h): SIFT pyramid canvas — keep identical across warps.
+// Returns the number of features; use vksift_jl_get_features().
+uint32_t vksift_jl_detect_fused_imas(vksift_jl_handle h,
+                                     uint32_t W, uint32_t H,
+                                     float t_factor, float theta_rad,
+                                     uint32_t canvas_w, uint32_t canvas_h);
+
 #ifdef __cplusplus
 }
 #endif

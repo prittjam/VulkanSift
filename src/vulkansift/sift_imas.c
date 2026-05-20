@@ -235,6 +235,10 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
                      &p->fproj_pipeline_layout, &p->fproj_pipeline)) goto fail;
   write_two_storage(device, p->fproj_set, mem->slots[0].tilted_image_view, mem->slots[0].rotated_image_view);
 
+  // (The same set-0 writes are encapsulated in vksift_imasRefreshDescriptorSets
+  // below for callers to rewire after a pyramid resize destroys + recreates the
+  // image views these descriptors reference.)
+
   // Bilinear-fproj alternate pipeline (same layout + descriptor set).
   // FprojBilinearY.comp reads input as storage image (binding 0, r32f) and
   // writes output as storage image (binding 1, r32f), matching the cubic
@@ -299,6 +303,26 @@ fail:
   return NULL;
 }
 
+void vksift_imasRefreshDescriptorSets(vksift_ImasPipeline p)
+{
+  if (!p || !p->dev) return;
+  VkDevice device = p->dev->device;
+  vksift_SiftMemory mem = p->mem;
+  if (!mem || mem->cached_input_image_view == VK_NULL_HANDLE) return;
+  // Mirrors the writes done in vksift_createImasPipeline. The IMAS shaders'
+  // set-0 image views go stale whenever vksift_prepareSiftMemoryForDetection
+  // resizes the per-slot images on a canvas change; this routine rewires the
+  // descriptor sets to the freshly-created views before the next dispatch.
+  write_sampler_storage(device, p->warp_set, p->sampler,
+                        mem->cached_input_image_view, mem->slots[0].rotated_image_view);
+  write_two_storage(device, p->blur_set,
+                    mem->slots[0].rotated_image_view, mem->slots[0].tilted_image_view);
+  write_one_storage(device, p->finvspline_row_set, mem->slots[0].tilted_image_view);
+  write_one_storage(device, p->finvspline_col_set, mem->slots[0].tilted_image_view);
+  write_two_storage(device, p->fproj_set,
+                    mem->slots[0].tilted_image_view, mem->slots[0].rotated_image_view);
+}
+
 void vksift_destroyImasPipeline(vksift_ImasPipeline *pipeline_ptr)
 {
   if (!pipeline_ptr || !*pipeline_ptr) return;
@@ -351,9 +375,11 @@ void vksift_destroyImasPipeline(vksift_ImasPipeline *pipeline_ptr)
 // Compute extended rotated canvas extents (W_rot × H_rot) for the given input
 // dims and rotation angle. Output (xmin, xmax, ymin, ymax) encode the canvas
 // extent in input-frame coordinates; sx, sy are the canvas dimensions.
-static void compute_rotated_canvas(uint32_t nx, uint32_t ny, float ca, float sa,
-                                   int *xmin, int *xmax, int *ymin, int *ymax,
-                                   uint32_t *sx, uint32_t *sy)
+// Exposed via sift_imas.h (Phase B-3) as vksift_imasComputeRotatedCanvas for
+// the fused-cmd-buffer driver in sift_detector.c.
+void vksift_imasComputeRotatedCanvas(uint32_t nx, uint32_t ny, float ca, float sa,
+                                     int *xmin, int *xmax, int *ymin, int *ymax,
+                                     uint32_t *sx, uint32_t *sy)
 {
   int xn = 0, xm = 0, yn = 0, ym = 0;
   const int corners_x[3] = {(int)nx - 1, 0, (int)nx - 1};
@@ -428,7 +454,7 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
   // Rotation canvas (extended).
   int xmin, xmax, ymin, ymax;
   uint32_t W_rot, H_rot;
-  compute_rotated_canvas(W, H, ca, sa, &xmin, &xmax, &ymin, &ymax, &W_rot, &H_rot);
+  vksift_imasComputeRotatedCanvas(W, H, ca, sa, &xmin, &xmax, &ymin, &ymax, &W_rot, &H_rot);
 
   // Output (tilted) dims.
   uint32_t H_t = (t_factor > 1.0f) ? (uint32_t)floorf((float)H_rot / t_factor) : H_rot;

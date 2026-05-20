@@ -780,3 +780,82 @@ void vksift_detectFeaturesOnImas(vksift_Instance instance,
     instance->error_cb_func(VKSIFT_VULKAN_ERROR);
   }
 }
+
+// =============================================================================
+// Phase B-3 fused IMAS + Quantize + SIFT-detect entrypoint. Single GPU
+// submission per warp; no host roundtrip between IMAS chain and SIFT detect.
+// =============================================================================
+void vksift_detectFeaturesFusedImas(vksift_Instance instance,
+                                    uint32_t W, uint32_t H,
+                                    float t_factor, float theta_rad,
+                                    uint32_t canvas_w, uint32_t canvas_h,
+                                    uint32_t gpu_buffer_id)
+{
+  if (instance == NULL ||
+      !isBufferIdxValid(instance, gpu_buffer_id) ||
+      !isInputResolutionValid(instance, canvas_w, canvas_h))
+  {
+    logError(LOG_TAG, "vksift_detectFeaturesFusedImas() error: invalid input.");
+    instance->error_cb_func(VKSIFT_INVALID_INPUT_ERROR);
+    return;
+  }
+
+  VkFence fences[2] = {instance->sift_detector->end_of_detection_fence,
+                      instance->sift_matcher->end_of_matching_fence};
+  vkWaitForFences(instance->vulkan_device->device, 2, fences, VK_TRUE, UINT64_MAX);
+
+  // Lazy-create the IMAS pipeline on first fused call. The pre-recorded fused
+  // command buffer needs the IMAS pipeline's pipeline + descriptor set objects
+  // bound during recording — so once the pipeline is up we must trigger a
+  // re-record by marking pending_warp_dirty (which forces recordCommandBuffers
+  // in vksift_dispatchFusedImasWarpForSlot).
+  bool imas_just_created = false;
+  if (instance->imas_pipeline == NULL)
+  {
+    instance->imas_pipeline = vksift_createImasPipeline(
+        instance->vulkan_device, instance->sift_memory, instance->sift_detector->image_sampler);
+    if (instance->imas_pipeline == NULL)
+    {
+      logError(LOG_TAG, "vksift_detectFeaturesFusedImas() error: failed to create IMAS pipeline");
+      instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+      return;
+    }
+    // Wire the IMAS pipeline reference into the detector so
+    // recFusedImasDetectCmdsForSlot can bind its pipelines + descriptor sets.
+    instance->sift_detector->imas_pipeline_ref =
+        (struct vksift_ImasPipeline_T *)instance->imas_pipeline;
+    imas_just_created = true;
+  }
+
+  bool memory_layout_updated = false;
+  if (!vksift_prepareSiftMemoryForDetection(instance->sift_memory, NULL, canvas_w, canvas_h,
+                                            gpu_buffer_id, &memory_layout_updated))
+  {
+    logError(LOG_TAG, "vksift_detectFeaturesFusedImas() error: failed to prepare SIFT memory");
+    instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+    return;
+  }
+
+  // If the pyramid was resized (per-slot images destroyed + recreated), the
+  // IMAS pipeline's set-0 descriptor sets reference dead image views. Rewire
+  // them before the fused cmd buffer dispatches anything through the IMAS
+  // pipelines.
+  if (memory_layout_updated || imas_just_created)
+  {
+    vksift_imasRefreshDescriptorSets(instance->imas_pipeline);
+  }
+
+  // First call after lazy IMAS creation: force a re-record so the fused cmd
+  // buffer picks up the real IMAS pipeline (the very first recordCommandBuffers
+  // call during createSiftDetector produced an empty no-op recording because
+  // imas_pipeline_ref was NULL then).
+  bool force_record = imas_just_created || memory_layout_updated;
+
+  if (!vksift_dispatchFusedImasWarpForSlot(instance->sift_detector, 0u, gpu_buffer_id,
+                                           W, H, t_factor, theta_rad, canvas_w, canvas_h,
+                                           force_record))
+  {
+    logError(LOG_TAG, "vksift_detectFeaturesFusedImas() error: failed to dispatch fused chain");
+    instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+  }
+}

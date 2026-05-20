@@ -98,6 +98,27 @@ extern "C"
                                                  const float fill_value,
                                                  const uint32_t gpu_buffer_id);
 
+  // Phase B-3: fully-fused IMAS + Quantize + SIFT-detect in a single GPU
+  // submission. Lazily creates the IMAS pipeline on first call. The fused
+  // command buffer is pre-recorded per slot; this call updates the per-slot
+  // WarpParamsUBO and indirect-dispatch buffer, then submits the recording.
+  // No host roundtrip between IMAS warp and SIFT detect.
+  //
+  // (W, H) are the input-image dims (must match the dims used to upload via
+  // vksift_detectFeatures). (t_factor, theta_rad) define the IMAS warp.
+  // (canvas_w, canvas_h) is the stable SIFT pyramid input canvas — keep
+  // identical across warps in a schedule to avoid pyramid reallocation.
+  // gpu_buffer_id selects the destination SIFT buffer.
+  //
+  // Note: Phase B-3 only exercises pyramid slot 0; the SIFT-detect descriptor
+  // sets are still bound to mem->slots[0]'s image views. Phase C will allow
+  // parallel waves across slots.
+  VKSIFT_EXPORT void vksift_detectFeaturesFusedImas(vksift_Instance instance,
+                                                    uint32_t W, uint32_t H,
+                                                    float t_factor, float theta_rad,
+                                                    uint32_t canvas_w, uint32_t canvas_h,
+                                                    uint32_t gpu_buffer_id);
+
   // For each SIFT feature in the buffer A, find the 2-nearest neighbors in the buffer B, store feature index and descriptors L2 distance
   // for the two neighbors.
   VKSIFT_EXPORT void vksift_matchFeatures(vksift_Instance instance, const uint32_t gpu_buffer_id_A, const uint32_t gpu_buffer_id_B);

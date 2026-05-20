@@ -19,6 +19,38 @@
 //
 
 #include <stdint.h>
+#include <vulkan/vulkan.h>
+
+// =============================================================================
+// SlotDispatchBuffer — per-slot indirect-dispatch group counts for the fused
+// IMAS + Quantize chain (Phase B-3). Lives in
+// `vksift_SiftPyramidSlot::dispatch_buffer` (host-mapped). Host writes the
+// VkDispatchIndirectCommand triples (x, y, z group counts) before each warp
+// submission; the pre-recorded fused command buffer reads them via
+// vkCmdDispatchIndirect.
+//
+// SIFT-detect dispatches (PreBlur1D, AffineWarp on warped_input, scale-space,
+// DoG, ExtractKeypoints, CopySIFTCount) are NOT here — their group counts
+// derive from the stable curr_input_image_* canvas, which doesn't change
+// across IMAS warps in a wave. Those stay direct dispatches.
+//
+// Workgroup sizes (must match shader local_size_*):
+//   AffineWarp.comp           local_size_x=8,  local_size_y=8
+//   GaussBlur1DStorage.comp   local_size_x=8,  local_size_y=8
+//   FinvsplineRow.comp        local_size_x=64
+//   FinvsplineCol.comp        local_size_x=64
+//   FprojCubicY/BilinearY.comp local_size_x=8, local_size_y=8
+//   QuantizeF32ToInput.comp   local_size_x=8,  local_size_y=8
+// =============================================================================
+typedef struct
+{
+  VkDispatchIndirectCommand affinewarp;       // (ceil(W_rot/8), ceil(H_rot/8), 1)
+  VkDispatchIndirectCommand gaussblur;        // (ceil(W_rot/8), ceil(H_rot/8), 1)
+  VkDispatchIndirectCommand finvspline_row;   // (ceil(H_rot/64), 1, 1)
+  VkDispatchIndirectCommand finvspline_col;   // (ceil(W_rot/64), 1, 1)
+  VkDispatchIndirectCommand fproj;            // (ceil(W_rot/8), ceil(H_sub/8), 1)
+  VkDispatchIndirectCommand quantize;         // (ceil(canvas_w/8), ceil(canvas_h/8), 1)
+} SlotDispatchBuffer;
 
 typedef struct
 {
