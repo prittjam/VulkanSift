@@ -50,6 +50,7 @@ typedef struct
   VkDispatchIndirectCommand finvspline_col;   // (ceil(W_rot/64), 1, 1)
   VkDispatchIndirectCommand fproj;            // (ceil(W_rot/8), ceil(H_sub/8), 1)
   VkDispatchIndirectCommand quantize;         // (ceil(canvas_w/8), ceil(canvas_h/8), 1)
+  VkDispatchIndirectCommand seed_from_input;  // (ceil(oct0_w/8), ceil(oct0_h/8), 1)
 } SlotDispatchBuffer;
 
 typedef struct

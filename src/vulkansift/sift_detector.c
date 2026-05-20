@@ -3339,9 +3339,12 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
     vkCmdPushConstants(cmd, detector->seed_from_input_pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(Upsample2xLinearPushConsts), &sf_pc);
-    vkCmdDispatch(cmd,
-        (uint32_t)ceilf((float)oct_w / 8.f),
-        (uint32_t)ceilf((float)oct_h / 8.f), 1);
+    // Indirect dispatch via the slot's SlotDispatchBuffer.seed_from_input
+    // field (populated host-side per warp in vksift_fillFusedWarpState).
+    // The cmd buffer recording becomes independent of oct-0 dims, matching
+    // the rest of the IMAS chain's indirect pattern.
+    vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
+                          offsetof(SlotDispatchBuffer, seed_from_input));
   }
 
   // ---- 7. SIFT detect chain (per-slot) ----
@@ -3901,6 +3904,8 @@ void vksift_fillFusedWarpState(vksift_SiftDetector detector,
 
   // ---- 3. Populate the slot's indirect-dispatch buffer ----
   {
+    const uint32_t oct0_w = detector->mem->octave_resolutions[0].width;
+    const uint32_t oct0_h = detector->mem->octave_resolutions[0].height;
     SlotDispatchBuffer disp = {0};
     disp.affinewarp       = (VkDispatchIndirectCommand){(W_rot + 7u) / 8u, (H_rot + 7u) / 8u, 1u};
     disp.gaussblur        = (VkDispatchIndirectCommand){(W_rot + 7u) / 8u, (H_rot + 7u) / 8u, 1u};
@@ -3908,6 +3913,7 @@ void vksift_fillFusedWarpState(vksift_SiftDetector detector,
     disp.finvspline_col   = (VkDispatchIndirectCommand){(W_rot + 63u) / 64u, 1u, 1u};
     disp.fproj            = (VkDispatchIndirectCommand){(W_rot + 7u) / 8u, (H_t + 7u) / 8u, 1u};
     disp.quantize         = (VkDispatchIndirectCommand){(canvas_w + 7u) / 8u, (canvas_h + 7u) / 8u, 1u};
+    disp.seed_from_input  = (VkDispatchIndirectCommand){(oct0_w + 7u) / 8u, (oct0_h + 7u) / 8u, 1u};
     memcpy(detector->mem->slots[slot_idx].dispatch_buffer_ptr, &disp, sizeof(SlotDispatchBuffer));
   }
 }
