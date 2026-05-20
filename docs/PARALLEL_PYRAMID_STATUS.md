@@ -66,12 +66,16 @@ a tag yet — add one after the commit lands.
 ## Stashes
 
 ```
-stash@{0}  phase-c-multi-queue WIP   (Phase E — next)
+stash@{0}  phase-e-wip            (latest Phase E attempt — see "Phase E attempt" below)
+stash@{1}  phase-c-multi-queue    (original Phase E scaffold from before the wip)
 ```
 
-(Old `phase-d-broken` and `phase-d-approach1-and-diagnosis` stashes are
-obsolete — Phase D landed via a different fix. Drop them with
-`git stash drop` once you confirm `git stash list` matches.)
+Phase E details: see the "Phase E attempt" section near the bottom of
+this doc. The wip stash got further than the original scaffold (it adds
+CONCURRENT sharing on per-slot resources, a graphics→compute semaphore,
+and a defensive HOST→COMPUTE barrier) but still hits a wall on the
+compute-queue dispatch producing zero / garbage features for everything
+beyond the first identity warp.
 
 ---
 
@@ -365,21 +369,141 @@ examples/asift_gpu/driver.jl  added vks_init `n_pyramid_slots` kwarg
 
 ---
 
-## If you only have time for one thing next session
+## Phase E attempt (stashed)
 
-Phase E (multi-queue). The Phase E stash (`git stash list` — was
-`stash@{1}` originally, numbering may have shifted) bumps
-`nb_async_compute_queues 0 → 1` and routes half each wave's slots to
-the async-compute queue, but per-slot resources are
-`VK_SHARING_MODE_EXCLUSIVE` owned by the graphics family so the
-compute-queue writes produce undefined contents. Fix: recreate the ~10
-per-slot resources (`sift_buffer_arr[s]`,
-`sift_count_staging_buffer_arr[s]`, `slots[s].input_image`,
-`slots[s].rotated_image`, `cached_input_image`, etc.) with
-`VK_SHARING_MODE_CONCURRENT` listing both
-`general_queues_family_idx` and `async_compute_queues_family_idx`.
+Phase E was attempted on top of Phase D, hit a wall, and got stashed at
+`stash@{0}: phase-e-wip` (numbering may shift — check `git stash list`).
+The diff includes the original `stash@{1}: phase-c-multi-queue` scaffold
+(async-compute pool + per-slot compute-pool cmd buffers + dedicated
+fence + wave-splitting in `vksift_dispatchParallelIMAS`) plus three
+additional pieces that take it further but not all the way:
 
-Expected payoff per plan §10: ~1.3× on the n_slots>1 path. At
-n_slots=2 that should put 1920²×25 warps near 210 ms (from 276 ms),
-finally beating the n_slots=1 result and getting close to the plan's
-200 ms target.
+1. **`VK_SHARING_MODE_CONCURRENT` for everything the compute queue
+   touches.** A `multi_queue_share_info` helper in `sift_memory.c` fills
+   `(sharing_mode, queue_family_count, queue_family_indices)` for callers,
+   returning EXCLUSIVE on devices without a dedicated compute queue
+   family so we don't pay CONCURRENT's modest driver-side cost on
+   hardware that can't use it. Applied to every per-slot resource in
+   `setupOneSlot`, plus `cached_input_image`, `sift_buffer_arr[s]`,
+   `sift_count_staging_buffer_arr[s]`, and the indirect orientation /
+   descriptor dispatch buffers.
+
+2. **Cross-queue handshake semaphore.** New
+   `detector->parallel_compute_start_semaphore`. At the top of
+   `vksift_dispatchParallelIMAS`, an empty signal-only submit on
+   `general_queue` signals the semaphore; the first compute-queue wave
+   waits on it at `COMPUTE_SHADER_BIT`. Reason: `cached_input_image`
+   was last written by the graphics queue in `vks_detect`; the host's
+   `vkWaitForFences` between the two calls gives the host visibility
+   but does NOT establish a graphics→compute *GPU-side* dependency,
+   even with CONCURRENT sharing. Subsequent compute submissions on the
+   same queue see cached_input_image transitively through submission
+   order, so the semaphore is one-shot per `vksift_dispatchParallelIMAS`
+   call.
+
+3. **Defensive `HOST→COMPUTE` barrier at the head of every fused cmd
+   buffer.** `HOST_WRITE → UNIFORM_READ | SHADER_READ |
+   INDIRECT_COMMAND_READ` covering both the slot's
+   `warp_params_ubo` and `dispatch_buffer` host writes that happen
+   immediately before each wave's submit.
+
+### Symptom that's still unresolved
+
+With all three pieces in: **only the first identity warp (warp_idx=0,
+t=1, φ=0) on slot 0 of the general queue in the very first wave
+returns features.** Specifically:
+
+- `n_slots=1`: still works perfectly (276 ms, sum_kept=36924 on 1920²,
+  59635 on 7084²) — but n_slots=1 never exercises the compute queue.
+- `n_slots=2` or `n_slots=4`: only warp 1 (identity, slot 0, general
+  queue) returns 9738 features. Every other warp returns 0 features —
+  including warps on the GENERAL queue in waves 2+. Sometimes returns
+  garbage `octave_idx` (`32687`, `1768715626`) — uninitialised memory
+  semantics.
+- Forcing `wave_g=0, wave_c=wave` (everything on compute) gives 9738 for
+  warp 1, 0 for everything else. So the compute queue produces
+  *something* for the identity warp's lightweight IMAS work but fails on
+  anything heavier — or fails the second time the cmd buffer is
+  submitted, regardless of which queue.
+
+That last symptom — wave-2 general-queue failures — strongly suggests
+something past CONCURRENT sharing is leaking state between submissions.
+Possible suspects:
+
+- The shared indirect orientation / descriptor dispatch buffers
+  (CONCURRENT now, but still single-writer-multi-slot — `slot 0` and
+  `slot 1` both `vkCmdFillBuffer` the same per-octave offsets).
+  Pre-Phase-E this raced harmlessly because both queues wrote the same
+  values; Phase E might expose a real ordering issue.
+- The indirect dispatch buffer state (host-written between waves) not
+  re-read by NVIDIA's compute queue on subsequent submissions even with
+  the HOST→COMPUTE barrier — same pattern as the misdiagnosed Phase D
+  "UBO freeze" but actually on the compute path.
+- A compute-queue-specific Vulkan-spec violation flagged by the
+  Khronos validation layer — which we couldn't get loaded under
+  kaimon's Julia (the validation layer's `.so` is now in the pixi env
+  at `.pixi/envs/default/lib/libVkLayer_khronos_validation.so` but the
+  Vulkan loader needs `VK_ADD_LAYER_PATH` + `LD_LIBRARY_PATH` set
+  **before** Julia starts; in-Julia `ENV[]` is too late since libvulkan
+  is already `dlopen`'d).
+
+### Infrastructure landed (for the next attempt)
+
+These two pieces are committed on `asift-batch` as Phase-E-prep and are
+no-ops at runtime when validation isn't loaded:
+
+- **`VK_EXT_debug_utils` messenger** in `vkenv_createInstance`
+  (`src/vulkansift/vkenv/vulkan_device.c`). Registers a callback that
+  prints validation-layer warnings/errors to **stderr** (kaimon forwards
+  stderr, strips stdout). When `VK_LAYER_KHRONOS_validation` is loaded
+  by the loader, every validation message lands directly in the kaimon
+  output. When the layer isn't loaded, the messenger registration is a
+  no-op.
+- **`vulkan-validation-layers` in `pixi.toml`** (`pixi.lock` updated).
+  Installs the Khronos validation layer + its `.so` into the pixi env.
+
+### How to actually get validation output flowing next time
+
+The validation layer load can't be triggered from inside a running
+Julia process. Either:
+
+```bash
+# Option A: launch the kaimon-Julia process with the right env exported.
+export VK_ADD_LAYER_PATH="$PWD/.pixi/envs/default/share/vulkan/explicit_layer.d"
+export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
+# … start kaimon as usual …
+```
+
+```bash
+# Option B: copy / symlink the layer's .so into a path already on
+# the loader's runtime search list, e.g. /usr/local/lib (needs sudo)
+# or one of the colon-separated entries in `cat /etc/ld.so.conf.d/*`.
+```
+
+```bash
+# Option C: build VulkanSift with -DCMAKE_BUILD_TYPE=Debug so
+# `vksift_loadVulkan`'s `#ifndef NDEBUG` branch fires AND ship the
+# validation layer system-wide. Slightly heavier (debug build) but
+# avoids the per-launch env-var dance.
+```
+
+The `vksift_loadVulkan` source path that requests
+`VK_LAYER_KHRONOS_validation` lives under `#ifndef NDEBUG`. For a
+release build, manually un-gate that block (or temporarily edit
+`vulkansift.c`) before re-running.
+
+### Expected payoff if Phase E lands
+
+Per plan §10: ~1.3× on the n_slots>1 path. At n_slots=2 that should put
+1920²×25 warps near 210 ms (from 276 ms), finally beating the n_slots=1
+result and getting close to the plan's 200 ms target.
+
+### If you only have time for one thing next session
+
+Get `VK_LAYER_KHRONOS_validation` loaded (Option A above is easiest),
+unstash `phase-e-wip`, run the n_slots=2 test, and read the validation
+output. The messenger code already routes those messages to stderr;
+kaimon will capture them. With validation telling us exactly which
+spec rule we're tripping (queue-family transition? synchronization
+scope? layout transition?), Phase E should land in another short
+session.

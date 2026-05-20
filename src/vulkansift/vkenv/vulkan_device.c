@@ -3,6 +3,7 @@
 #include "vulkan_utils.h"
 
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,6 +14,31 @@ bool getPhysicalDevice(vkenv_Device device, vkenv_DeviceConfig *config);
 bool createLogicalDevice(vkenv_Device device, vkenv_DeviceConfig *config);
 
 static VkInstance vulkan_instance = VK_NULL_HANDLE;
+static VkDebugUtilsMessengerEXT vulkan_debug_messenger = VK_NULL_HANDLE;
+
+// Debug-utils callback — routes validation layer messages to stderr so kaimon
+// (which strips stdout but forwards stderr) can capture them during Phase E
+// multi-queue diagnosis. Only registered when the instance is created with
+// VK_EXT_debug_utils + the Khronos validation layer loaded.
+static VKAPI_ATTR VkBool32 VKAPI_CALL vkenv_debug_messenger_cb(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT type,
+    const VkDebugUtilsMessengerCallbackDataEXT *cb_data,
+    void *user_data)
+{
+  (void)type;
+  (void)user_data;
+  const char *sev = "info";
+  if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)        sev = "ERROR";
+  else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) sev = "WARN ";
+  else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT)    sev = "info ";
+  // VERBOSE drops to debug; ignore it to keep the output readable.
+  if (severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT) return VK_FALSE;
+  fprintf(stderr, "[vk-%s] %s\n", sev,
+          cb_data && cb_data->pMessage ? cb_data->pMessage : "(no message)");
+  fflush(stderr);
+  return VK_FALSE;
+}
 
 bool vkenv_createInstance(vkenv_InstanceConfig *config_ptr)
 {
@@ -34,6 +60,31 @@ bool vkenv_createInstance(vkenv_InstanceConfig *config_ptr)
 #if defined(VK_NO_PROTOTYPES)
       volkLoadInstance(vulkan_instance);
 #endif
+      // Register a VK_EXT_debug_utils messenger so validation-layer messages
+      // land on stderr (kaimon forwards stderr; default validation-layer
+      // sink is stdout which kaimon strips). Failure here is non-fatal —
+      // the instance is still usable, we just won't see validation output.
+      PFN_vkCreateDebugUtilsMessengerEXT pfn_create_msg =
+          (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(vulkan_instance, "vkCreateDebugUtilsMessengerEXT");
+      if (pfn_create_msg != NULL)
+      {
+        VkDebugUtilsMessengerCreateInfoEXT msg_info = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .pNext = NULL,
+            .flags = 0,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
+                              | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT
+                          | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT
+                          | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .pfnUserCallback = vkenv_debug_messenger_cb,
+            .pUserData = NULL};
+        if (pfn_create_msg(vulkan_instance, &msg_info, NULL, &vulkan_debug_messenger) != VK_SUCCESS)
+        {
+          vulkan_debug_messenger = VK_NULL_HANDLE;
+          logWarning(LOG_TAG, "Failed to register VK_EXT_debug_utils messenger; validation output will be lost");
+        }
+      }
       return true;
     }
     else
@@ -55,6 +106,17 @@ VkInstance vkenv_getInstance() { return vulkan_instance; }
 
 void vkenv_destroyInstance()
 {
+  // Tear down the debug-utils messenger before the instance.
+  if (vulkan_debug_messenger != VK_NULL_HANDLE && vulkan_instance != VK_NULL_HANDLE)
+  {
+    PFN_vkDestroyDebugUtilsMessengerEXT pfn_destroy_msg =
+        (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(vulkan_instance, "vkDestroyDebugUtilsMessengerEXT");
+    if (pfn_destroy_msg != NULL)
+    {
+      pfn_destroy_msg(vulkan_instance, vulkan_debug_messenger, NULL);
+    }
+    vulkan_debug_messenger = VK_NULL_HANDLE;
+  }
   // Destroy instance
   VK_NULL_SAFE_DELETE(vulkan_instance, vkDestroyInstance(vulkan_instance, NULL));
 #if defined(VK_NO_PROTOTYPES)
