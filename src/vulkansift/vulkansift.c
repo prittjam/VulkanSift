@@ -68,7 +68,8 @@ static vksift_Config vksift_Config_Default = {.input_image_max_size = 1920u * 10
                                               .use_rgba_input = false,
                                               .use_rgb_input = false,
                                               .use_gpu_debug_functions = false,
-                                              .gpu_debug_external_window_info = {.context = NULL, .window = NULL}};
+                                              .gpu_debug_external_window_info = {.context = NULL, .window = NULL},
+                                              .nb_pyramid_slots = 1u};
 
 vksift_Config vksift_getDefaultConfig() { return vksift_Config_Default; }
 

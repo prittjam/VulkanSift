@@ -152,7 +152,7 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
   // input_image with quantized tilted content without corrupting the next
   // warp's IMAS source. The cache is updated whenever a regular
   // vksift_detectFeatures uploads new content.
-  write_sampler_storage(device, p->warp_set, sampler, mem->cached_input_image_view, mem->rotated_image_view);
+  write_sampler_storage(device, p->warp_set, sampler, mem->cached_input_image_view, mem->slots[0].rotated_image_view);
 
   // ----- GaussBlur1DStorage — two storage images (rotated → tilted) -----
   if (!create_two_image_layout(device, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -164,7 +164,7 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
   if (!alloc_set(device, p->blur_pool, p->blur_layout, &p->blur_set)) goto fail;
   if (!make_pipeline(device, "shaders/GaussBlur1DStorage.comp.spv", p->blur_layout, sizeof(ImasGaussBlur1DPushConsts),
                      &p->blur_pipeline_layout, &p->blur_pipeline)) goto fail;
-  write_two_storage(device, p->blur_set, mem->rotated_image_view, mem->tilted_image_view);
+  write_two_storage(device, p->blur_set, mem->slots[0].rotated_image_view, mem->slots[0].tilted_image_view);
 
   // ----- FinvsplineRow / FinvsplineCol — single storage image, in-place IIR -----
   if (!create_one_image_layout(device, &p->finvspline_layout)) goto fail;
@@ -189,8 +189,8 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
     vkDestroyShaderModule(device, col_module, NULL);
     if (res != VK_SUCCESS) goto fail;
   }
-  write_one_storage(device, p->finvspline_row_set, mem->tilted_image_view);
-  write_one_storage(device, p->finvspline_col_set, mem->tilted_image_view);
+  write_one_storage(device, p->finvspline_row_set, mem->slots[0].tilted_image_view);
+  write_one_storage(device, p->finvspline_col_set, mem->slots[0].tilted_image_view);
 
   // ----- FprojCubicY — sampler in, storage out, tilted_image → rotated_image -----
   // Shader binds: binding 0 = storage img_coeffs, binding 1 = storage img_out (per FprojCubicY.comp).
@@ -203,7 +203,7 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
   if (!alloc_set(device, p->fproj_pool, p->fproj_layout, &p->fproj_set)) goto fail;
   if (!make_pipeline(device, "shaders/FprojCubicY.comp.spv", p->fproj_layout, sizeof(FprojCubicPushConsts),
                      &p->fproj_pipeline_layout, &p->fproj_pipeline)) goto fail;
-  write_two_storage(device, p->fproj_set, mem->tilted_image_view, mem->rotated_image_view);
+  write_two_storage(device, p->fproj_set, mem->slots[0].tilted_image_view, mem->slots[0].rotated_image_view);
 
   // Bilinear-fproj alternate pipeline (same layout + descriptor set).
   // FprojBilinearY.comp reads input as storage image (binding 0, r32f) and
@@ -223,7 +223,7 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
   }
 
   // ----- Readback buffer (host-visible, persistent map) -----
-  p->readback_size = (VkDeviceSize)mem->rotated_image_max_width * mem->rotated_image_max_height * sizeof(float);
+  p->readback_size = (VkDeviceSize)mem->slots[0].rotated_image_max_width * mem->slots[0].rotated_image_max_height * sizeof(float);
   if (!vkenv_createBuffer(&p->readback_buffer, dev, 0, p->readback_size,
                           VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL))
     goto fail;
@@ -260,7 +260,7 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
 
   p->created = true;
   logInfo(LOG_TAG, "IMAS pipeline initialised (rotated buf %ux%u, readback %llu MB)",
-          mem->rotated_image_max_width, mem->rotated_image_max_height,
+          mem->slots[0].rotated_image_max_width, mem->slots[0].rotated_image_max_height,
           (unsigned long long)(p->readback_size / (1024 * 1024)));
   return p;
 
@@ -441,7 +441,7 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
   //   commonly used post-detect) → GENERAL using GENERAL as old_layout
   //   (no-op transition that just emits memory-barrier semantics).
   {
-    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(p->mem->input_image,
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(p->mem->slots[0].input_image,
         VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_ACCESS_SHADER_READ_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
@@ -454,8 +454,8 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
   }
   // rotated/tilted scratch images: ensure GENERAL layout. We don't preserve
   // contents (overwritten in step 1 / step 2 fully).
-  barrier_to_general_undef(p->cmd_buf, p->mem->rotated_image);
-  barrier_to_general_undef(p->cmd_buf, p->mem->tilted_image);
+  barrier_to_general_undef(p->cmd_buf, p->mem->slots[0].rotated_image);
+  barrier_to_general_undef(p->cmd_buf, p->mem->slots[0].tilted_image);
 
   // ----- 1. AffineWarp (rotate) : input_image → rotated_image -----
   {
@@ -470,13 +470,13 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(p->cmd_buf, (W_rot + 7) / 8, (H_rot + 7) / 8, 1);
   }
-  barrier_storage_to_sampled(p->cmd_buf, p->mem->rotated_image);
+  barrier_storage_to_sampled(p->cmd_buf, p->mem->slots[0].rotated_image);
 
   if (stage_limit == 1) {
     // Read back rotated_image directly
     VkBufferImageCopy region = {.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                 .imageExtent = {W_rot, H_rot, 1}};
-    vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->rotated_image, VK_IMAGE_LAYOUT_GENERAL,
+    vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->slots[0].rotated_image, VK_IMAGE_LAYOUT_GENERAL,
                            p->readback_buffer, 1, &region);
     *out_h = H_rot;
     goto submit;
@@ -494,12 +494,12 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(p->cmd_buf, (W_rot + 7) / 8, (H_rot + 7) / 8, 1);
   }
-  barrier_storage_to_sampled(p->cmd_buf, p->mem->tilted_image);
+  barrier_storage_to_sampled(p->cmd_buf, p->mem->slots[0].tilted_image);
 
   if (stage_limit == 2) {
     VkBufferImageCopy region = {.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                 .imageExtent = {W_rot, H_rot, 1}};
-    vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->tilted_image, VK_IMAGE_LAYOUT_GENERAL,
+    vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->slots[0].tilted_image, VK_IMAGE_LAYOUT_GENERAL,
                            p->readback_buffer, 1, &region);
     *out_h = H_rot;
     goto submit;
@@ -517,12 +517,12 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
                          0, sizeof(pc), &pc);
       vkCmdDispatch(p->cmd_buf, (H_rot + 63) / 64, 1, 1);
     }
-    barrier_storage_to_sampled(p->cmd_buf, p->mem->tilted_image);
+    barrier_storage_to_sampled(p->cmd_buf, p->mem->slots[0].tilted_image);
 
     if (stage_limit == 3) {
       VkBufferImageCopy region = {.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                   .imageExtent = {W_rot, H_rot, 1}};
-      vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->tilted_image, VK_IMAGE_LAYOUT_GENERAL,
+      vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->slots[0].tilted_image, VK_IMAGE_LAYOUT_GENERAL,
                              p->readback_buffer, 1, &region);
       *out_h = H_rot;
       goto submit;
@@ -538,7 +538,7 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
                          0, sizeof(pc), &pc);
       vkCmdDispatch(p->cmd_buf, (W_rot + 63) / 64, 1, 1);
     }
-    barrier_storage_to_sampled(p->cmd_buf, p->mem->tilted_image);
+    barrier_storage_to_sampled(p->cmd_buf, p->mem->slots[0].tilted_image);
   }
 
   // ----- 5. Fproj{Cubic|Bilinear}Y : tilted_image → rotated_image -----
@@ -555,7 +555,7 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(p->cmd_buf, (W_rot + 7) / 8, (H_t + 7) / 8, 1);
   }
-  barrier_storage_to_sampled(p->cmd_buf, p->mem->rotated_image);
+  barrier_storage_to_sampled(p->cmd_buf, p->mem->slots[0].rotated_image);
 
   // ----- 6. Copy rotated_image (final tilted) → host-mapped readback buffer -----
   {
@@ -564,7 +564,7 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         .imageOffset = {0, 0, 0},
         .imageExtent = {W_rot, H_t, 1}};
-    vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->rotated_image, VK_IMAGE_LAYOUT_GENERAL,
+    vkCmdCopyImageToBuffer(p->cmd_buf, p->mem->slots[0].rotated_image, VK_IMAGE_LAYOUT_GENERAL,
                            p->readback_buffer, 1, &region);
   }
 

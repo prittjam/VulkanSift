@@ -130,12 +130,13 @@ static bool estimateHighestMemoryRequirement(vksift_SiftMemory memory, uint32_t 
   return true;
 }
 
-bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
+// Per-slot allocation pass for setupDynamicObjectsAndMemory. Allocates
+// the per-pyramid images/buffers (input/blurred/warped/rotated/tilted/
+// rgba/rgb plus the per-octave arrays) that live in memory->slots[slot_idx].
+// Caller invokes once per slot; cached_input_image + image layout
+// barriers are emitted separately at the setupDynamicObjectsAndMemory level.
+static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_init)
 {
-  // Setup Pyramid related objects (must be updated when the input resolution changes)
-  // Memory is only allocated on first call or if the previous allocation isn't large enough, this should not happen (or very rarely due to driver decision
-  // on the alignment) since on first call the memory is allocated to support max size items at runtime.
-
   VkFormat pyramid_format = (memory->pyr_precision_mode == VKSIFT_PYRAMID_PRECISION_FLOAT16) ? VK_FORMAT_R16_SFLOAT : VK_FORMAT_R32_SFLOAT;
 
   bool res;
@@ -147,7 +148,7 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
   // ASIFT batch detect path is active (Phase 2b+). Doesn't affect existing
   // storage-image reads on the standard detect path.
   res = true;
-  res = res && vkenv_createImage(&memory->input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM,
+  res = res && vkenv_createImage(&memory->slots[slot_idx].input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM,
                                  (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
                                  VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -163,26 +164,421 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
   }
   else if (res)
   {
-    vkGetImageMemoryRequirements(memory->device->device, memory->input_image, &memory_requirement);
+    vkGetImageMemoryRequirements(memory->device->device, memory->slots[slot_idx].input_image, &memory_requirement);
   }
 
-  if (memory_requirement.size > memory->input_image_memory_size)
+  if (memory_requirement.size > memory->slots[slot_idx].input_image_memory_size)
   {
 
-    VK_NULL_SAFE_DELETE(memory->input_image_memory, vkFreeMemory(memory->device->device, memory->input_image_memory, NULL));
+    VK_NULL_SAFE_DELETE(memory->slots[slot_idx].input_image_memory, vkFreeMemory(memory->device->device, memory->slots[slot_idx].input_image_memory, NULL));
     res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
-    res = res && vkenv_allocateMemory(&memory->input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
-    memory->input_image_memory_size = memory_requirement.size;
+    res = res && vkenv_allocateMemory(&memory->slots[slot_idx].input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+    memory->slots[slot_idx].input_image_memory_size = memory_requirement.size;
     logDebug(LOG_TAG, "Input image (%d,%d) allocation", memory->curr_input_image_width, memory->curr_input_image_height);
   }
-  res = res && vkenv_bindImageMemory(memory->device, memory->input_image, memory->input_image_memory, 0u);
-  res = res && vkenv_createImageView(&memory->input_image_view, memory->device, 0, memory->input_image, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8_UNORM,
+  res = res && vkenv_bindImageMemory(memory->device, memory->slots[slot_idx].input_image, memory->slots[slot_idx].input_image_memory, 0u);
+  res = res && vkenv_createImageView(&memory->slots[slot_idx].input_image_view, memory->device, 0, memory->slots[slot_idx].input_image, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8_UNORM,
                                      VKENV_DEFAULT_COMPONENT_MAPPING, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
   if (!res)
   {
     logError(LOG_TAG, "An error occured when setting up the input image");
     return false;
   }
+
+  // Create blurred input image (r32f). Output of PreBlur1D.comp; the
+  // AffineWarp pass then samples FROM it. Needs SAMPLED + STORAGE bits.
+  res = true;
+  res = res && vkenv_createImage(&memory->slots[slot_idx].blurred_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
+                                 (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
+                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+  if (is_init)
+  {
+    res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height * 4u, &memory_requirement, 0,
+                                                  VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+  }
+  else if (res)
+  {
+    vkGetImageMemoryRequirements(memory->device->device, memory->slots[slot_idx].blurred_input_image, &memory_requirement);
+  }
+  if (memory_requirement.size > memory->slots[slot_idx].blurred_input_image_memory_size)
+  {
+    VK_NULL_SAFE_DELETE(memory->slots[slot_idx].blurred_input_image_memory, vkFreeMemory(memory->device->device, memory->slots[slot_idx].blurred_input_image_memory, NULL));
+    res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+    res = res && vkenv_allocateMemory(&memory->slots[slot_idx].blurred_input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+    memory->slots[slot_idx].blurred_input_image_memory_size = memory_requirement.size;
+    logDebug(LOG_TAG, "Blurred input image (%d,%d) allocation", memory->curr_input_image_width, memory->curr_input_image_height);
+  }
+  res = res && vkenv_bindImageMemory(memory->device, memory->slots[slot_idx].blurred_input_image, memory->slots[slot_idx].blurred_input_image_memory, 0u);
+  res = res && vkenv_createImageView(&memory->slots[slot_idx].blurred_input_image_view, memory->device, 0, memory->slots[slot_idx].blurred_input_image, VK_IMAGE_VIEW_TYPE_2D,
+                                     VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+  if (!res)
+  {
+    logError(LOG_TAG, "An error occured when setting up the blurred input image");
+    return false;
+  }
+
+  // Create warped input image (r32f). Output of AffineWarp.comp; consumed by
+  // the first Gaussian blur as a sampler2D, so we need SAMPLED + STORAGE bits.
+  res = true;
+  res = res && vkenv_createImage(&memory->slots[slot_idx].warped_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
+                                 (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
+                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+  if (is_init)
+  {
+    res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height * 4u, &memory_requirement, 0,
+                                                  VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+  }
+  else if (res)
+  {
+    vkGetImageMemoryRequirements(memory->device->device, memory->slots[slot_idx].warped_input_image, &memory_requirement);
+  }
+  if (memory_requirement.size > memory->slots[slot_idx].warped_input_image_memory_size)
+  {
+    VK_NULL_SAFE_DELETE(memory->slots[slot_idx].warped_input_image_memory, vkFreeMemory(memory->device->device, memory->slots[slot_idx].warped_input_image_memory, NULL));
+    res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+    res = res && vkenv_allocateMemory(&memory->slots[slot_idx].warped_input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+    memory->slots[slot_idx].warped_input_image_memory_size = memory_requirement.size;
+    logDebug(LOG_TAG, "Warped input image (%d,%d) allocation", memory->curr_input_image_width, memory->curr_input_image_height);
+  }
+  res = res && vkenv_bindImageMemory(memory->device, memory->slots[slot_idx].warped_input_image, memory->slots[slot_idx].warped_input_image_memory, 0u);
+  res = res && vkenv_createImageView(&memory->slots[slot_idx].warped_input_image_view, memory->device, 0, memory->slots[slot_idx].warped_input_image, VK_IMAGE_VIEW_TYPE_2D,
+                                     VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+  if (!res)
+  {
+    logError(LOG_TAG, "An error occured when setting up the warped input image");
+    return false;
+  }
+
+  // Create rotated working image (r32f). Worst-case rotated canvas for a W×H
+  // input is sqrt(2)·max(W,H) per side at 45°. We size at curr_W+curr_H per
+  // side to cover all IMAS-25 tilts (still smaller than 2·max but safe). Used
+  // as scratch for: AffineWarp(rotate) → rotated; PreBlur1D(vertical σ_aa)
+  // in-place; FprojBilinearY samples FROM here to produce tilted_image.
+  {
+    uint32_t rot_max = memory->curr_input_image_width + memory->curr_input_image_height;
+    memory->slots[slot_idx].rotated_image_max_width = rot_max;
+    memory->slots[slot_idx].rotated_image_max_height = rot_max;
+    res = true;
+    res = res && vkenv_createImage(&memory->slots[slot_idx].rotated_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
+                                   (VkExtent3D){.width = rot_max, .height = rot_max, .depth = 1}, 1, 1,
+                                   VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (is_init)
+    {
+      res = res && estimateHighestMemoryRequirement(memory, rot_max * rot_max * 4u, &memory_requirement, 0,
+                                                    VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+    else if (res)
+    {
+      vkGetImageMemoryRequirements(memory->device->device, memory->slots[slot_idx].rotated_image, &memory_requirement);
+    }
+    if (memory_requirement.size > memory->slots[slot_idx].rotated_image_memory_size)
+    {
+      VK_NULL_SAFE_DELETE(memory->slots[slot_idx].rotated_image_memory, vkFreeMemory(memory->device->device, memory->slots[slot_idx].rotated_image_memory, NULL));
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->slots[slot_idx].rotated_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+      memory->slots[slot_idx].rotated_image_memory_size = memory_requirement.size;
+      logDebug(LOG_TAG, "Rotated image (%d,%d) allocation", rot_max, rot_max);
+    }
+    res = res && vkenv_bindImageMemory(memory->device, memory->slots[slot_idx].rotated_image, memory->slots[slot_idx].rotated_image_memory, 0u);
+    res = res && vkenv_createImageView(&memory->slots[slot_idx].rotated_image_view, memory->device, 0, memory->slots[slot_idx].rotated_image, VK_IMAGE_VIEW_TYPE_2D,
+                                       VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    if (!res)
+    {
+      logError(LOG_TAG, "An error occured when setting up the rotated image");
+      return false;
+    }
+  }
+
+  // Create tilted image (r32f). Output of FprojBilinearY at W_rot × ⌊H_rot/t⌋.
+  // Worst case dimension = rotated_image_max_width × rotated_image_max_height
+  // (when t=1 the fproj is a pass-through). We oversize to the rotated extent
+  // for simplicity.
+  {
+    uint32_t tilt_max = memory->slots[slot_idx].rotated_image_max_width;
+    memory->slots[slot_idx].tilted_image_max_width = tilt_max;
+    memory->slots[slot_idx].tilted_image_max_height = tilt_max;
+    res = true;
+    res = res && vkenv_createImage(&memory->slots[slot_idx].tilted_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
+                                   (VkExtent3D){.width = tilt_max, .height = tilt_max, .depth = 1}, 1, 1,
+                                   VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                       VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (is_init)
+    {
+      res = res && estimateHighestMemoryRequirement(memory, tilt_max * tilt_max * 4u, &memory_requirement, 0,
+                                                    VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+    else if (res)
+    {
+      vkGetImageMemoryRequirements(memory->device->device, memory->slots[slot_idx].tilted_image, &memory_requirement);
+    }
+    if (memory_requirement.size > memory->slots[slot_idx].tilted_image_memory_size)
+    {
+      VK_NULL_SAFE_DELETE(memory->slots[slot_idx].tilted_image_memory, vkFreeMemory(memory->device->device, memory->slots[slot_idx].tilted_image_memory, NULL));
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->slots[slot_idx].tilted_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+      memory->slots[slot_idx].tilted_image_memory_size = memory_requirement.size;
+      logDebug(LOG_TAG, "Tilted image (%d,%d) allocation", tilt_max, tilt_max);
+    }
+    res = res && vkenv_bindImageMemory(memory->device, memory->slots[slot_idx].tilted_image, memory->slots[slot_idx].tilted_image_memory, 0u);
+    res = res && vkenv_createImageView(&memory->slots[slot_idx].tilted_image_view, memory->device, 0, memory->slots[slot_idx].tilted_image, VK_IMAGE_VIEW_TYPE_2D,
+                                       VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    if (!res)
+    {
+      logError(LOG_TAG, "An error occured when setting up the tilted image");
+      return false;
+    }
+  }
+
+  // Create RGBA input image if using RGBA input mode
+  if (memory->use_rgba_input)
+  {
+    res = true;
+    res = res && vkenv_createImage(&memory->slots[slot_idx].rgba_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
+                                   (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
+                                   VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE,
+                                   0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+
+    if (is_init)
+    {
+      res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height, &memory_requirement, 0,
+                                                    VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+    else if (res)
+    {
+      vkGetImageMemoryRequirements(memory->device->device, memory->slots[slot_idx].rgba_input_image, &memory_requirement);
+    }
+
+    if (memory_requirement.size > memory->slots[slot_idx].rgba_input_image_memory_size)
+    {
+      VK_NULL_SAFE_DELETE(memory->slots[slot_idx].rgba_input_image_memory, vkFreeMemory(memory->device->device, memory->slots[slot_idx].rgba_input_image_memory, NULL));
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->slots[slot_idx].rgba_input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+      memory->slots[slot_idx].rgba_input_image_memory_size = memory_requirement.size;
+    }
+    res = res && vkenv_bindImageMemory(memory->device, memory->slots[slot_idx].rgba_input_image, memory->slots[slot_idx].rgba_input_image_memory, 0u);
+    res = res && vkenv_createImageView(&memory->slots[slot_idx].rgba_input_image_view, memory->device, 0, memory->slots[slot_idx].rgba_input_image, VK_IMAGE_VIEW_TYPE_2D,
+                                       VK_FORMAT_R8G8B8A8_UNORM, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    if (!res)
+    {
+      logError(LOG_TAG, "An error occured when setting up the RGBA input image");
+      return false;
+    }
+  }
+
+  // Create RGB input buffer if using RGB input mode (SSBO-based)
+  if (memory->use_rgb_input)
+  {
+    VkDeviceSize rgb_buf_size = 3 * (VkDeviceSize)memory->curr_input_image_width * memory->curr_input_image_height;
+    // Round up to 4 bytes for uint32 alignment in shader
+    rgb_buf_size = (rgb_buf_size + 3u) & ~3u;
+
+    if (rgb_buf_size > memory->slots[slot_idx].rgb_input_buffer_size)
+    {
+      VK_NULL_SAFE_DELETE(memory->slots[slot_idx].rgb_input_buffer, vkDestroyBuffer(memory->device->device, memory->slots[slot_idx].rgb_input_buffer, NULL));
+      VK_NULL_SAFE_DELETE(memory->slots[slot_idx].rgb_input_buffer_memory, vkFreeMemory(memory->device->device, memory->slots[slot_idx].rgb_input_buffer_memory, NULL));
+
+      res = true;
+      res = res && vkenv_createBuffer(&memory->slots[slot_idx].rgb_input_buffer, memory->device, 0, rgb_buf_size,
+                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+      if (res)
+      {
+        vkGetBufferMemoryRequirements(memory->device->device, memory->slots[slot_idx].rgb_input_buffer, &memory_requirement);
+      }
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement,
+                                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->slots[slot_idx].rgb_input_buffer_memory, memory->device, memory_requirement.size, memory_type_idx);
+      res = res && vkenv_bindBufferMemory(memory->device, memory->slots[slot_idx].rgb_input_buffer, memory->slots[slot_idx].rgb_input_buffer_memory, 0u);
+      memory->slots[slot_idx].rgb_input_buffer_size = rgb_buf_size;
+
+      if (!res)
+      {
+        logError(LOG_TAG, "An error occured when setting up the RGB input buffer");
+        return false;
+      }
+    }
+  }
+
+  // Create blur temp result images (one per octave)
+  res = true;
+  for (uint32_t oct_idx = 0; oct_idx < memory->curr_nb_octaves; oct_idx++)
+  {
+    uint32_t width = memory->octave_resolutions[oct_idx].width;
+    uint32_t height = memory->octave_resolutions[oct_idx].height;
+    res = res &&
+          vkenv_createImage(&memory->slots[slot_idx].blur_tmp_image_arr[oct_idx], memory->device, 0, VK_IMAGE_TYPE_2D, pyramid_format,
+                            (VkExtent3D){.width = width, .height = height, .depth = 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (is_init)
+    {
+      res = res && estimateHighestMemoryRequirement(memory, width * height, &memory_requirement, 0, VK_IMAGE_TYPE_2D, pyramid_format, 1, 1,
+                                                    VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                                        VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+    else if (res)
+    {
+      vkGetImageMemoryRequirements(memory->device->device, memory->slots[slot_idx].blur_tmp_image_arr[oct_idx], &memory_requirement);
+    }
+
+    if (memory_requirement.size > memory->slots[slot_idx].blur_tmp_image_memory_size_arr[oct_idx])
+    {
+      VK_NULL_SAFE_DELETE(memory->slots[slot_idx].blur_tmp_image_memory_arr[oct_idx],
+                          vkFreeMemory(memory->device->device, memory->slots[slot_idx].blur_tmp_image_memory_arr[oct_idx], NULL));
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->slots[slot_idx].blur_tmp_image_memory_arr[oct_idx], memory->device, memory_requirement.size, memory_type_idx);
+      memory->slots[slot_idx].blur_tmp_image_memory_size_arr[oct_idx] = memory_requirement.size;
+      logDebug(LOG_TAG, "Blur tmp image (oct %d) (%d,%d) allocation", oct_idx, width, height);
+    }
+    res = res && vkenv_bindImageMemory(memory->device, memory->slots[slot_idx].blur_tmp_image_arr[oct_idx], memory->slots[slot_idx].blur_tmp_image_memory_arr[oct_idx], 0);
+    res = res && vkenv_createImageView(&memory->slots[slot_idx].blur_tmp_image_view_arr[oct_idx], memory->device, 0, memory->slots[slot_idx].blur_tmp_image_arr[oct_idx],
+                                       VK_IMAGE_VIEW_TYPE_2D_ARRAY, pyramid_format, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+  }
+  if (!res)
+  {
+    logError(LOG_TAG, "An error occured when setting up the temporary blur result images");
+    return false;
+  }
+
+  // Create gaussian image array per octave
+  res = true;
+  for (uint32_t oct_idx = 0; oct_idx < memory->curr_nb_octaves; oct_idx++)
+  {
+    uint32_t width = memory->octave_resolutions[oct_idx].width;
+    uint32_t height = memory->octave_resolutions[oct_idx].height;
+    res = res &&
+          vkenv_createImage(&memory->slots[slot_idx].octave_image_arr[oct_idx], memory->device, 0, VK_IMAGE_TYPE_2D, pyramid_format,
+                            (VkExtent3D){.width = width, .height = height, .depth = 1}, 1, memory->nb_scales_per_octave + 3, VK_SAMPLE_COUNT_1_BIT,
+                            VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (is_init)
+    {
+      res = res && estimateHighestMemoryRequirement(memory, width * height, &memory_requirement, 0, VK_IMAGE_TYPE_2D, pyramid_format, 1,
+                                                    memory->nb_scales_per_octave + 3, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                                        VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+    else if (res)
+    {
+      vkGetImageMemoryRequirements(memory->device->device, memory->slots[slot_idx].octave_image_arr[oct_idx], &memory_requirement);
+    }
+
+    if (memory_requirement.size > memory->slots[slot_idx].octave_image_memory_size_arr[oct_idx])
+    {
+      VK_NULL_SAFE_DELETE(memory->slots[slot_idx].octave_image_memory_arr[oct_idx], vkFreeMemory(memory->device->device, memory->slots[slot_idx].octave_image_memory_arr[oct_idx], NULL));
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->slots[slot_idx].octave_image_memory_arr[oct_idx], memory->device, memory_requirement.size, memory_type_idx);
+      memory->slots[slot_idx].octave_image_memory_size_arr[oct_idx] = memory_requirement.size;
+      logDebug(LOG_TAG, "Octave image (oct %d) (%d,%d) allocation", oct_idx, width, height);
+    }
+    res = res && vkenv_bindImageMemory(memory->device, memory->slots[slot_idx].octave_image_arr[oct_idx], memory->slots[slot_idx].octave_image_memory_arr[oct_idx], 0);
+    res = res && vkenv_createImageView(&memory->slots[slot_idx].octave_image_view_arr[oct_idx], memory->device, 0, memory->slots[slot_idx].octave_image_arr[oct_idx],
+                                       VK_IMAGE_VIEW_TYPE_2D_ARRAY, pyramid_format, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, memory->nb_scales_per_octave + 3});
+  }
+  if (!res)
+  {
+    logError(LOG_TAG, "An error occured when setting up the octave images");
+    return false;
+  }
+
+  // Create DoG image array per octave
+  res = true;
+  for (uint32_t oct_idx = 0; oct_idx < memory->curr_nb_octaves; oct_idx++)
+  {
+    uint32_t width = memory->octave_resolutions[oct_idx].width;
+    uint32_t height = memory->octave_resolutions[oct_idx].height;
+    res = res &&
+          vkenv_createImage(&memory->slots[slot_idx].octave_DoG_image_arr[oct_idx], memory->device, 0, VK_IMAGE_TYPE_2D, pyramid_format,
+                            (VkExtent3D){.width = width, .height = height, .depth = 1}, 1, memory->nb_scales_per_octave + 2, VK_SAMPLE_COUNT_1_BIT,
+                            VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (is_init)
+    {
+      res = res && estimateHighestMemoryRequirement(memory, width * height, &memory_requirement, 0, VK_IMAGE_TYPE_2D, pyramid_format, 1,
+                                                    memory->nb_scales_per_octave + 2, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                                        VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+    else if (res)
+    {
+      vkGetImageMemoryRequirements(memory->device->device, memory->slots[slot_idx].octave_DoG_image_arr[oct_idx], &memory_requirement);
+    }
+
+    if (memory_requirement.size > memory->slots[slot_idx].octave_DoG_image_memory_size_arr[oct_idx])
+    {
+      VK_NULL_SAFE_DELETE(memory->slots[slot_idx].octave_DoG_image_memory_arr[oct_idx],
+                          vkFreeMemory(memory->device->device, memory->slots[slot_idx].octave_DoG_image_memory_arr[oct_idx], NULL));
+      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+      res = res && vkenv_allocateMemory(&memory->slots[slot_idx].octave_DoG_image_memory_arr[oct_idx], memory->device, memory_requirement.size, memory_type_idx);
+      memory->slots[slot_idx].octave_DoG_image_memory_size_arr[oct_idx] = memory_requirement.size;
+      logDebug(LOG_TAG, "Octave DoG image (oct %d) (%d,%d) allocation", oct_idx, width, height);
+    }
+    res = res && vkenv_bindImageMemory(memory->device, memory->slots[slot_idx].octave_DoG_image_arr[oct_idx], memory->slots[slot_idx].octave_DoG_image_memory_arr[oct_idx], 0);
+    res = res && vkenv_createImageView(&memory->slots[slot_idx].octave_DoG_image_view_arr[oct_idx], memory->device, 0, memory->slots[slot_idx].octave_DoG_image_arr[oct_idx],
+                                       VK_IMAGE_VIEW_TYPE_2D_ARRAY, pyramid_format, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, memory->nb_scales_per_octave + 2});
+  }
+  if (!res)
+  {
+    logError(LOG_TAG, "An error occured when setting up the DoG octave images");
+    return false;
+  }
+
+  return true;
+}
+
+bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
+{
+  // Setup Pyramid related objects (must be updated when the input resolution changes)
+  // Memory is only allocated on first call or if the previous allocation isn't large enough, this should not happen (or very rarely due to driver decision
+  // on the alignment) since on first call the memory is allocated to support max size items at runtime.
+  // Phase A parallel-pyramid scaffold: per-slot allocations live in
+  // memory->slots[s] for s in [0, nb_pyramid_slots). cached_input_image
+  // stays single-instance.
+  for (uint32_t s = 0; s < memory->nb_pyramid_slots; s++)
+  {
+    if (!setupOneSlot(memory, s, is_init))
+    {
+      return false;
+    }
+  }
+
+  bool res;
+  VkMemoryRequirements memory_requirement;
+  uint32_t memory_type_idx;
 
   // Create cached_input_image — same R8 format and dims as input_image. The
   // IMAS pipeline samples from this image (rather than input_image) so the
@@ -224,413 +620,48 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
     return false;
   }
 
-  // Create blurred input image (r32f). Output of PreBlur1D.comp; the
-  // AffineWarp pass then samples FROM it. Needs SAMPLED + STORAGE bits.
-  res = true;
-  res = res && vkenv_createImage(&memory->blurred_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
-                                 (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
-                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-  if (is_init)
-  {
-    res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height * 4u, &memory_requirement, 0,
-                                                  VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-  }
-  else if (res)
-  {
-    vkGetImageMemoryRequirements(memory->device->device, memory->blurred_input_image, &memory_requirement);
-  }
-  if (memory_requirement.size > memory->blurred_input_image_memory_size)
-  {
-    VK_NULL_SAFE_DELETE(memory->blurred_input_image_memory, vkFreeMemory(memory->device->device, memory->blurred_input_image_memory, NULL));
-    res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
-    res = res && vkenv_allocateMemory(&memory->blurred_input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
-    memory->blurred_input_image_memory_size = memory_requirement.size;
-    logDebug(LOG_TAG, "Blurred input image (%d,%d) allocation", memory->curr_input_image_width, memory->curr_input_image_height);
-  }
-  res = res && vkenv_bindImageMemory(memory->device, memory->blurred_input_image, memory->blurred_input_image_memory, 0u);
-  res = res && vkenv_createImageView(&memory->blurred_input_image_view, memory->device, 0, memory->blurred_input_image, VK_IMAGE_VIEW_TYPE_2D,
-                                     VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
-                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-  if (!res)
-  {
-    logError(LOG_TAG, "An error occured when setting up the blurred input image");
-    return false;
-  }
-
-  // Create warped input image (r32f). Output of AffineWarp.comp; consumed by
-  // the first Gaussian blur as a sampler2D, so we need SAMPLED + STORAGE bits.
-  res = true;
-  res = res && vkenv_createImage(&memory->warped_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
-                                 (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
-                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-  if (is_init)
-  {
-    res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height * 4u, &memory_requirement, 0,
-                                                  VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-  }
-  else if (res)
-  {
-    vkGetImageMemoryRequirements(memory->device->device, memory->warped_input_image, &memory_requirement);
-  }
-  if (memory_requirement.size > memory->warped_input_image_memory_size)
-  {
-    VK_NULL_SAFE_DELETE(memory->warped_input_image_memory, vkFreeMemory(memory->device->device, memory->warped_input_image_memory, NULL));
-    res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
-    res = res && vkenv_allocateMemory(&memory->warped_input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
-    memory->warped_input_image_memory_size = memory_requirement.size;
-    logDebug(LOG_TAG, "Warped input image (%d,%d) allocation", memory->curr_input_image_width, memory->curr_input_image_height);
-  }
-  res = res && vkenv_bindImageMemory(memory->device, memory->warped_input_image, memory->warped_input_image_memory, 0u);
-  res = res && vkenv_createImageView(&memory->warped_input_image_view, memory->device, 0, memory->warped_input_image, VK_IMAGE_VIEW_TYPE_2D,
-                                     VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
-                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-  if (!res)
-  {
-    logError(LOG_TAG, "An error occured when setting up the warped input image");
-    return false;
-  }
-
-  // Create rotated working image (r32f). Worst-case rotated canvas for a W×H
-  // input is sqrt(2)·max(W,H) per side at 45°. We size at curr_W+curr_H per
-  // side to cover all IMAS-25 tilts (still smaller than 2·max but safe). Used
-  // as scratch for: AffineWarp(rotate) → rotated; PreBlur1D(vertical σ_aa)
-  // in-place; FprojBilinearY samples FROM here to produce tilted_image.
-  {
-    uint32_t rot_max = memory->curr_input_image_width + memory->curr_input_image_height;
-    memory->rotated_image_max_width = rot_max;
-    memory->rotated_image_max_height = rot_max;
-    res = true;
-    res = res && vkenv_createImage(&memory->rotated_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
-                                   (VkExtent3D){.width = rot_max, .height = rot_max, .depth = 1}, 1, 1,
-                                   VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                   VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    if (is_init)
-    {
-      res = res && estimateHighestMemoryRequirement(memory, rot_max * rot_max * 4u, &memory_requirement, 0,
-                                                    VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    }
-    else if (res)
-    {
-      vkGetImageMemoryRequirements(memory->device->device, memory->rotated_image, &memory_requirement);
-    }
-    if (memory_requirement.size > memory->rotated_image_memory_size)
-    {
-      VK_NULL_SAFE_DELETE(memory->rotated_image_memory, vkFreeMemory(memory->device->device, memory->rotated_image_memory, NULL));
-      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
-      res = res && vkenv_allocateMemory(&memory->rotated_image_memory, memory->device, memory_requirement.size, memory_type_idx);
-      memory->rotated_image_memory_size = memory_requirement.size;
-      logDebug(LOG_TAG, "Rotated image (%d,%d) allocation", rot_max, rot_max);
-    }
-    res = res && vkenv_bindImageMemory(memory->device, memory->rotated_image, memory->rotated_image_memory, 0u);
-    res = res && vkenv_createImageView(&memory->rotated_image_view, memory->device, 0, memory->rotated_image, VK_IMAGE_VIEW_TYPE_2D,
-                                       VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
-                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    if (!res)
-    {
-      logError(LOG_TAG, "An error occured when setting up the rotated image");
-      return false;
-    }
-  }
-
-  // Create tilted image (r32f). Output of FprojBilinearY at W_rot × ⌊H_rot/t⌋.
-  // Worst case dimension = rotated_image_max_width × rotated_image_max_height
-  // (when t=1 the fproj is a pass-through). We oversize to the rotated extent
-  // for simplicity.
-  {
-    uint32_t tilt_max = memory->rotated_image_max_width;
-    memory->tilted_image_max_width = tilt_max;
-    memory->tilted_image_max_height = tilt_max;
-    res = true;
-    res = res && vkenv_createImage(&memory->tilted_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
-                                   (VkExtent3D){.width = tilt_max, .height = tilt_max, .depth = 1}, 1, 1,
-                                   VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                       VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                   VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    if (is_init)
-    {
-      res = res && estimateHighestMemoryRequirement(memory, tilt_max * tilt_max * 4u, &memory_requirement, 0,
-                                                    VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    }
-    else if (res)
-    {
-      vkGetImageMemoryRequirements(memory->device->device, memory->tilted_image, &memory_requirement);
-    }
-    if (memory_requirement.size > memory->tilted_image_memory_size)
-    {
-      VK_NULL_SAFE_DELETE(memory->tilted_image_memory, vkFreeMemory(memory->device->device, memory->tilted_image_memory, NULL));
-      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
-      res = res && vkenv_allocateMemory(&memory->tilted_image_memory, memory->device, memory_requirement.size, memory_type_idx);
-      memory->tilted_image_memory_size = memory_requirement.size;
-      logDebug(LOG_TAG, "Tilted image (%d,%d) allocation", tilt_max, tilt_max);
-    }
-    res = res && vkenv_bindImageMemory(memory->device, memory->tilted_image, memory->tilted_image_memory, 0u);
-    res = res && vkenv_createImageView(&memory->tilted_image_view, memory->device, 0, memory->tilted_image, VK_IMAGE_VIEW_TYPE_2D,
-                                       VK_FORMAT_R32_SFLOAT, VKENV_DEFAULT_COMPONENT_MAPPING,
-                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    if (!res)
-    {
-      logError(LOG_TAG, "An error occured when setting up the tilted image");
-      return false;
-    }
-  }
-
-  // Create RGBA input image if using RGBA input mode
-  if (memory->use_rgba_input)
-  {
-    res = true;
-    res = res && vkenv_createImage(&memory->rgba_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
-                                   (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
-                                   VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE,
-                                   0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-
-    if (is_init)
-    {
-      res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height, &memory_requirement, 0,
-                                                    VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    }
-    else if (res)
-    {
-      vkGetImageMemoryRequirements(memory->device->device, memory->rgba_input_image, &memory_requirement);
-    }
-
-    if (memory_requirement.size > memory->rgba_input_image_memory_size)
-    {
-      VK_NULL_SAFE_DELETE(memory->rgba_input_image_memory, vkFreeMemory(memory->device->device, memory->rgba_input_image_memory, NULL));
-      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
-      res = res && vkenv_allocateMemory(&memory->rgba_input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
-      memory->rgba_input_image_memory_size = memory_requirement.size;
-    }
-    res = res && vkenv_bindImageMemory(memory->device, memory->rgba_input_image, memory->rgba_input_image_memory, 0u);
-    res = res && vkenv_createImageView(&memory->rgba_input_image_view, memory->device, 0, memory->rgba_input_image, VK_IMAGE_VIEW_TYPE_2D,
-                                       VK_FORMAT_R8G8B8A8_UNORM, VKENV_DEFAULT_COMPONENT_MAPPING,
-                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    if (!res)
-    {
-      logError(LOG_TAG, "An error occured when setting up the RGBA input image");
-      return false;
-    }
-  }
-
-  // Create RGB input buffer if using RGB input mode (SSBO-based)
-  if (memory->use_rgb_input)
-  {
-    VkDeviceSize rgb_buf_size = 3 * (VkDeviceSize)memory->curr_input_image_width * memory->curr_input_image_height;
-    // Round up to 4 bytes for uint32 alignment in shader
-    rgb_buf_size = (rgb_buf_size + 3u) & ~3u;
-
-    if (rgb_buf_size > memory->rgb_input_buffer_size)
-    {
-      VK_NULL_SAFE_DELETE(memory->rgb_input_buffer, vkDestroyBuffer(memory->device->device, memory->rgb_input_buffer, NULL));
-      VK_NULL_SAFE_DELETE(memory->rgb_input_buffer_memory, vkFreeMemory(memory->device->device, memory->rgb_input_buffer_memory, NULL));
-
-      res = true;
-      res = res && vkenv_createBuffer(&memory->rgb_input_buffer, memory->device, 0, rgb_buf_size,
-                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                       VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
-      if (res)
-      {
-        vkGetBufferMemoryRequirements(memory->device->device, memory->rgb_input_buffer, &memory_requirement);
-      }
-      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement,
-                                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
-      res = res && vkenv_allocateMemory(&memory->rgb_input_buffer_memory, memory->device, memory_requirement.size, memory_type_idx);
-      res = res && vkenv_bindBufferMemory(memory->device, memory->rgb_input_buffer, memory->rgb_input_buffer_memory, 0u);
-      memory->rgb_input_buffer_size = rgb_buf_size;
-
-      if (!res)
-      {
-        logError(LOG_TAG, "An error occured when setting up the RGB input buffer");
-        return false;
-      }
-    }
-  }
-
-  // Create blur temp result images (one per octave)
-  res = true;
-  for (uint32_t oct_idx = 0; oct_idx < memory->curr_nb_octaves; oct_idx++)
-  {
-    uint32_t width = memory->octave_resolutions[oct_idx].width;
-    uint32_t height = memory->octave_resolutions[oct_idx].height;
-    res = res &&
-          vkenv_createImage(&memory->blur_tmp_image_arr[oct_idx], memory->device, 0, VK_IMAGE_TYPE_2D, pyramid_format,
-                            (VkExtent3D){.width = width, .height = height, .depth = 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    if (is_init)
-    {
-      res = res && estimateHighestMemoryRequirement(memory, width * height, &memory_requirement, 0, VK_IMAGE_TYPE_2D, pyramid_format, 1, 1,
-                                                    VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                                        VK_IMAGE_USAGE_SAMPLED_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    }
-    else if (res)
-    {
-      vkGetImageMemoryRequirements(memory->device->device, memory->blur_tmp_image_arr[oct_idx], &memory_requirement);
-    }
-
-    if (memory_requirement.size > memory->blur_tmp_image_memory_size_arr[oct_idx])
-    {
-      VK_NULL_SAFE_DELETE(memory->blur_tmp_image_memory_arr[oct_idx],
-                          vkFreeMemory(memory->device->device, memory->blur_tmp_image_memory_arr[oct_idx], NULL));
-      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
-      res = res && vkenv_allocateMemory(&memory->blur_tmp_image_memory_arr[oct_idx], memory->device, memory_requirement.size, memory_type_idx);
-      memory->blur_tmp_image_memory_size_arr[oct_idx] = memory_requirement.size;
-      logDebug(LOG_TAG, "Blur tmp image (oct %d) (%d,%d) allocation", oct_idx, width, height);
-    }
-    res = res && vkenv_bindImageMemory(memory->device, memory->blur_tmp_image_arr[oct_idx], memory->blur_tmp_image_memory_arr[oct_idx], 0);
-    res = res && vkenv_createImageView(&memory->blur_tmp_image_view_arr[oct_idx], memory->device, 0, memory->blur_tmp_image_arr[oct_idx],
-                                       VK_IMAGE_VIEW_TYPE_2D_ARRAY, pyramid_format, VKENV_DEFAULT_COMPONENT_MAPPING,
-                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-  }
-  if (!res)
-  {
-    logError(LOG_TAG, "An error occured when setting up the temporary blur result images");
-    return false;
-  }
-
-  // Create gaussian image array per octave
-  res = true;
-  for (uint32_t oct_idx = 0; oct_idx < memory->curr_nb_octaves; oct_idx++)
-  {
-    uint32_t width = memory->octave_resolutions[oct_idx].width;
-    uint32_t height = memory->octave_resolutions[oct_idx].height;
-    res = res &&
-          vkenv_createImage(&memory->octave_image_arr[oct_idx], memory->device, 0, VK_IMAGE_TYPE_2D, pyramid_format,
-                            (VkExtent3D){.width = width, .height = height, .depth = 1}, 1, memory->nb_scales_per_octave + 3, VK_SAMPLE_COUNT_1_BIT,
-                            VK_IMAGE_TILING_OPTIMAL,
-                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    if (is_init)
-    {
-      res = res && estimateHighestMemoryRequirement(memory, width * height, &memory_requirement, 0, VK_IMAGE_TYPE_2D, pyramid_format, 1,
-                                                    memory->nb_scales_per_octave + 3, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                                        VK_IMAGE_USAGE_SAMPLED_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    }
-    else if (res)
-    {
-      vkGetImageMemoryRequirements(memory->device->device, memory->octave_image_arr[oct_idx], &memory_requirement);
-    }
-
-    if (memory_requirement.size > memory->octave_image_memory_size_arr[oct_idx])
-    {
-      VK_NULL_SAFE_DELETE(memory->octave_image_memory_arr[oct_idx], vkFreeMemory(memory->device->device, memory->octave_image_memory_arr[oct_idx], NULL));
-      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
-      res = res && vkenv_allocateMemory(&memory->octave_image_memory_arr[oct_idx], memory->device, memory_requirement.size, memory_type_idx);
-      memory->octave_image_memory_size_arr[oct_idx] = memory_requirement.size;
-      logDebug(LOG_TAG, "Octave image (oct %d) (%d,%d) allocation", oct_idx, width, height);
-    }
-    res = res && vkenv_bindImageMemory(memory->device, memory->octave_image_arr[oct_idx], memory->octave_image_memory_arr[oct_idx], 0);
-    res = res && vkenv_createImageView(&memory->octave_image_view_arr[oct_idx], memory->device, 0, memory->octave_image_arr[oct_idx],
-                                       VK_IMAGE_VIEW_TYPE_2D_ARRAY, pyramid_format, VKENV_DEFAULT_COMPONENT_MAPPING,
-                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, memory->nb_scales_per_octave + 3});
-  }
-  if (!res)
-  {
-    logError(LOG_TAG, "An error occured when setting up the octave images");
-    return false;
-  }
-
-  // Create DoG image array per octave
-  res = true;
-  for (uint32_t oct_idx = 0; oct_idx < memory->curr_nb_octaves; oct_idx++)
-  {
-    uint32_t width = memory->octave_resolutions[oct_idx].width;
-    uint32_t height = memory->octave_resolutions[oct_idx].height;
-    res = res &&
-          vkenv_createImage(&memory->octave_DoG_image_arr[oct_idx], memory->device, 0, VK_IMAGE_TYPE_2D, pyramid_format,
-                            (VkExtent3D){.width = width, .height = height, .depth = 1}, 1, memory->nb_scales_per_octave + 2, VK_SAMPLE_COUNT_1_BIT,
-                            VK_IMAGE_TILING_OPTIMAL,
-                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    if (is_init)
-    {
-      res = res && estimateHighestMemoryRequirement(memory, width * height, &memory_requirement, 0, VK_IMAGE_TYPE_2D, pyramid_format, 1,
-                                                    memory->nb_scales_per_octave + 2, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                                        VK_IMAGE_USAGE_SAMPLED_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
-    }
-    else if (res)
-    {
-      vkGetImageMemoryRequirements(memory->device->device, memory->octave_DoG_image_arr[oct_idx], &memory_requirement);
-    }
-
-    if (memory_requirement.size > memory->octave_DoG_image_memory_size_arr[oct_idx])
-    {
-      VK_NULL_SAFE_DELETE(memory->octave_DoG_image_memory_arr[oct_idx],
-                          vkFreeMemory(memory->device->device, memory->octave_DoG_image_memory_arr[oct_idx], NULL));
-      res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
-      res = res && vkenv_allocateMemory(&memory->octave_DoG_image_memory_arr[oct_idx], memory->device, memory_requirement.size, memory_type_idx);
-      memory->octave_DoG_image_memory_size_arr[oct_idx] = memory_requirement.size;
-      logDebug(LOG_TAG, "Octave DoG image (oct %d) (%d,%d) allocation", oct_idx, width, height);
-    }
-    res = res && vkenv_bindImageMemory(memory->device, memory->octave_DoG_image_arr[oct_idx], memory->octave_DoG_image_memory_arr[oct_idx], 0);
-    res = res && vkenv_createImageView(&memory->octave_DoG_image_view_arr[oct_idx], memory->device, 0, memory->octave_DoG_image_arr[oct_idx],
-                                       VK_IMAGE_VIEW_TYPE_2D_ARRAY, pyramid_format, VKENV_DEFAULT_COMPONENT_MAPPING,
-                                       (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, memory->nb_scales_per_octave + 2});
-  }
-  if (!res)
-  {
-    logError(LOG_TAG, "An error occured when setting up the DoG octave images");
-    return false;
-  }
-
   //////////////////////////////////////////////////////////////////////
-  // Setup the image layouts
+  // Setup the image layouts (covering every per-pyramid slot's images)
   //////////////////////////////////////////////////////////////////////
   res = true;
   VkCommandBuffer layout_change_cmdbuf = NULL;
   res = res && vkenv_beginInstantCommandBuffer(memory->device->device, memory->general_command_pool, &layout_change_cmdbuf);
   // Set the input image, blurred input image, warped input image, blur temp images, octave images and DoG images to VK_LAYOUT_GENERAL
-  VkImageMemoryBarrier *layout_change_barriers = (VkImageMemoryBarrier *)malloc(sizeof(VkImageMemoryBarrier) * (3 + (memory->curr_nb_octaves * 3)));
-  layout_change_barriers[0] =
-      vkenv_genImageMemoryBarrier(memory->input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                                  VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-  layout_change_barriers[1] =
-      vkenv_genImageMemoryBarrier(memory->blurred_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                                  VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-  layout_change_barriers[2] =
-      vkenv_genImageMemoryBarrier(memory->warped_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                                  VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-
-  int layout_change_barrier_cnt = 3;
-
-  for (uint32_t i = 0; i < memory->curr_nb_octaves; i++)
+  // for every slot in [0, nb_pyramid_slots).
+  uint32_t per_slot_barrier_count = 3 + (memory->curr_nb_octaves * 3);
+  VkImageMemoryBarrier *layout_change_barriers =
+      (VkImageMemoryBarrier *)malloc(sizeof(VkImageMemoryBarrier) * per_slot_barrier_count * memory->nb_pyramid_slots);
+  int layout_change_barrier_cnt = 0;
+  for (uint32_t s = 0; s < memory->nb_pyramid_slots; s++)
   {
     layout_change_barriers[layout_change_barrier_cnt + 0] =
-        vkenv_genImageMemoryBarrier(memory->blur_tmp_image_arr[i], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        vkenv_genImageMemoryBarrier(memory->slots[s].input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    layout_change_barriers[layout_change_barrier_cnt + 1] =
+        vkenv_genImageMemoryBarrier(memory->slots[s].blurred_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    layout_change_barriers[layout_change_barrier_cnt + 2] =
+        vkenv_genImageMemoryBarrier(memory->slots[s].warped_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                                     VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
 
-    layout_change_barriers[layout_change_barrier_cnt + 1] = vkenv_genImageMemoryBarrier(
-        memory->octave_image_arr[i], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
-        VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, memory->nb_scales_per_octave + 3});
-
-    layout_change_barriers[layout_change_barrier_cnt + 2] = vkenv_genImageMemoryBarrier(
-        memory->octave_DoG_image_arr[i], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
-        VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, memory->nb_scales_per_octave + 2});
-
     layout_change_barrier_cnt += 3;
+
+    for (uint32_t i = 0; i < memory->curr_nb_octaves; i++)
+    {
+      layout_change_barriers[layout_change_barrier_cnt + 0] =
+          vkenv_genImageMemoryBarrier(memory->slots[s].blur_tmp_image_arr[i], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+
+      layout_change_barriers[layout_change_barrier_cnt + 1] = vkenv_genImageMemoryBarrier(
+          memory->slots[s].octave_image_arr[i], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
+          VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, memory->nb_scales_per_octave + 3});
+
+      layout_change_barriers[layout_change_barrier_cnt + 2] = vkenv_genImageMemoryBarrier(
+          memory->slots[s].octave_DoG_image_arr[i], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
+          VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, memory->nb_scales_per_octave + 2});
+
+      layout_change_barrier_cnt += 3;
+    }
   }
   vkCmdPipelineBarrier(layout_change_cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL,
                        layout_change_barrier_cnt, layout_change_barriers);
@@ -948,6 +979,16 @@ bool vksift_createSiftMemory(vkenv_Device device, vksift_SiftMemory *memory_ptr,
   memory->use_rgba_input = config->use_rgba_input;
   memory->use_rgb_input = config->use_rgb_input;
 
+  // Pyramid slot count for the Phase A parallel-pyramid scaffold. Default 1
+  // (single-slot semantics, identical to pre-refactor behavior); clamp to the
+  // static array size VKSIFT_MAX_PYRAMID_SLOTS so per-slot field accesses are
+  // always safe.
+  memory->nb_pyramid_slots = (config->nb_pyramid_slots == 0u) ? 1u : config->nb_pyramid_slots;
+  if (memory->nb_pyramid_slots > VKSIFT_MAX_PYRAMID_SLOTS)
+  {
+    memory->nb_pyramid_slots = VKSIFT_MAX_PYRAMID_SLOTS;
+  }
+
   // Define default input image width/height from configuration.
   // NOTE: VKS allocates a SQUARE buffer of side ceil(sqrt(input_image_max_size)).
   // Non-square inputs work fine via the dynamic-resize path in
@@ -1008,32 +1049,38 @@ bool vksift_createSiftMemory(vkenv_Device device, vksift_SiftMemory *memory_ptr,
   memset(memory->sift_count_staging_buffer_memory_arr, 0, sizeof(VkDeviceMemory) * memory->nb_sift_buffer);
   memset(memory->sift_count_staging_buffer_ptr_arr, 0, sizeof(void *) * memory->nb_sift_buffer);
 
-  memory->blur_tmp_image_arr = (VkImage *)malloc(sizeof(VkImage) * memory->max_nb_octaves);
-  memory->blur_tmp_image_view_arr = (VkImageView *)malloc(sizeof(VkImageView) * memory->max_nb_octaves);
-  memory->blur_tmp_image_memory_arr = (VkDeviceMemory *)malloc(sizeof(VkDeviceMemory) * memory->max_nb_octaves);
-  memory->blur_tmp_image_memory_size_arr = (VkDeviceSize *)malloc(sizeof(VkDeviceSize) * memory->max_nb_octaves);
-  memset(memory->blur_tmp_image_arr, 0, sizeof(VkImage) * memory->max_nb_octaves);
-  memset(memory->blur_tmp_image_view_arr, 0, sizeof(VkImageView) * memory->max_nb_octaves);
-  memset(memory->blur_tmp_image_memory_arr, 0, sizeof(VkDeviceMemory) * memory->max_nb_octaves);
-  memset(memory->blur_tmp_image_memory_size_arr, 0, sizeof(VkDeviceSize) * memory->max_nb_octaves);
+  // Per-slot per-octave array allocations. memset on the whole memory struct
+  // already zeroed memory->slots[], so each slot's pointer/size arrays start
+  // NULL/0 — only the active [0, nb_pyramid_slots) slots get backing storage.
+  for (uint32_t s = 0; s < memory->nb_pyramid_slots; s++)
+  {
+    memory->slots[s].blur_tmp_image_arr = (VkImage *)malloc(sizeof(VkImage) * memory->max_nb_octaves);
+    memory->slots[s].blur_tmp_image_view_arr = (VkImageView *)malloc(sizeof(VkImageView) * memory->max_nb_octaves);
+    memory->slots[s].blur_tmp_image_memory_arr = (VkDeviceMemory *)malloc(sizeof(VkDeviceMemory) * memory->max_nb_octaves);
+    memory->slots[s].blur_tmp_image_memory_size_arr = (VkDeviceSize *)malloc(sizeof(VkDeviceSize) * memory->max_nb_octaves);
+    memset(memory->slots[s].blur_tmp_image_arr, 0, sizeof(VkImage) * memory->max_nb_octaves);
+    memset(memory->slots[s].blur_tmp_image_view_arr, 0, sizeof(VkImageView) * memory->max_nb_octaves);
+    memset(memory->slots[s].blur_tmp_image_memory_arr, 0, sizeof(VkDeviceMemory) * memory->max_nb_octaves);
+    memset(memory->slots[s].blur_tmp_image_memory_size_arr, 0, sizeof(VkDeviceSize) * memory->max_nb_octaves);
 
-  memory->octave_image_arr = (VkImage *)malloc(sizeof(VkImage) * memory->max_nb_octaves);
-  memory->octave_image_view_arr = (VkImageView *)malloc(sizeof(VkImageView) * memory->max_nb_octaves);
-  memory->octave_image_memory_arr = (VkDeviceMemory *)malloc(sizeof(VkDeviceMemory) * memory->max_nb_octaves);
-  memory->octave_image_memory_size_arr = (VkDeviceSize *)malloc(sizeof(VkDeviceSize) * memory->max_nb_octaves);
-  memset(memory->octave_image_arr, 0, sizeof(VkImage) * memory->max_nb_octaves);
-  memset(memory->octave_image_view_arr, 0, sizeof(VkImageView) * memory->max_nb_octaves);
-  memset(memory->octave_image_memory_arr, 0, sizeof(VkDeviceMemory) * memory->max_nb_octaves);
-  memset(memory->octave_image_memory_size_arr, 0, sizeof(VkDeviceSize) * memory->max_nb_octaves);
+    memory->slots[s].octave_image_arr = (VkImage *)malloc(sizeof(VkImage) * memory->max_nb_octaves);
+    memory->slots[s].octave_image_view_arr = (VkImageView *)malloc(sizeof(VkImageView) * memory->max_nb_octaves);
+    memory->slots[s].octave_image_memory_arr = (VkDeviceMemory *)malloc(sizeof(VkDeviceMemory) * memory->max_nb_octaves);
+    memory->slots[s].octave_image_memory_size_arr = (VkDeviceSize *)malloc(sizeof(VkDeviceSize) * memory->max_nb_octaves);
+    memset(memory->slots[s].octave_image_arr, 0, sizeof(VkImage) * memory->max_nb_octaves);
+    memset(memory->slots[s].octave_image_view_arr, 0, sizeof(VkImageView) * memory->max_nb_octaves);
+    memset(memory->slots[s].octave_image_memory_arr, 0, sizeof(VkDeviceMemory) * memory->max_nb_octaves);
+    memset(memory->slots[s].octave_image_memory_size_arr, 0, sizeof(VkDeviceSize) * memory->max_nb_octaves);
 
-  memory->octave_DoG_image_arr = (VkImage *)malloc(sizeof(VkImage) * memory->max_nb_octaves);
-  memory->octave_DoG_image_view_arr = (VkImageView *)malloc(sizeof(VkImageView) * memory->max_nb_octaves);
-  memory->octave_DoG_image_memory_arr = (VkDeviceMemory *)malloc(sizeof(VkDeviceMemory) * memory->max_nb_octaves);
-  memory->octave_DoG_image_memory_size_arr = (VkDeviceSize *)malloc(sizeof(VkDeviceSize) * memory->max_nb_octaves);
-  memset(memory->octave_DoG_image_arr, 0, sizeof(VkImage) * memory->max_nb_octaves);
-  memset(memory->octave_DoG_image_view_arr, 0, sizeof(VkImageView) * memory->max_nb_octaves);
-  memset(memory->octave_DoG_image_memory_arr, 0, sizeof(VkDeviceMemory) * memory->max_nb_octaves);
-  memset(memory->octave_DoG_image_memory_size_arr, 0, sizeof(VkDeviceSize) * memory->max_nb_octaves);
+    memory->slots[s].octave_DoG_image_arr = (VkImage *)malloc(sizeof(VkImage) * memory->max_nb_octaves);
+    memory->slots[s].octave_DoG_image_view_arr = (VkImageView *)malloc(sizeof(VkImageView) * memory->max_nb_octaves);
+    memory->slots[s].octave_DoG_image_memory_arr = (VkDeviceMemory *)malloc(sizeof(VkDeviceMemory) * memory->max_nb_octaves);
+    memory->slots[s].octave_DoG_image_memory_size_arr = (VkDeviceSize *)malloc(sizeof(VkDeviceSize) * memory->max_nb_octaves);
+    memset(memory->slots[s].octave_DoG_image_arr, 0, sizeof(VkImage) * memory->max_nb_octaves);
+    memset(memory->slots[s].octave_DoG_image_view_arr, 0, sizeof(VkImageView) * memory->max_nb_octaves);
+    memset(memory->slots[s].octave_DoG_image_memory_arr, 0, sizeof(VkDeviceMemory) * memory->max_nb_octaves);
+    memset(memory->slots[s].octave_DoG_image_memory_size_arr, 0, sizeof(VkDeviceSize) * memory->max_nb_octaves);
+  }
 
   // Setup the command pools (we always need the general purpose queue for image layout transfers)
   VkCommandPoolCreateInfo cmdpool_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -1141,51 +1188,65 @@ void vksift_destroySiftMemory(vksift_SiftMemory *memory_ptr)
   VK_NULL_SAFE_DELETE(memory->indirect_descriptor_dispatch_buffer_memory,
                       vkFreeMemory(memory->device->device, memory->indirect_descriptor_dispatch_buffer_memory, NULL));
 
-  // Destroy Vulkan images and memory
-  for (uint32_t i = 0; i < memory->max_nb_octaves; i++)
+  // Destroy Vulkan images and memory per pyramid slot. nb_pyramid_slots is 0
+  // when create failed before assigning it — the loop is a no-op in that case.
+  for (uint32_t s = 0; s < memory->nb_pyramid_slots; s++)
   {
-    VK_NULL_SAFE_DELETE(memory->blur_tmp_image_view_arr[i], vkDestroyImageView(memory->device->device, memory->blur_tmp_image_view_arr[i], NULL));
-    VK_NULL_SAFE_DELETE(memory->octave_image_view_arr[i], vkDestroyImageView(memory->device->device, memory->octave_image_view_arr[i], NULL));
-    VK_NULL_SAFE_DELETE(memory->octave_DoG_image_view_arr[i], vkDestroyImageView(memory->device->device, memory->octave_DoG_image_view_arr[i], NULL));
+    vksift_SiftPyramidSlot *slot = &memory->slots[s];
 
-    VK_NULL_SAFE_DELETE(memory->blur_tmp_image_arr[i], vkDestroyImage(memory->device->device, memory->blur_tmp_image_arr[i], NULL));
-    VK_NULL_SAFE_DELETE(memory->octave_image_arr[i], vkDestroyImage(memory->device->device, memory->octave_image_arr[i], NULL));
-    VK_NULL_SAFE_DELETE(memory->octave_DoG_image_arr[i], vkDestroyImage(memory->device->device, memory->octave_DoG_image_arr[i], NULL));
+    // Per-octave arrays are only allocated for active slots; defensive NULL
+    // check protects against partial-init teardown.
+    if (slot->blur_tmp_image_arr != NULL)
+    {
+      for (uint32_t i = 0; i < memory->max_nb_octaves; i++)
+      {
+        VK_NULL_SAFE_DELETE(slot->blur_tmp_image_view_arr[i], vkDestroyImageView(memory->device->device, slot->blur_tmp_image_view_arr[i], NULL));
+        VK_NULL_SAFE_DELETE(slot->octave_image_view_arr[i], vkDestroyImageView(memory->device->device, slot->octave_image_view_arr[i], NULL));
+        VK_NULL_SAFE_DELETE(slot->octave_DoG_image_view_arr[i], vkDestroyImageView(memory->device->device, slot->octave_DoG_image_view_arr[i], NULL));
 
-    VK_NULL_SAFE_DELETE(memory->blur_tmp_image_memory_arr[i], vkFreeMemory(memory->device->device, memory->blur_tmp_image_memory_arr[i], NULL));
-    VK_NULL_SAFE_DELETE(memory->octave_image_memory_arr[i], vkFreeMemory(memory->device->device, memory->octave_image_memory_arr[i], NULL));
-    VK_NULL_SAFE_DELETE(memory->octave_DoG_image_memory_arr[i], vkFreeMemory(memory->device->device, memory->octave_DoG_image_memory_arr[i], NULL));
+        VK_NULL_SAFE_DELETE(slot->blur_tmp_image_arr[i], vkDestroyImage(memory->device->device, slot->blur_tmp_image_arr[i], NULL));
+        VK_NULL_SAFE_DELETE(slot->octave_image_arr[i], vkDestroyImage(memory->device->device, slot->octave_image_arr[i], NULL));
+        VK_NULL_SAFE_DELETE(slot->octave_DoG_image_arr[i], vkDestroyImage(memory->device->device, slot->octave_DoG_image_arr[i], NULL));
+
+        VK_NULL_SAFE_DELETE(slot->blur_tmp_image_memory_arr[i], vkFreeMemory(memory->device->device, slot->blur_tmp_image_memory_arr[i], NULL));
+        VK_NULL_SAFE_DELETE(slot->octave_image_memory_arr[i], vkFreeMemory(memory->device->device, slot->octave_image_memory_arr[i], NULL));
+        VK_NULL_SAFE_DELETE(slot->octave_DoG_image_memory_arr[i], vkFreeMemory(memory->device->device, slot->octave_DoG_image_memory_arr[i], NULL));
+      }
+    }
+
+    VK_NULL_SAFE_DELETE(slot->input_image_view, vkDestroyImageView(memory->device->device, slot->input_image_view, NULL));
+    VK_NULL_SAFE_DELETE(slot->input_image, vkDestroyImage(memory->device->device, slot->input_image, NULL));
+    VK_NULL_SAFE_DELETE(slot->blurred_input_image_view, vkDestroyImageView(memory->device->device, slot->blurred_input_image_view, NULL));
+    VK_NULL_SAFE_DELETE(slot->blurred_input_image, vkDestroyImage(memory->device->device, slot->blurred_input_image, NULL));
+    VK_NULL_SAFE_DELETE(slot->blurred_input_image_memory, vkFreeMemory(memory->device->device, slot->blurred_input_image_memory, NULL));
+    VK_NULL_SAFE_DELETE(slot->warped_input_image_view, vkDestroyImageView(memory->device->device, slot->warped_input_image_view, NULL));
+    VK_NULL_SAFE_DELETE(slot->warped_input_image, vkDestroyImage(memory->device->device, slot->warped_input_image, NULL));
+    VK_NULL_SAFE_DELETE(slot->warped_input_image_memory, vkFreeMemory(memory->device->device, slot->warped_input_image_memory, NULL));
+    VK_NULL_SAFE_DELETE(slot->rotated_image_view, vkDestroyImageView(memory->device->device, slot->rotated_image_view, NULL));
+    VK_NULL_SAFE_DELETE(slot->rotated_image, vkDestroyImage(memory->device->device, slot->rotated_image, NULL));
+    VK_NULL_SAFE_DELETE(slot->rotated_image_memory, vkFreeMemory(memory->device->device, slot->rotated_image_memory, NULL));
+    VK_NULL_SAFE_DELETE(slot->tilted_image_view, vkDestroyImageView(memory->device->device, slot->tilted_image_view, NULL));
+    VK_NULL_SAFE_DELETE(slot->tilted_image, vkDestroyImage(memory->device->device, slot->tilted_image, NULL));
+    VK_NULL_SAFE_DELETE(slot->tilted_image_memory, vkFreeMemory(memory->device->device, slot->tilted_image_memory, NULL));
+    if (memory->use_rgba_input)
+    {
+      VK_NULL_SAFE_DELETE(slot->rgba_input_image_view, vkDestroyImageView(memory->device->device, slot->rgba_input_image_view, NULL));
+      VK_NULL_SAFE_DELETE(slot->rgba_input_image, vkDestroyImage(memory->device->device, slot->rgba_input_image, NULL));
+      VK_NULL_SAFE_DELETE(slot->rgba_input_image_memory, vkFreeMemory(memory->device->device, slot->rgba_input_image_memory, NULL));
+    }
+    if (memory->use_rgb_input)
+    {
+      VK_NULL_SAFE_DELETE(slot->rgb_input_buffer, vkDestroyBuffer(memory->device->device, slot->rgb_input_buffer, NULL));
+      VK_NULL_SAFE_DELETE(slot->rgb_input_buffer_memory, vkFreeMemory(memory->device->device, slot->rgb_input_buffer_memory, NULL));
+    }
+    VK_NULL_SAFE_DELETE(slot->input_image_memory, vkFreeMemory(memory->device->device, slot->input_image_memory, NULL));
   }
-  VK_NULL_SAFE_DELETE(memory->input_image_view, vkDestroyImageView(memory->device->device, memory->input_image_view, NULL));
-  VK_NULL_SAFE_DELETE(memory->input_image, vkDestroyImage(memory->device->device, memory->input_image, NULL));
+
+  // Single-instance cached IMAS-source image + output image (shared across slots).
   VK_NULL_SAFE_DELETE(memory->cached_input_image_view, vkDestroyImageView(memory->device->device, memory->cached_input_image_view, NULL));
   VK_NULL_SAFE_DELETE(memory->cached_input_image, vkDestroyImage(memory->device->device, memory->cached_input_image, NULL));
   VK_NULL_SAFE_DELETE(memory->cached_input_image_memory, vkFreeMemory(memory->device->device, memory->cached_input_image_memory, NULL));
-  VK_NULL_SAFE_DELETE(memory->blurred_input_image_view, vkDestroyImageView(memory->device->device, memory->blurred_input_image_view, NULL));
-  VK_NULL_SAFE_DELETE(memory->blurred_input_image, vkDestroyImage(memory->device->device, memory->blurred_input_image, NULL));
-  VK_NULL_SAFE_DELETE(memory->blurred_input_image_memory, vkFreeMemory(memory->device->device, memory->blurred_input_image_memory, NULL));
-  VK_NULL_SAFE_DELETE(memory->warped_input_image_view, vkDestroyImageView(memory->device->device, memory->warped_input_image_view, NULL));
-  VK_NULL_SAFE_DELETE(memory->warped_input_image, vkDestroyImage(memory->device->device, memory->warped_input_image, NULL));
-  VK_NULL_SAFE_DELETE(memory->warped_input_image_memory, vkFreeMemory(memory->device->device, memory->warped_input_image_memory, NULL));
-  VK_NULL_SAFE_DELETE(memory->rotated_image_view, vkDestroyImageView(memory->device->device, memory->rotated_image_view, NULL));
-  VK_NULL_SAFE_DELETE(memory->rotated_image, vkDestroyImage(memory->device->device, memory->rotated_image, NULL));
-  VK_NULL_SAFE_DELETE(memory->rotated_image_memory, vkFreeMemory(memory->device->device, memory->rotated_image_memory, NULL));
-  VK_NULL_SAFE_DELETE(memory->tilted_image_view, vkDestroyImageView(memory->device->device, memory->tilted_image_view, NULL));
-  VK_NULL_SAFE_DELETE(memory->tilted_image, vkDestroyImage(memory->device->device, memory->tilted_image, NULL));
-  VK_NULL_SAFE_DELETE(memory->tilted_image_memory, vkFreeMemory(memory->device->device, memory->tilted_image_memory, NULL));
-  if (memory->use_rgba_input)
-  {
-    VK_NULL_SAFE_DELETE(memory->rgba_input_image_view, vkDestroyImageView(memory->device->device, memory->rgba_input_image_view, NULL));
-    VK_NULL_SAFE_DELETE(memory->rgba_input_image, vkDestroyImage(memory->device->device, memory->rgba_input_image, NULL));
-    VK_NULL_SAFE_DELETE(memory->rgba_input_image_memory, vkFreeMemory(memory->device->device, memory->rgba_input_image_memory, NULL));
-  }
-  if (memory->use_rgb_input)
-  {
-    VK_NULL_SAFE_DELETE(memory->rgb_input_buffer, vkDestroyBuffer(memory->device->device, memory->rgb_input_buffer, NULL));
-    VK_NULL_SAFE_DELETE(memory->rgb_input_buffer_memory, vkFreeMemory(memory->device->device, memory->rgb_input_buffer_memory, NULL));
-  }
   VK_NULL_SAFE_DELETE(memory->output_image, vkDestroyImage(memory->device->device, memory->output_image, NULL));
-  VK_NULL_SAFE_DELETE(memory->input_image_memory, vkFreeMemory(memory->device->device, memory->input_image_memory, NULL));
   VK_NULL_SAFE_DELETE(memory->output_image_memory, vkFreeMemory(memory->device->device, memory->output_image_memory, NULL));
   VK_NULL_SAFE_DELETE(memory->transfer_fence, vkDestroyFence(memory->device->device, memory->transfer_fence, NULL));
 
@@ -1202,18 +1263,25 @@ void vksift_destroySiftMemory(vksift_SiftMemory *memory_ptr)
   free(memory->sift_count_staging_buffer_arr);
   free(memory->sift_count_staging_buffer_memory_arr);
   free(memory->sift_count_staging_buffer_ptr_arr);
-  free(memory->blur_tmp_image_arr);
-  free(memory->blur_tmp_image_view_arr);
-  free(memory->blur_tmp_image_memory_arr);
-  free(memory->blur_tmp_image_memory_size_arr);
-  free(memory->octave_image_arr);
-  free(memory->octave_image_view_arr);
-  free(memory->octave_image_memory_arr);
-  free(memory->octave_image_memory_size_arr);
-  free(memory->octave_DoG_image_arr);
-  free(memory->octave_DoG_image_view_arr);
-  free(memory->octave_DoG_image_memory_arr);
-  free(memory->octave_DoG_image_memory_size_arr);
+
+  // Per-slot per-octave array pointers (allocated by vksift_createSiftMemory
+  // inside the slot loop). free() is NULL-safe; guard nb_pyramid_slots in case
+  // create failed early before assigning it.
+  for (uint32_t s = 0; s < memory->nb_pyramid_slots; s++)
+  {
+    free(memory->slots[s].blur_tmp_image_arr);
+    free(memory->slots[s].blur_tmp_image_view_arr);
+    free(memory->slots[s].blur_tmp_image_memory_arr);
+    free(memory->slots[s].blur_tmp_image_memory_size_arr);
+    free(memory->slots[s].octave_image_arr);
+    free(memory->slots[s].octave_image_view_arr);
+    free(memory->slots[s].octave_image_memory_arr);
+    free(memory->slots[s].octave_image_memory_size_arr);
+    free(memory->slots[s].octave_DoG_image_arr);
+    free(memory->slots[s].octave_DoG_image_view_arr);
+    free(memory->slots[s].octave_DoG_image_memory_arr);
+    free(memory->slots[s].octave_DoG_image_memory_size_arr);
+  }
   for (uint32_t i = 0; i < memory->nb_sift_buffer; i++)
   {
     free(memory->sift_buffers_info[i].octave_section_max_nb_feat_arr);
@@ -1238,42 +1306,47 @@ bool vksift_prepareSiftMemoryForDetection(vksift_SiftMemory memory, const uint8_
     memory->curr_input_image_width = input_width;
     memory->curr_input_image_height = input_height;
     updateScaleSpaceInfo(memory); // update scalespace resolutions and define the number of octave
-    // Destroy pyramid related buffers, images and views and try to recreate them on the memory allocated for the max input size
-    // (to avoid extremely slow memory reallocation)
-    VK_NULL_SAFE_DELETE(memory->input_image_view, vkDestroyImageView(memory->device->device, memory->input_image_view, NULL));
-    VK_NULL_SAFE_DELETE(memory->input_image, vkDestroyImage(memory->device->device, memory->input_image, NULL));
+    // Destroy pyramid related buffers, images and views per slot, then recreate
+    // them on the memory allocated for the max input size (to avoid extremely
+    // slow memory reallocation). cached_input_image is single-instance.
     VK_NULL_SAFE_DELETE(memory->cached_input_image_view, vkDestroyImageView(memory->device->device, memory->cached_input_image_view, NULL));
     VK_NULL_SAFE_DELETE(memory->cached_input_image, vkDestroyImage(memory->device->device, memory->cached_input_image, NULL));
-    VK_NULL_SAFE_DELETE(memory->blurred_input_image_view, vkDestroyImageView(memory->device->device, memory->blurred_input_image_view, NULL));
-    VK_NULL_SAFE_DELETE(memory->blurred_input_image, vkDestroyImage(memory->device->device, memory->blurred_input_image, NULL));
-    VK_NULL_SAFE_DELETE(memory->warped_input_image_view, vkDestroyImageView(memory->device->device, memory->warped_input_image_view, NULL));
-    VK_NULL_SAFE_DELETE(memory->warped_input_image, vkDestroyImage(memory->device->device, memory->warped_input_image, NULL));
-    VK_NULL_SAFE_DELETE(memory->rotated_image_view, vkDestroyImageView(memory->device->device, memory->rotated_image_view, NULL));
-    VK_NULL_SAFE_DELETE(memory->rotated_image, vkDestroyImage(memory->device->device, memory->rotated_image, NULL));
-    VK_NULL_SAFE_DELETE(memory->tilted_image_view, vkDestroyImageView(memory->device->device, memory->tilted_image_view, NULL));
-    VK_NULL_SAFE_DELETE(memory->tilted_image, vkDestroyImage(memory->device->device, memory->tilted_image, NULL));
-    if (memory->use_rgba_input)
+    for (uint32_t s = 0; s < memory->nb_pyramid_slots; s++)
     {
-      VK_NULL_SAFE_DELETE(memory->rgba_input_image_view, vkDestroyImageView(memory->device->device, memory->rgba_input_image_view, NULL));
-      VK_NULL_SAFE_DELETE(memory->rgba_input_image, vkDestroyImage(memory->device->device, memory->rgba_input_image, NULL));
-    }
-    if (memory->use_rgb_input)
-    {
-      VK_NULL_SAFE_DELETE(memory->rgb_input_buffer, vkDestroyBuffer(memory->device->device, memory->rgb_input_buffer, NULL));
-      VK_NULL_SAFE_DELETE(memory->rgb_input_buffer_memory, vkFreeMemory(memory->device->device, memory->rgb_input_buffer_memory, NULL));
-      memory->rgb_input_buffer_size = 0;
-    }
-    for (uint32_t oct_idx = 0; oct_idx < memory->max_nb_octaves; oct_idx++)
-    {
-      VK_NULL_SAFE_DELETE(memory->blur_tmp_image_view_arr[oct_idx],
-                          vkDestroyImageView(memory->device->device, memory->blur_tmp_image_view_arr[oct_idx], NULL));
-      VK_NULL_SAFE_DELETE(memory->blur_tmp_image_arr[oct_idx], vkDestroyImage(memory->device->device, memory->blur_tmp_image_arr[oct_idx], NULL));
-      VK_NULL_SAFE_DELETE(memory->octave_image_view_arr[oct_idx],
-                          vkDestroyImageView(memory->device->device, memory->octave_image_view_arr[oct_idx], NULL));
-      VK_NULL_SAFE_DELETE(memory->octave_image_arr[oct_idx], vkDestroyImage(memory->device->device, memory->octave_image_arr[oct_idx], NULL));
-      VK_NULL_SAFE_DELETE(memory->octave_DoG_image_view_arr[oct_idx],
-                          vkDestroyImageView(memory->device->device, memory->octave_DoG_image_view_arr[oct_idx], NULL));
-      VK_NULL_SAFE_DELETE(memory->octave_DoG_image_arr[oct_idx], vkDestroyImage(memory->device->device, memory->octave_DoG_image_arr[oct_idx], NULL));
+      vksift_SiftPyramidSlot *slot = &memory->slots[s];
+      VK_NULL_SAFE_DELETE(slot->input_image_view, vkDestroyImageView(memory->device->device, slot->input_image_view, NULL));
+      VK_NULL_SAFE_DELETE(slot->input_image, vkDestroyImage(memory->device->device, slot->input_image, NULL));
+      VK_NULL_SAFE_DELETE(slot->blurred_input_image_view, vkDestroyImageView(memory->device->device, slot->blurred_input_image_view, NULL));
+      VK_NULL_SAFE_DELETE(slot->blurred_input_image, vkDestroyImage(memory->device->device, slot->blurred_input_image, NULL));
+      VK_NULL_SAFE_DELETE(slot->warped_input_image_view, vkDestroyImageView(memory->device->device, slot->warped_input_image_view, NULL));
+      VK_NULL_SAFE_DELETE(slot->warped_input_image, vkDestroyImage(memory->device->device, slot->warped_input_image, NULL));
+      VK_NULL_SAFE_DELETE(slot->rotated_image_view, vkDestroyImageView(memory->device->device, slot->rotated_image_view, NULL));
+      VK_NULL_SAFE_DELETE(slot->rotated_image, vkDestroyImage(memory->device->device, slot->rotated_image, NULL));
+      VK_NULL_SAFE_DELETE(slot->tilted_image_view, vkDestroyImageView(memory->device->device, slot->tilted_image_view, NULL));
+      VK_NULL_SAFE_DELETE(slot->tilted_image, vkDestroyImage(memory->device->device, slot->tilted_image, NULL));
+      if (memory->use_rgba_input)
+      {
+        VK_NULL_SAFE_DELETE(slot->rgba_input_image_view, vkDestroyImageView(memory->device->device, slot->rgba_input_image_view, NULL));
+        VK_NULL_SAFE_DELETE(slot->rgba_input_image, vkDestroyImage(memory->device->device, slot->rgba_input_image, NULL));
+      }
+      if (memory->use_rgb_input)
+      {
+        VK_NULL_SAFE_DELETE(slot->rgb_input_buffer, vkDestroyBuffer(memory->device->device, slot->rgb_input_buffer, NULL));
+        VK_NULL_SAFE_DELETE(slot->rgb_input_buffer_memory, vkFreeMemory(memory->device->device, slot->rgb_input_buffer_memory, NULL));
+        slot->rgb_input_buffer_size = 0;
+      }
+      for (uint32_t oct_idx = 0; oct_idx < memory->max_nb_octaves; oct_idx++)
+      {
+        VK_NULL_SAFE_DELETE(slot->blur_tmp_image_view_arr[oct_idx],
+                            vkDestroyImageView(memory->device->device, slot->blur_tmp_image_view_arr[oct_idx], NULL));
+        VK_NULL_SAFE_DELETE(slot->blur_tmp_image_arr[oct_idx], vkDestroyImage(memory->device->device, slot->blur_tmp_image_arr[oct_idx], NULL));
+        VK_NULL_SAFE_DELETE(slot->octave_image_view_arr[oct_idx],
+                            vkDestroyImageView(memory->device->device, slot->octave_image_view_arr[oct_idx], NULL));
+        VK_NULL_SAFE_DELETE(slot->octave_image_arr[oct_idx], vkDestroyImage(memory->device->device, slot->octave_image_arr[oct_idx], NULL));
+        VK_NULL_SAFE_DELETE(slot->octave_DoG_image_view_arr[oct_idx],
+                            vkDestroyImageView(memory->device->device, slot->octave_DoG_image_view_arr[oct_idx], NULL));
+        VK_NULL_SAFE_DELETE(slot->octave_DoG_image_arr[oct_idx], vkDestroyImage(memory->device->device, slot->octave_DoG_image_arr[oct_idx], NULL));
+      }
     }
     // Recreate objects
     if (!setupDynamicObjectsAndMemory(memory, false))
@@ -1680,7 +1753,9 @@ bool vksift_Memory_copyBufferMatchesFromGPU(vksift_SiftMemory memory, vksift_Mat
 
 bool vksift_Memory_copyPyramidImageFromGPU(vksift_SiftMemory memory, const uint8_t octave, const uint8_t scale, const bool is_dog, float *out_image_data)
 {
-  VkImage target_image = is_dog ? memory->octave_DoG_image_arr[octave] : memory->octave_image_arr[octave];
+  // Debug viz path: always read from slot 0's pyramid. Phase A scaffold —
+  // multi-slot viz can come later if needed.
+  VkImage target_image = is_dog ? memory->slots[0].octave_DoG_image_arr[octave] : memory->slots[0].octave_image_arr[octave];
   uint32_t width = memory->octave_resolutions[octave].width;
   uint32_t height = memory->octave_resolutions[octave].height;
 

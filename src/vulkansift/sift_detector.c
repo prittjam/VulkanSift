@@ -1156,9 +1156,9 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   // Binds (sampler input_image_view) and (storage blurred_input_image_view).
   {
     VkDescriptorImageInfo pb_in_info = {
-        .sampler = detector->image_sampler, .imageView = detector->mem->input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = detector->image_sampler, .imageView = detector->mem->slots[0].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo pb_out_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->blurred_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].blurred_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet pb_writes[2] = {
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
          .dstSet = detector->preblur_desc_set, .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1,
@@ -1176,9 +1176,9 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   // not the raw input_image, so the σ_aa pre-blur is included in the warp.
   {
     VkDescriptorImageInfo aw_in_info = {
-        .sampler = detector->image_sampler, .imageView = detector->mem->blurred_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = detector->image_sampler, .imageView = detector->mem->slots[0].blurred_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo aw_out_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->warped_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].warped_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet aw_writes[2] = {
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
          .dstSet = detector->affinewarp_desc_set, .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1,
@@ -1194,11 +1194,11 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
     VkDescriptorImageInfo blur_input_image_info = {
-        .sampler = detector->image_sampler, .imageView = detector->mem->octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = detector->image_sampler, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo blur_work_image_info = {
-        .sampler = detector->image_sampler, .imageView = detector->mem->blur_tmp_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = detector->image_sampler, .imageView = detector->mem->slots[0].blur_tmp_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo blur_output_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet blur_descriptor_writes[2];
     // First write for horizontal pass
     blur_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -1233,9 +1233,9 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
     VkDescriptorImageInfo dog_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo dog_output_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->octave_DoG_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_DoG_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet dog_descriptor_writes[2];
     dog_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                                       .dstSet = detector->dog_desc_sets[i],
@@ -1264,9 +1264,9 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   for (uint32_t i = 0; i + 1 < detector->mem->curr_nb_octaves; i++)
   {
     VkDescriptorImageInfo ds_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo ds_output_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->octave_image_view_arr[i + 1], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i + 1], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet ds_writes[2];
     ds_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                           .dstSet = detector->downsample_desc_sets[i],
@@ -1295,9 +1295,9 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   //   1: input_image_view   (R8_UNORM, SIFT input)
   {
     VkDescriptorImageInfo q_in_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->rotated_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].rotated_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo q_out_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet q_writes[2];
     q_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                          .dstSet = detector->quantize_desc_set,
@@ -1325,7 +1325,7 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
     VkDescriptorImageInfo dog_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->octave_DoG_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_DoG_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo sift_buffer_info = {.buffer = detector->mem->sift_buffer_arr[detector->curr_buffer_idx],
                                                .offset = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[i],
                                                .range = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[i]};
@@ -1368,7 +1368,7 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
     VkDescriptorImageInfo octave_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo sift_buffer_info = {.buffer = detector->mem->sift_buffer_arr[detector->curr_buffer_idx],
                                                .offset = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[i],
                                                .range = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[i]};
@@ -1412,7 +1412,7 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
     VkDescriptorImageInfo octave_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo sift_buffer_info = {.buffer = detector->mem->sift_buffer_arr[detector->curr_buffer_idx],
                                                .offset = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[i],
                                                .range = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[i]};
@@ -1443,9 +1443,9 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   if (detector->use_rgba_input)
   {
     VkDescriptorImageInfo rgba_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->rgba_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].rgba_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo gray_output_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet rgba_descriptor_writes[2];
     rgba_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                                         .dstSet = detector->rgba_convert_desc_set,
@@ -1473,9 +1473,9 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   if (detector->use_rgb_input)
   {
     VkDescriptorBufferInfo rgb_ssbo_info = {
-        .buffer = detector->mem->rgb_input_buffer, .offset = 0, .range = VK_WHOLE_SIZE};
+        .buffer = detector->mem->slots[0].rgb_input_buffer, .offset = 0, .range = VK_WHOLE_SIZE};
     VkDescriptorImageInfo rgb_gray_output_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet rgb_descriptor_writes[2];
     rgb_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                                        .dstSet = detector->rgb_convert_desc_set,
@@ -1514,7 +1514,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
     // RGBA path: copy staging → rgba_input_image, then compute shader → input_image
     // Transition rgba_input_image for transfer write
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->rgba_input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        detector->mem->slots[0].rgba_input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
@@ -1527,12 +1527,12 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
         .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
         .imageOffset = {.x = 0, .y = 0, .z = 0},
         .imageExtent = {.width = detector->mem->curr_input_image_width, .height = detector->mem->curr_input_image_height, .depth = 1}};
-    vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->rgba_input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+    vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->slots[0].rgba_input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                            &buffer_image_region);
 
     // Transition rgba_input_image to GENERAL for compute read
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->rgba_input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        detector->mem->slots[0].rgba_input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
@@ -1540,7 +1540,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
 
     // Transition input_image (R8) to GENERAL for compute write
     VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[0].input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &input_barrier);
@@ -1554,7 +1554,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
 
     // Transition input_image from compute write to shader read (for scale-space blit)
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[0].input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
@@ -1568,7 +1568,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
 
     // Copy staging buffer → device-local RGB buffer
     VkBufferCopy buf_copy = {.srcOffset = 0, .dstOffset = 0, .size = rgb_size};
-    vkCmdCopyBuffer(cmdbuf, detector->mem->image_staging_buffer, detector->mem->rgb_input_buffer, 1, &buf_copy);
+    vkCmdCopyBuffer(cmdbuf, detector->mem->image_staging_buffer, detector->mem->slots[0].rgb_input_buffer, 1, &buf_copy);
 
     // Barrier: transfer write to RGB buffer → shader read
     VkBufferMemoryBarrier buf_barrier = {
@@ -1577,14 +1577,14 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = detector->mem->rgb_input_buffer,
+        .buffer = detector->mem->slots[0].rgb_input_buffer,
         .offset = 0,
         .size = VK_WHOLE_SIZE};
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &buf_barrier, 0, NULL);
 
     // Transition input_image (R8) to GENERAL for compute write
     VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[0].input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &input_barrier);
@@ -1598,7 +1598,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
 
     // Transition input_image from compute write to shader read (for scale-space blit)
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[0].input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
@@ -1607,7 +1607,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
   {
     // Grayscale path: copy staging → input_image directly (original code)
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        detector->mem->slots[0].input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
@@ -1619,11 +1619,11 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
         .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
         .imageOffset = {.x = 0, .y = 0, .z = 0},
         .imageExtent = {.width = detector->mem->curr_input_image_width, .height = detector->mem->curr_input_image_height, .depth = 1}};
-    vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+    vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->slots[0].input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                            &buffer_image_region);
 
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[0].input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
@@ -1636,7 +1636,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
   {
     VkImageMemoryBarrier barriers[2];
     barriers[0] = vkenv_genImageMemoryBarrier(
-        detector->mem->input_image,
+        detector->mem->slots[0].input_image,
         VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_ACCESS_TRANSFER_READ_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
@@ -1660,7 +1660,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
         .dstOffset = {0, 0, 0},
         .extent = {detector->mem->curr_input_image_width, detector->mem->curr_input_image_height, 1}};
     vkCmdCopyImage(cmdbuf,
-        detector->mem->input_image,        VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[0].input_image,        VK_IMAGE_LAYOUT_GENERAL,
         detector->mem->cached_input_image, VK_IMAGE_LAYOUT_GENERAL,
         1, &region);
 
@@ -1681,15 +1681,15 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
 
 // Records the on-IMAS variant of input-image population: instead of copying
 // from the host staging buffer, runs the QuantizeF32ToInput compute shader to
-// copy device-side from mem->rotated_image (R32F, IMAS output) into
-// mem->input_image (R8_UNORM). Dispatch dims come from detector->quantize_width
+// copy device-side from mem->slots[0].rotated_image (R32F, IMAS output) into
+// mem->slots[0].input_image (R8_UNORM). Dispatch dims come from detector->quantize_width
 // / quantize_height, which the caller sets per-tilt before submitting the
 // from-IMAS detection command buffer.
 static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf)
 {
   beginMarkerRegion(detector, cmdbuf, "Quantize IMAS → input");
   VkImageMemoryBarrier rotated_barrier = vkenv_genImageMemoryBarrier(
-      detector->mem->rotated_image,
+      detector->mem->slots[0].rotated_image,
       VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
       VK_ACCESS_SHADER_READ_BIT,
       VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
@@ -1701,7 +1701,7 @@ static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBu
       0, 0, NULL, 0, NULL, 1, &rotated_barrier);
 
   VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
-      detector->mem->input_image,
+      detector->mem->slots[0].input_image,
       0, VK_ACCESS_SHADER_WRITE_BIT,
       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
@@ -1730,7 +1730,7 @@ static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBu
       (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
 
   VkImageMemoryBarrier post_barrier = vkenv_genImageMemoryBarrier(
-      detector->mem->input_image,
+      detector->mem->slots[0].input_image,
       VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
       VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
@@ -1764,7 +1764,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
 
     // PreBlur1D: input_image → blurred_input_image.
     image_barriers[0] = vkenv_genImageMemoryBarrier(
-        detector->mem->blurred_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
+        detector->mem->slots[0].blurred_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
@@ -1787,12 +1787,12 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
 
     // Barrier: blurred_input_image SHADER_WRITE → SHADER_READ for AffineWarp's sampler.
     image_barriers[0] = vkenv_genImageMemoryBarrier(
-        detector->mem->blurred_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        detector->mem->slots[0].blurred_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
     image_barriers[1] = vkenv_genImageMemoryBarrier(
-        detector->mem->warped_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
+        detector->mem->slots[0].warped_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
@@ -1817,7 +1817,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
 
     // Barrier: warped_input_image SHADER_WRITE → TRANSFER_READ for the BlitImage below.
     image_barriers[0] = vkenv_genImageMemoryBarrier(
-        detector->mem->warped_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        detector->mem->slots[0].warped_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
@@ -1839,14 +1839,14 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
         .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
         .dstOffsets = {{0, 0, 0},
                        {(int32_t)detector->mem->octave_resolutions[oct_idx].width, (int32_t)detector->mem->octave_resolutions[oct_idx].height, 1}}};
-    vkCmdBlitImage(cmdbuf, detector->mem->warped_input_image, VK_IMAGE_LAYOUT_GENERAL,
-                   detector->mem->octave_image_arr[oct_idx], VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
+    vkCmdBlitImage(cmdbuf, detector->mem->slots[0].warped_input_image, VK_IMAGE_LAYOUT_GENERAL,
+                   detector->mem->slots[0].octave_image_arr[oct_idx], VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
 
     // Setup memory access (horizontal pass read from source scale and write to temporary restul image)
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->blur_tmp_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].blur_tmp_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}); // only scale 0
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
@@ -1863,10 +1863,10 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
                   ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), 1);
 
     // Setup the memory access masks for vertical pass (read from temp result and write to target scale)
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}); // only scale 0
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
@@ -1883,10 +1883,10 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
   {
     // Gaussian blur from one scale to the next
     // Setup read/write access for relevant scales
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, scale_i - 1, 1}); // ony prev scale
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
@@ -1903,10 +1903,10 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
     vkCmdDispatch(cmdbuf, ceilf((float)(detector->mem->octave_resolutions[oct_idx].width) / 8.f),
                   ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), 1);
     // Change read/write acces for vertical pass
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, scale_i, 1}); // ony curr scale
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
@@ -1921,7 +1921,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
                   ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), 1);
 
     // Make sure the scale image writes are available for compute
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, scale_i, 1}); // ony curr scale
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
@@ -1936,7 +1936,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
     // at higher octaves. The compute shader is pixel-aligned with the
     // keypoint coord-conversion formula.
 
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
@@ -1951,7 +1951,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
     vkCmdPushConstants(cmdbuf, detector->downsample_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Downsample2xPushConsts), &ds_pc);
     vkCmdDispatch(cmdbuf, ceilf((float)ds_pc.dst_width / 8.f), ceilf((float)ds_pc.dst_height / 8.f), 1);
 
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
@@ -1975,7 +1975,7 @@ static void recDifferenceOfGaussianCmds(vksift_SiftDetector detector, VkCommandB
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
     image_barriers[oct_idx - oct_begin] = vkenv_genImageMemoryBarrier(
-        detector->mem->octave_DoG_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[0].octave_DoG_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, nb_scales + 2});
   }
   vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, oct_count, image_barriers);
@@ -1991,7 +1991,7 @@ static void recDifferenceOfGaussianCmds(vksift_SiftDetector detector, VkCommandB
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
     image_barriers[oct_idx - oct_begin] =
-        vkenv_genImageMemoryBarrier(detector->mem->octave_DoG_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_DoG_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, nb_scales + 2});
   }

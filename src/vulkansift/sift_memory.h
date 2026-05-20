@@ -4,6 +4,11 @@
 #include "vkenv/vulkan_device.h"
 #include "vulkansift/vulkansift_types.h"
 
+// Maximum number of independent pyramid slots the parallel IMAS+detect path
+// can be configured for. Runtime nb_pyramid_slots ≤ this. Used to size the
+// per-slot static array on vksift_SiftMemory_T.
+#define VKSIFT_MAX_PYRAMID_SLOTS 8u
+
 typedef struct
 {
   // Buffer memory can be arranged in two different ways. After being filled with a detection pipeline the buffer is arranged in sections
@@ -29,6 +34,91 @@ typedef struct
   uint32_t width;
   uint32_t height;
 } vksift_OctaveResolution;
+
+// Per-pyramid GPU resources. The parallel IMAS+detect pipeline keeps
+// nb_pyramid_slots of these so N pyramids can be in-flight simultaneously.
+// Phase A only consumes slots[0]; Phase B+ adds parallel scheduling.
+typedef struct
+{
+  // Pyramid input (R8_UNORM). Either uploaded host-side via image_staging_buffer
+  // (regular detect path) or written device-side by the QuantizeF32ToInput
+  // shader (on-IMAS detect path).
+  VkImage input_image;
+  VkImageView input_image_view;
+  VkDeviceMemory input_image_memory;
+  VkDeviceSize input_image_memory_size;
+
+  // Pre-blurred input image (r32f). Output of the per-warp PreBlur1D.comp
+  // pass that applies the Morel-Yu σ_aa = 0.8·√(t²−1) anti-alias filter
+  // along the warp's squash direction. Sized at the input resolution; serves
+  // as the sampler source for the AffineWarp pass below. At σ ≈ 0 the
+  // PreBlur1D shader degenerates to a pass-through copy of input_image.
+  VkImage blurred_input_image;
+  VkImageView blurred_input_image_view;
+  VkDeviceMemory blurred_input_image_memory;
+  VkDeviceSize blurred_input_image_memory_size;
+
+  // Warped input image (r32f). Output of the optional AffineWarp.comp pass;
+  // becomes the source of the first Gaussian blur for ASIFT-style detection.
+  // Sized at curr_input_image_width × curr_input_image_height to fit the
+  // worst-case tilt-warp output bbox.
+  VkImage warped_input_image;
+  VkImageView warped_input_image_view;
+  VkDeviceMemory warped_input_image_memory;
+  VkDeviceSize warped_input_image_memory_size;
+
+  // Rotated working image (r32f) sized at WORST-CASE rotated dimensions for
+  // the IMAS-25 covering: max(W_rot × H_rot) ≈ (W + H) × (W + H). Used as a
+  // scratch buffer holding the chain output of:
+  //   AffineWarp(rotation only)  → rotated image
+  //   GaussianBlur(σ_aa vertical)→ blurred-rotated image (in-place)
+  // Matches `frot` + `GaussianBlur1D` from libSimuTilts/digital_tilt.cpp.
+  VkImage rotated_image;
+  VkImageView rotated_image_view;
+  VkDeviceMemory rotated_image_memory;
+  VkDeviceSize rotated_image_memory_size;
+  uint32_t rotated_image_max_width;
+  uint32_t rotated_image_max_height;
+
+  // Final tilted image (r32f) sized at W_rot × ⌊H_rot/t⌋ for the IMAS-25
+  // covering's smallest non-identity tilt. Output of FprojBilinearY.comp;
+  // serves as the detection-pipeline input for per-warp pyramid construction.
+  VkImage tilted_image;
+  VkImageView tilted_image_view;
+  VkDeviceMemory tilted_image_memory;
+  VkDeviceSize tilted_image_memory_size;
+  uint32_t tilted_image_max_width;
+  uint32_t tilted_image_max_height;
+
+  // RGBA input image (only allocated when use_rgba_input=true)
+  VkImage rgba_input_image;
+  VkImageView rgba_input_image_view;
+  VkDeviceMemory rgba_input_image_memory;
+  VkDeviceSize rgba_input_image_memory_size;
+
+  // RGB input buffer (only allocated when use_rgb_input=true)
+  // Uses SSBO since VK_FORMAT_R8G8B8_UNORM has poor storage image support
+  VkBuffer rgb_input_buffer;
+  VkDeviceMemory rgb_input_buffer_memory;
+  VkDeviceSize rgb_input_buffer_size;
+
+  // Scale-space pyramid (per-octave arrays). Sized max_nb_octaves at slot
+  // allocation time; entries past curr_nb_octaves are unused.
+  VkImage *octave_image_arr;
+  VkImageView *octave_image_view_arr;
+  VkDeviceMemory *octave_image_memory_arr;
+  VkDeviceSize *octave_image_memory_size_arr;
+
+  VkImage *blur_tmp_image_arr;
+  VkImageView *blur_tmp_image_view_arr;
+  VkDeviceMemory *blur_tmp_image_memory_arr;
+  VkDeviceSize *blur_tmp_image_memory_size_arr;
+
+  VkImage *octave_DoG_image_arr;
+  VkImageView *octave_DoG_image_view_arr;
+  VkDeviceMemory *octave_DoG_image_memory_arr;
+  VkDeviceSize *octave_DoG_image_memory_size_arr;
+} vksift_SiftPyramidSlot;
 
 typedef struct vksift_SiftMemory_T
 {
@@ -56,95 +146,28 @@ typedef struct vksift_SiftMemory_T
   VkDeviceMemory image_staging_buffer_memory;
   void *image_staging_buffer_ptr;
 
-  VkImage input_image;
-  VkImageView input_image_view;
-  VkDeviceMemory input_image_memory;
-  VkDeviceSize input_image_memory_size;
+  // Per-pyramid resources. Phase A: only slots[0] is consumed by detector +
+  // IMAS pipeline. Phase B+: parallel IMAS waves use slots[s] for s in
+  // [0, nb_pyramid_slots). Setup + destroy loop over slots[0 .. nb_pyramid_slots).
+  vksift_SiftPyramidSlot slots[VKSIFT_MAX_PYRAMID_SLOTS];
+  uint32_t nb_pyramid_slots;
 
-  // Cached copy of input_image, kept in sync by recCopyInputImageCmds whenever
-  // a regular vksift_detectFeatures uploads new content. The IMAS pipeline
-  // reads from cached_input_image_view instead of input_image_view so that
-  // the device-side on-IMAS detect path (which overwrites input_image with
-  // quantized tilted content) doesn't corrupt the IMAS source between warps.
-  // Eliminates the per-warp host→staging→input_image re-upload.
+  // Cached copy of slots[0].input_image, kept in sync by recCopyInputImageCmds
+  // whenever a regular vksift_detectFeatures uploads new content. The IMAS
+  // pipeline reads from cached_input_image_view (rather than the per-slot
+  // input_image_view) so that the device-side on-IMAS detect path (which
+  // overwrites input_image with quantized tilted content) doesn't corrupt the
+  // IMAS source between warps. Single shared instance — read-only IMAS source.
   VkImage cached_input_image;
   VkImageView cached_input_image_view;
   VkDeviceMemory cached_input_image_memory;
   VkDeviceSize cached_input_image_memory_size;
 
-  // Pre-blurred input image (r32f). Output of the per-warp PreBlur1D.comp
-  // pass that applies the Morel-Yu σ_aa = 0.8·√(t²−1) anti-alias filter
-  // along the warp's squash direction. Sized at the input resolution; serves
-  // as the sampler source for the AffineWarp pass below. At σ ≈ 0 the
-  // PreBlur1D shader degenerates to a pass-through copy of input_image.
-  VkImage blurred_input_image;
-  VkImageView blurred_input_image_view;
-  VkDeviceMemory blurred_input_image_memory;
-  VkDeviceSize blurred_input_image_memory_size;
-
-  // Rotated working image (r32f) sized at WORST-CASE rotated dimensions for
-  // the IMAS-25 covering: max(W_rot × H_rot) ≈ (W + H) × (W + H). Used as a
-  // scratch buffer holding the chain output of:
-  //   AffineWarp(rotation only)  → rotated image
-  //   GaussianBlur(σ_aa vertical)→ blurred-rotated image (in-place)
-  // Matches `frot` + `GaussianBlur1D` from libSimuTilts/digital_tilt.cpp.
-  VkImage rotated_image;
-  VkImageView rotated_image_view;
-  VkDeviceMemory rotated_image_memory;
-  VkDeviceSize rotated_image_memory_size;
-  uint32_t rotated_image_max_width;
-  uint32_t rotated_image_max_height;
-
-  // Final tilted image (r32f) sized at W_rot × ⌊H_rot/t_min⌋ for the IMAS-25
-  // covering's smallest non-identity tilt. Output of FprojBilinearY.comp;
-  // serves as the detection-pipeline input for per-warp pyramid construction.
-  VkImage tilted_image;
-  VkImageView tilted_image_view;
-  VkDeviceMemory tilted_image_memory;
-  VkDeviceSize tilted_image_memory_size;
-  uint32_t tilted_image_max_width;
-  uint32_t tilted_image_max_height;
-
-  // Warped input image (r32f). Output of the optional AffineWarp.comp pass;
-  // becomes the source of the first Gaussian blur for ASIFT-style detection.
-  // Sized at curr_input_image_width × curr_input_image_height to fit the
-  // worst-case tilt-warp output bbox.
-  VkImage warped_input_image;
-  VkImageView warped_input_image_view;
-  VkDeviceMemory warped_input_image_memory;
-  VkDeviceSize warped_input_image_memory_size;
-
-  // RGBA input image (only allocated when use_rgba_input=true)
-  VkImage rgba_input_image;
-  VkImageView rgba_input_image_view;
-  VkDeviceMemory rgba_input_image_memory;
-  VkDeviceSize rgba_input_image_memory_size;
   bool use_rgba_input;
-
-  // RGB input buffer (only allocated when use_rgb_input=true)
-  // Uses SSBO since VK_FORMAT_R8G8B8_UNORM has poor storage image support
-  VkBuffer rgb_input_buffer;
-  VkDeviceMemory rgb_input_buffer_memory;
-  VkDeviceSize rgb_input_buffer_size;
   bool use_rgb_input;
 
   VkImage output_image; // output image is used to export scalespace images to the CPU for debug/viz
   VkDeviceMemory output_image_memory;
-
-  VkImage *octave_image_arr;
-  VkImageView *octave_image_view_arr;
-  VkDeviceMemory *octave_image_memory_arr;
-  VkDeviceSize *octave_image_memory_size_arr;
-
-  VkImage *blur_tmp_image_arr;
-  VkImageView *blur_tmp_image_view_arr;
-  VkDeviceMemory *blur_tmp_image_memory_arr;
-  VkDeviceSize *blur_tmp_image_memory_size_arr;
-
-  VkImage *octave_DoG_image_arr;
-  VkImageView *octave_DoG_image_view_arr;
-  VkDeviceMemory *octave_DoG_image_memory_arr;
-  VkDeviceSize *octave_DoG_image_memory_size_arr;
 
   // Pyramid info
   uint32_t curr_input_image_width;
