@@ -20,17 +20,23 @@
 //
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(r32f, binding = 0) uniform image2D img_coeffs;
-layout(r32f, binding = 1) uniform image2D img_out;
+layout(set = 0, binding = 0, r32f) uniform image2D img_coeffs;
+layout(set = 0, binding = 1, r32f) uniform image2D img_out;
 
-layout(push_constant) uniform PushConst {
-    float t;                  // subsample factor (height_t = ⌊height/t⌋)
-    uint  output_width;       // = input width (= width_r)
-    uint  output_height;      // = ⌊input height / t⌋
-    uint  input_width;
-    uint  input_height;
-    float bg_value;           // fill for OOB samples
-} push_const;
+layout(set = 1, binding = 0, std140) uniform WarpParamsBlock {
+    float a11, a12, a13;
+    float a21, a22, a23;
+    float fill_value;
+    float fproj_bg_value;
+    uint  W_rot, H_rot, H_sub, canvas_w, canvas_h, valid_w, valid_h, warp_idx;
+    float sigma_aa, t_factor, quantize_fill, gauss_dir_x, gauss_dir_y;
+    float _pad1, _pad2, _pad3;
+} ubo;
+// FprojCubicY mapping:
+//   output dims  = (W_rot, H_sub)
+//   input dims   = (W_rot, H_rot)
+//   subsample t  = t_factor
+//   OOB fill     = fill_value
 
 // spline3 coefficients (splines.cpp:169-178)
 void spline3(float u, out float c0, out float c1, out float c2, out float c3) {
@@ -42,27 +48,27 @@ void spline3(float u, out float c0, out float c1, out float c2, out float c3) {
 }
 
 float fetch_coeff(int x, int y) {
-    int W = int(push_const.input_width);
-    int H = int(push_const.input_height);
-    if (x < 0 || x >= W || y < 0 || y >= H) return push_const.bg_value;
+    int W = int(ubo.W_rot);
+    int H = int(ubo.H_rot);
+    if (x < 0 || x >= W || y < 0 || y >= H) return ubo.fproj_bg_value;
     return imageLoad(img_coeffs, ivec2(x, y)).r;
 }
 
 void main() {
     int x = int(gl_GlobalInvocationID.x);
     int y = int(gl_GlobalInvocationID.y);
-    if (x >= int(push_const.output_width) || y >= int(push_const.output_height)) return;
+    if (x >= int(ubo.W_rot) || y >= int(ubo.H_sub)) return;
 
     // fproj with `i` non-NULL, identity rectangular mapping:
     //   xp = x + 0.5,  yp = t·y + 0.5
     // (matches the derivation in fproj.cpp:104-110 with our specific corners)
     float xp = float(x) + 0.5;
-    float yp = push_const.t * float(y) + 0.5;
+    float yp = ubo.t_factor * float(y) + 0.5;
 
     // OOB check (fproj.cpp:130)
-    if (xp < 0.0 || xp > float(push_const.input_width)  ||
-        yp < 0.0 || yp > float(push_const.input_height)) {
-        imageStore(img_out, ivec2(x, y), vec4(push_const.bg_value, 0.0, 0.0, 1.0));
+    if (xp < 0.0 || xp > float(ubo.W_rot)  ||
+        yp < 0.0 || yp > float(ubo.H_rot)) {
+        imageStore(img_out, ivec2(x, y), vec4(ubo.fproj_bg_value, 0.0, 0.0, 1.0));
         return;
     }
 

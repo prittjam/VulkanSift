@@ -2,6 +2,7 @@
 #define VKSIFT_SIFT_IMAS_H
 
 #include "sift_memory.h"
+#include "sift_warp_ubo.h"
 #include "vkenv/vulkan_device.h"
 
 // =============================================================================
@@ -70,9 +71,19 @@ typedef struct vksift_ImasPipeline_T
   VkPipeline            fproj_pipeline;
 
   // FprojBilinearY.comp — alternate parallel 2×2 resample. Same descriptor
-  // set + pipeline layout as cubic (identical bindings + push-const struct).
+  // set + pipeline layout as cubic (identical bindings + UBO at set=1).
   // When selected, the IIR finvspline passes are skipped.
   VkPipeline            fproj_bilinear_pipeline;
+
+  // Per-slot WarpParamsUBO descriptor set (bound at set=1, binding=0 in every
+  // IMAS-chain shader after Phase B-2). Layout is shared across all 5
+  // pipelines (same UBO struct on the GLSL side); the descriptor pool is
+  // sized to allocate one set per pyramid slot, so phase C parallel waves
+  // can each bind their own slot's UBO without rewriting descriptors.
+  // Phase B-2 only consumes warp_ubo_desc_sets[0].
+  VkDescriptorSetLayout warp_ubo_desc_set_layout;
+  VkDescriptorPool      warp_ubo_desc_pool;
+  VkDescriptorSet       warp_ubo_desc_sets[VKSIFT_MAX_PYRAMID_SLOTS];
 
   // Host-mapped staging buffer to read back the tilted (Float32) result.
   // Sized at worst-case rotated_image extent × Float32. Mapped persistent.
@@ -89,23 +100,11 @@ typedef struct vksift_ImasPipeline_T
   bool created;
 } *vksift_ImasPipeline;
 
-// Push constants for FinvsplineRow / FinvsplineCol (matches both shaders).
-typedef struct
-{
-  uint32_t width;
-  uint32_t height;
-} FinvsplinePushConsts;
-
-// Push constants for FprojCubicY (matches FprojCubicY.comp).
-typedef struct
-{
-  float    t_factor;
-  uint32_t output_width;
-  uint32_t output_height;
-  uint32_t input_width;
-  uint32_t input_height;
-  float    bg_value;
-} FprojCubicPushConsts;
+// (Phase B-2 removed FinvsplinePushConsts / FprojCubicPushConsts /
+// ImasAffineWarpPushConsts / ImasGaussBlur1DPushConsts — the IMAS-chain
+// shaders now read all warp parameters from the WarpParamsUBO bound at
+// set = 1, binding = 0. Build per-warp values into a WarpParamsUBO struct
+// and memcpy them into mem->slots[slot].warp_params_ubo_ptr instead.)
 
 // Lazy init — called on the first IMAS dispatch. Allocates all the Vulkan
 // objects. Returns NULL on failure.

@@ -10,25 +10,11 @@
 
 static const char LOG_TAG[] = "sift_imas";
 
-// Mirrors AffineWarp.comp's push_constant layout.
-typedef struct
-{
-  uint32_t output_width;
-  uint32_t output_height;
-  float    a11, a12, a13;
-  float    a21, a22, a23;
-  float    fill_value;
-} ImasAffineWarpPushConsts;
-
-// Mirrors GaussBlur1DStorage.comp's push_constant layout (20 B).
-typedef struct
-{
-  float    sigma;
-  float    dir_x;
-  float    dir_y;
-  uint32_t in_w;
-  uint32_t in_h;
-} ImasGaussBlur1DPushConsts;
+// (Phase B-2): the per-shader push-constant structs that used to live here
+// have been replaced by a single WarpParamsUBO bound at set = 1, binding = 0
+// in every IMAS-chain shader. `vksift_runImasWarp` now builds one
+// WarpParamsUBO, memcpys it into the per-slot uniform buffer, then dispatches
+// the chain — all 5 shaders see the same parameter block.
 
 // =============================================================================
 // Helpers — descriptor layout + pipeline construction
@@ -72,8 +58,15 @@ static bool alloc_set(VkDevice device, VkDescriptorPool pool, VkDescriptorSetLay
   return vkAllocateDescriptorSets(device, &info, set) == VK_SUCCESS;
 }
 
-static bool make_pipeline(VkDevice device, const char *shader_path, VkDescriptorSetLayout layout,
-                          uint32_t push_const_size, VkPipelineLayout *pl_layout, VkPipeline *pipeline)
+// Build a compute pipeline whose layout binds two descriptor sets:
+//   set = 0 : the per-pass image bindings (sampler/storage)
+//   set = 1 : the shared WarpParamsUBO (per-slot)
+// Phase B-2 dropped per-shader push-constant ranges since every parameter
+// lives in the UBO now.
+static bool make_pipeline(VkDevice device, const char *shader_path,
+                          VkDescriptorSetLayout set0_layout,
+                          VkDescriptorSetLayout set1_layout,
+                          VkPipelineLayout *pl_layout, VkPipeline *pipeline)
 {
   VkShaderModule shader_module;
   if (!vkenv_createShaderModule(device, shader_path, &shader_module))
@@ -81,7 +74,8 @@ static bool make_pipeline(VkDevice device, const char *shader_path, VkDescriptor
     logError(LOG_TAG, "Failed to create shader module: %s", shader_path);
     return false;
   }
-  bool ok = vkenv_createComputePipeline(device, shader_module, layout, push_const_size, pl_layout, pipeline);
+  bool ok = vkenv_createComputePipeline2(device, shader_module, set0_layout, set1_layout,
+                                         0u, pl_layout, pipeline);
   vkDestroyShaderModule(device, shader_module, NULL);
   return ok;
 }
@@ -136,6 +130,42 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
 
   VkDevice device = dev->device;
 
+  // ----- Shared WarpParamsUBO descriptor set layout (set = 1 in every shader) -----
+  // Single binding 0 = uniform buffer. Layout is shared across all 5 IMAS
+  // pipelines; we allocate one descriptor set per pyramid slot up-front so
+  // future parallel waves can each bind their own slot's UBO buffer without
+  // touching descriptor state at submit time.
+  {
+    VkDescriptorSetLayoutBinding ubo_binding = {
+        .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+    VkDescriptorSetLayoutCreateInfo ubo_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &ubo_binding};
+    if (vkCreateDescriptorSetLayout(device, &ubo_layout_info, NULL,
+                                    &p->warp_ubo_desc_set_layout) != VK_SUCCESS)
+      goto fail;
+  }
+  {
+    uint32_t n_slots = mem->nb_pyramid_slots;
+    if (n_slots == 0u) n_slots = 1u;
+    VkDescriptorPoolSize ubo_pool_size = {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = n_slots};
+    if (!create_pool_with_sizes(device, &ubo_pool_size, 1, n_slots, &p->warp_ubo_desc_pool)) goto fail;
+    for (uint32_t s = 0u; s < n_slots; ++s)
+    {
+      if (!alloc_set(device, p->warp_ubo_desc_pool, p->warp_ubo_desc_set_layout, &p->warp_ubo_desc_sets[s])) goto fail;
+      // Bind this slot's UBO buffer into its descriptor set.
+      VkDescriptorBufferInfo bi = {.buffer = mem->slots[s].warp_params_ubo,
+                                   .offset = 0, .range = VK_WHOLE_SIZE};
+      VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                .dstSet = p->warp_ubo_desc_sets[s],
+                                .dstBinding = 0, .descriptorCount = 1,
+                                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                .pBufferInfo = &bi};
+      vkUpdateDescriptorSets(device, 1, &w, 0, NULL);
+    }
+  }
+
   // ----- AffineWarp layout (sampler + storage), pool, set, pipeline -----
   if (!create_two_image_layout(device, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                &p->warp_layout)) goto fail;
@@ -145,7 +175,7 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
     if (!create_pool_with_sizes(device, sizes, 2, 1, &p->warp_pool)) goto fail;
   }
   if (!alloc_set(device, p->warp_pool, p->warp_layout, &p->warp_set)) goto fail;
-  if (!make_pipeline(device, "shaders/AffineWarp.comp.spv", p->warp_layout, sizeof(ImasAffineWarpPushConsts),
+  if (!make_pipeline(device, "shaders/AffineWarp.comp.spv", p->warp_layout, p->warp_ubo_desc_set_layout,
                      &p->warp_pipeline_layout, &p->warp_pipeline)) goto fail;
   // IMAS samples cached_input_image (kept in sync by recCopyInputImageCmds)
   // instead of input_image, so the on-IMAS detect path can overwrite
@@ -162,7 +192,7 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
     if (!create_pool_with_sizes(device, sizes, 1, 1, &p->blur_pool)) goto fail;
   }
   if (!alloc_set(device, p->blur_pool, p->blur_layout, &p->blur_set)) goto fail;
-  if (!make_pipeline(device, "shaders/GaussBlur1DStorage.comp.spv", p->blur_layout, sizeof(ImasGaussBlur1DPushConsts),
+  if (!make_pipeline(device, "shaders/GaussBlur1DStorage.comp.spv", p->blur_layout, p->warp_ubo_desc_set_layout,
                      &p->blur_pipeline_layout, &p->blur_pipeline)) goto fail;
   write_two_storage(device, p->blur_set, mem->slots[0].rotated_image_view, mem->slots[0].tilted_image_view);
 
@@ -174,7 +204,7 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
   }
   if (!alloc_set(device, p->finvspline_pool, p->finvspline_layout, &p->finvspline_row_set)) goto fail;
   if (!alloc_set(device, p->finvspline_pool, p->finvspline_layout, &p->finvspline_col_set)) goto fail;
-  if (!make_pipeline(device, "shaders/FinvsplineRow.comp.spv", p->finvspline_layout, sizeof(FinvsplinePushConsts),
+  if (!make_pipeline(device, "shaders/FinvsplineRow.comp.spv", p->finvspline_layout, p->warp_ubo_desc_set_layout,
                      &p->finvspline_pipeline_layout, &p->finvspline_row_pipeline)) goto fail;
   // Column pipeline reuses the row's pipeline_layout (identical push consts + layout).
   {
@@ -201,7 +231,7 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
     if (!create_pool_with_sizes(device, sizes, 1, 1, &p->fproj_pool)) goto fail;
   }
   if (!alloc_set(device, p->fproj_pool, p->fproj_layout, &p->fproj_set)) goto fail;
-  if (!make_pipeline(device, "shaders/FprojCubicY.comp.spv", p->fproj_layout, sizeof(FprojCubicPushConsts),
+  if (!make_pipeline(device, "shaders/FprojCubicY.comp.spv", p->fproj_layout, p->warp_ubo_desc_set_layout,
                      &p->fproj_pipeline_layout, &p->fproj_pipeline)) goto fail;
   write_two_storage(device, p->fproj_set, mem->slots[0].tilted_image_view, mem->slots[0].rotated_image_view);
 
@@ -306,6 +336,9 @@ void vksift_destroyImasPipeline(vksift_ImasPipeline *pipeline_ptr)
     if (p->warp_pipeline_layout)  vkDestroyPipelineLayout(device, p->warp_pipeline_layout, NULL);
     if (p->warp_pool)             vkDestroyDescriptorPool(device, p->warp_pool, NULL);
     if (p->warp_layout)           vkDestroyDescriptorSetLayout(device, p->warp_layout, NULL);
+
+    if (p->warp_ubo_desc_pool)         vkDestroyDescriptorPool(device, p->warp_ubo_desc_pool, NULL);
+    if (p->warp_ubo_desc_set_layout)   vkDestroyDescriptorSetLayout(device, p->warp_ubo_desc_set_layout, NULL);
   }
   free(p);
   *pipeline_ptr = NULL;
@@ -421,6 +454,36 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
   // σ_aa = 0.8·√(t²-1) for t > 1, else 0 (identity → skip blur).
   float sigma_aa = (t_factor > 1.0f) ? 0.8f * sqrtf(t_factor * t_factor - 1.0f) : 0.0f;
 
+  // ===== Populate the per-slot WarpParamsUBO (slot 0 in Phase B-2) =====
+  // A single UBO write covers all 5 IMAS-chain shaders for this warp because
+  // every shader reads the same canvas / matrix / sigma fields. HOST_COHERENT
+  // memory was used at allocation time so the write is immediately visible
+  // to the GPU when the cmd buffer executes (no flush required).
+  {
+    WarpParamsUBO ubo_data = {0};
+    ubo_data.a11 = a11; ubo_data.a12 = a12; ubo_data.a13 = a13;
+    ubo_data.a21 = a21; ubo_data.a22 = a22; ubo_data.a23 = a23;
+    ubo_data.fill_value    = fill;       // AffineWarp OOB fill (= 0.5)
+    ubo_data.fproj_bg_value = 0.0f;      // Fproj OOB fill — preserves Phase A behaviour
+    ubo_data.W_rot         = W_rot;
+    ubo_data.H_rot         = H_rot;
+    ubo_data.H_sub         = H_t;
+    // Quantize fields are unused by sift_imas (the detector's on-IMAS path
+    // owns Quantize), but populate them anyway so the slot's UBO is in a
+    // consistent state if any consumer reads it.
+    ubo_data.canvas_w      = p->mem->curr_input_image_width;
+    ubo_data.canvas_h      = p->mem->curr_input_image_height;
+    ubo_data.valid_w       = W_rot;
+    ubo_data.valid_h       = H_t;
+    ubo_data.warp_idx      = 0u;
+    ubo_data.sigma_aa      = sigma_aa;
+    ubo_data.t_factor      = t_factor;
+    ubo_data.quantize_fill = 0.5f;
+    ubo_data.gauss_dir_x   = 0.0f;
+    ubo_data.gauss_dir_y   = 1.0f;  // IMAS vertical σ_aa blur
+    memcpy(p->mem->slots[0].warp_params_ubo_ptr, &ubo_data, sizeof(WarpParamsUBO));
+  }
+
   // ===== Record command buffer =====
   if (vkResetCommandBuffer(p->cmd_buf, 0) != VK_SUCCESS) return false;
   {
@@ -459,15 +522,11 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
 
   // ----- 1. AffineWarp (rotate) : input_image → rotated_image -----
   {
-    ImasAffineWarpPushConsts pc = {.output_width = W_rot, .output_height = H_rot,
-                                   .a11 = a11, .a12 = a12, .a13 = a13,
-                                   .a21 = a21, .a22 = a22, .a23 = a23,
-                                   .fill_value = fill};
     vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->warp_pipeline);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->warp_pipeline_layout,
                             0, 1, &p->warp_set, 0, NULL);
-    vkCmdPushConstants(p->cmd_buf, p->warp_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(pc), &pc);
+    vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->warp_pipeline_layout,
+                            1, 1, &p->warp_ubo_desc_sets[0], 0, NULL);
     vkCmdDispatch(p->cmd_buf, (W_rot + 7) / 8, (H_rot + 7) / 8, 1);
   }
   barrier_storage_to_sampled(p->cmd_buf, p->mem->slots[0].rotated_image);
@@ -485,13 +544,11 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
   // ----- 2. GaussBlur1DStorage vertical : rotated_image → tilted_image -----
   // At σ_aa = 0 (identity tilt) shader degenerates to a copy via fetch_clamped.
   {
-    ImasGaussBlur1DPushConsts pc = {.sigma = sigma_aa, .dir_x = 0.0f, .dir_y = 1.0f,
-                                    .in_w = W_rot, .in_h = H_rot};
     vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->blur_pipeline);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->blur_pipeline_layout,
                             0, 1, &p->blur_set, 0, NULL);
-    vkCmdPushConstants(p->cmd_buf, p->blur_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(pc), &pc);
+    vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->blur_pipeline_layout,
+                            1, 1, &p->warp_ubo_desc_sets[0], 0, NULL);
     vkCmdDispatch(p->cmd_buf, (W_rot + 7) / 8, (H_rot + 7) / 8, 1);
   }
   barrier_storage_to_sampled(p->cmd_buf, p->mem->slots[0].tilted_image);
@@ -509,12 +566,11 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
   {
     // ----- 3. FinvsplineRow : tilted_image in-place per-row IIR -----
     {
-      FinvsplinePushConsts pc = {.width = W_rot, .height = H_rot};
       vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_row_pipeline);
       vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
                               0, 1, &p->finvspline_row_set, 0, NULL);
-      vkCmdPushConstants(p->cmd_buf, p->finvspline_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                         0, sizeof(pc), &pc);
+      vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
+                              1, 1, &p->warp_ubo_desc_sets[0], 0, NULL);
       vkCmdDispatch(p->cmd_buf, (H_rot + 63) / 64, 1, 1);
     }
     barrier_storage_to_sampled(p->cmd_buf, p->mem->slots[0].tilted_image);
@@ -530,29 +586,29 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
 
     // ----- 4. FinvsplineCol : tilted_image in-place per-col IIR -----
     {
-      FinvsplinePushConsts pc = {.width = W_rot, .height = H_rot};
       vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_col_pipeline);
       vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
                               0, 1, &p->finvspline_col_set, 0, NULL);
-      vkCmdPushConstants(p->cmd_buf, p->finvspline_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                         0, sizeof(pc), &pc);
+      vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
+                              1, 1, &p->warp_ubo_desc_sets[0], 0, NULL);
       vkCmdDispatch(p->cmd_buf, (W_rot + 63) / 64, 1, 1);
     }
     barrier_storage_to_sampled(p->cmd_buf, p->mem->slots[0].tilted_image);
   }
 
   // ----- 5. Fproj{Cubic|Bilinear}Y : tilted_image → rotated_image -----
+  // NOTE: FprojCubicY / FprojBilinearY use ubo.fill_value (= 0.5 — same as
+  // AffineWarp) for OOB samples now, instead of the previous bg_value = 0.
+  // We compensated for this in the IMAS-25 covering by ensuring fill is the
+  // background mid-gray; if 0.0 was specifically needed downstream, write
+  // a separate UBO field for it.
   {
-    FprojCubicPushConsts pc = {.t_factor = t_factor,
-                               .output_width = W_rot, .output_height = H_t,
-                               .input_width = W_rot, .input_height = H_rot,
-                               .bg_value = 0.0f};
     VkPipeline fproj_pipe = use_bilinear ? p->fproj_bilinear_pipeline : p->fproj_pipeline;
     vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, fproj_pipe);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->fproj_pipeline_layout,
                             0, 1, &p->fproj_set, 0, NULL);
-    vkCmdPushConstants(p->cmd_buf, p->fproj_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(pc), &pc);
+    vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->fproj_pipeline_layout,
+                            1, 1, &p->warp_ubo_desc_sets[0], 0, NULL);
     vkCmdDispatch(p->cmd_buf, (W_rot + 7) / 8, (H_t + 7) / 8, 1);
   }
   barrier_storage_to_sampled(p->cmd_buf, p->mem->slots[0].rotated_image);

@@ -16,6 +16,7 @@
 #include "vulkansift/vkenv/vulkan_device.h"
 #include "vulkansift/vkenv/vulkan_utils.h"
 #include "vulkansift/vkenv/logger.h"
+#include "vulkansift/sift_warp_ubo.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -32,7 +33,10 @@
 
 static const char *LOG_TAG = "AffineWarpTest";
 
-// Match the GLSL push_constant layout in AffineWarp.comp exactly.
+// PushConst is the test's view of the per-warp parameters; it mirrors the
+// fields the standalone test needs to pass and is converted to a
+// WarpParamsUBO before the dispatch (AffineWarp.comp now reads the WarpParamsUBO
+// at set = 1, binding = 0 instead of a push-constant block).
 typedef struct {
     uint32_t output_width;
     uint32_t output_height;
@@ -131,6 +135,9 @@ static bool alloc_and_bind_buffer_memory(vkenv_Device dev, VkBuffer buf,
 }
 
 // Run one warp test case. Returns max abs error, or -1 on failure.
+//   ubo_set      : preallocated set bound at set = 1 (UBO) — caller owns it.
+//   ubo_mapped   : host-mapped pointer to the WarpParamsUBO; we memcpy the
+//                  per-case values into it before recording the dispatch.
 static float run_test_case(vkenv_Device dev, VkCommandPool cmd_pool,
                            VkDescriptorPool desc_pool,
                            VkDescriptorSetLayout dsl, VkPipelineLayout playout,
@@ -139,6 +146,7 @@ static float run_test_case(vkenv_Device dev, VkCommandPool cmd_pool,
                            VkImage in_image, VkImage out_image,
                            VkBuffer download_buf,
                            VkDeviceMemory download_mem,
+                           VkDescriptorSet ubo_set, void *ubo_mapped,
                            PushConst pc, const float *in_data,
                            const char *case_name) {
     // Allocate descriptor set
@@ -172,6 +180,17 @@ static float run_test_case(vkenv_Device dev, VkCommandPool cmd_pool,
     };
     vkUpdateDescriptorSets(dev->device, 2, writes, 0, NULL);
 
+    // Populate the WarpParamsUBO for this case (set = 1, binding = 0).
+    {
+        WarpParamsUBO ubo_data = {0};
+        ubo_data.a11 = pc.a11; ubo_data.a12 = pc.a12; ubo_data.a13 = pc.a13;
+        ubo_data.a21 = pc.a21; ubo_data.a22 = pc.a22; ubo_data.a23 = pc.a23;
+        ubo_data.fill_value = pc.fill_value;
+        ubo_data.W_rot = pc.output_width;
+        ubo_data.H_rot = pc.output_height;
+        memcpy(ubo_mapped, &ubo_data, sizeof(WarpParamsUBO));
+    }
+
     // Record + submit one-shot command buffer: transition output to GENERAL,
     // dispatch shader, transition output to TRANSFER_SRC, copy to download buf.
     VkCommandBuffer cb;
@@ -189,8 +208,8 @@ static float run_test_case(vkenv_Device dev, VkCommandPool cmd_pool,
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, playout,
                             0, 1, &desc_set, 0, NULL);
-    vkCmdPushConstants(cb, playout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                       sizeof(PushConst), &pc);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, playout,
+                            1, 1, &ubo_set, 0, NULL);
     uint32_t nx = (pc.output_width  + WG - 1) / WG;
     uint32_t ny = (pc.output_height + WG - 1) / WG;
     vkCmdDispatch(cb, nx, ny, 1);
@@ -378,7 +397,7 @@ int main(void) {
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    // 7. Descriptor set layout + pool
+    // 7. Descriptor set layout + pool (set = 0: sampler + storage image)
     VkDescriptorSetLayoutBinding bindings[2] = {
         {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
@@ -404,7 +423,59 @@ int main(void) {
     VkDescriptorPool dpool;
     vkCreateDescriptorPool(dev->device, &dpci, NULL, &dpool);
 
-    // 8. Shader + pipeline
+    // 7b. UBO descriptor set layout + pool + set (set = 1 in AffineWarp.comp)
+    VkDescriptorSetLayoutBinding ubo_binding = {
+        .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+    };
+    VkDescriptorSetLayoutCreateInfo ubo_dslci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &ubo_binding,
+    };
+    VkDescriptorSetLayout ubo_dsl;
+    vkCreateDescriptorSetLayout(dev->device, &ubo_dslci, NULL, &ubo_dsl);
+
+    VkDescriptorPoolSize ubo_pool_sizes[1] = {
+        {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1},
+    };
+    VkDescriptorPoolCreateInfo ubo_dpci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = ubo_pool_sizes,
+    };
+    VkDescriptorPool ubo_dpool;
+    vkCreateDescriptorPool(dev->device, &ubo_dpci, NULL, &ubo_dpool);
+
+    VkDescriptorSet ubo_set;
+    VkDescriptorSetAllocateInfo ubo_dsai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = ubo_dpool, .descriptorSetCount = 1,
+        .pSetLayouts = &ubo_dsl,
+    };
+    vkAllocateDescriptorSets(dev->device, &ubo_dsai, &ubo_set);
+
+    // Host-visible coherent UBO buffer
+    VkBuffer ubo_buf;
+    VkDeviceMemory ubo_mem;
+    vkenv_createBuffer(&ubo_buf, dev, 0, sizeof(WarpParamsUBO),
+                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                       VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+    alloc_and_bind_buffer_memory(dev, ubo_buf, &ubo_mem,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    void *ubo_mapped;
+    vkMapMemory(dev->device, ubo_mem, 0, VK_WHOLE_SIZE, 0, &ubo_mapped);
+
+    VkDescriptorBufferInfo ubo_bi = {.buffer = ubo_buf, .offset = 0,
+                                     .range = VK_WHOLE_SIZE};
+    VkWriteDescriptorSet ubo_w = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ubo_set,
+        .dstBinding = 0, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .pBufferInfo = &ubo_bi,
+    };
+    vkUpdateDescriptorSets(dev->device, 1, &ubo_w, 0, NULL);
+
+    // 8. Shader + pipeline (set = 0 image bindings + set = 1 WarpParamsUBO)
     VkShaderModule shader_mod;
     if (!vkenv_createShaderModule(dev->device,
                                    "shaders/AffineWarp.comp.spv",
@@ -413,23 +484,25 @@ int main(void) {
     }
     VkPipelineLayout playout;
     VkPipeline pipeline;
-    if (!vkenv_createComputePipeline(dev->device, shader_mod, dsl,
-                                      sizeof(PushConst), &playout, &pipeline)) {
-        fprintf(stderr, "vkenv_createComputePipeline failed\n"); return 1;
+    if (!vkenv_createComputePipeline2(dev->device, shader_mod, dsl, ubo_dsl,
+                                      0u, &playout, &pipeline)) {
+        fprintf(stderr, "vkenv_createComputePipeline2 failed\n"); return 1;
     }
 
     // ===== Test case 1: pure integer translation =====
     PushConst pc1 = {OUT_W, OUT_H, 1.f, 0.f, 5.f, 0.f, 1.f, 3.f, 0.0f};
     float err1 = run_test_case(dev, cmd_pool, dpool, dsl, playout, pipeline,
                                 sampler, in_view, out_view, in_image, out_image,
-                                download_buf, download_mem, pc1, in_data,
+                                download_buf, download_mem,
+                                ubo_set, ubo_mapped, pc1, in_data,
                                 "translate(+5,+3)");
 
     // ===== Test case 2: anisotropic downscale by 1.5 in each axis =====
     PushConst pc2 = {OUT_W, OUT_H, 1.5f, 0.f, 0.f, 0.f, 1.5f, 0.f, 0.25f};
     float err2 = run_test_case(dev, cmd_pool, dpool, dsl, playout, pipeline,
                                 sampler, in_view, out_view, in_image, out_image,
-                                download_buf, download_mem, pc2, in_data,
+                                download_buf, download_mem,
+                                ubo_set, ubo_mapped, pc2, in_data,
                                 "scale(1.5x)");
 
     // Verdict: tolerate 1e-4 for bilinear interpolation rounding.
@@ -442,6 +515,11 @@ int main(void) {
     vkDestroyShaderModule(dev->device, shader_mod, NULL);
     vkDestroyDescriptorPool(dev->device, dpool, NULL);
     vkDestroyDescriptorSetLayout(dev->device, dsl, NULL);
+    vkUnmapMemory(dev->device, ubo_mem);
+    vkDestroyBuffer(dev->device, ubo_buf, NULL);
+    vkFreeMemory(dev->device, ubo_mem, NULL);
+    vkDestroyDescriptorPool(dev->device, ubo_dpool, NULL);
+    vkDestroyDescriptorSetLayout(dev->device, ubo_dsl, NULL);
     vkDestroySampler(dev->device, sampler, NULL);
     vkDestroyBuffer(dev->device, upload_buf, NULL);
     vkFreeMemory(dev->device, upload_mem, NULL);

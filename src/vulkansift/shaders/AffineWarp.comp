@@ -11,43 +11,41 @@
 // for the final tilt-subsample step. AffineWarp.comp itself does pure
 // bilinear sampling — no kernel-aware filtering.
 //
-// Push constants:
-//   output_width, output_height : dimensions of the warped output
-//   a11..a23                    : 2×3 inverse affine matrix (row-major)
-//   fill_value                  : value returned for out-of-bounds samples
+// Parameters (set=1, binding=0 WarpParamsUBO):
+//   W_rot, H_rot             : dimensions of the warped output
+//   a11..a23                 : 2×3 inverse affine matrix (row-major)
+//   fill_value               : value returned for out-of-bounds samples
 //
 // Input: bound as sampler2D (r32f, bilinear filtering enabled, clamp-to-edge)
 // Output: bound as r32f image2D
 //
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(binding = 0) uniform sampler2D img_input;
-layout(r32f, binding = 1) uniform image2D img_output;
+layout(set = 0, binding = 0) uniform sampler2D img_input;
+layout(set = 0, binding = 1, r32f) uniform image2D img_output;
 
-layout(push_constant) uniform PushConst {
-    uint  output_width;
-    uint  output_height;
-    float a11;
-    float a12;
-    float a13;
-    float a21;
-    float a22;
-    float a23;
+layout(set = 1, binding = 0, std140) uniform WarpParamsBlock {
+    float a11, a12, a13;
+    float a21, a22, a23;
     float fill_value;
-} push_const;
+    float fproj_bg_value;
+    uint  W_rot, H_rot, H_sub, canvas_w, canvas_h, valid_w, valid_h, warp_idx;
+    float sigma_aa, t_factor, quantize_fill, gauss_dir_x, gauss_dir_y;
+    float _pad1, _pad2, _pad3;
+} ubo;
 
 void main() {
     ivec2 coords_out = ivec2(gl_GlobalInvocationID.xy);
-    if (uint(coords_out.x) >= push_const.output_width ||
-        uint(coords_out.y) >= push_const.output_height) {
+    if (uint(coords_out.x) >= ubo.W_rot ||
+        uint(coords_out.y) >= ubo.H_rot) {
         return;
     }
 
     // Map output pixel → input pixel coordinates via inverse affine
     float fx = float(coords_out.x);
     float fy = float(coords_out.y);
-    float x_in = push_const.a11 * fx + push_const.a12 * fy + push_const.a13;
-    float y_in = push_const.a21 * fx + push_const.a22 * fy + push_const.a23;
+    float x_in = ubo.a11 * fx + ubo.a12 * fy + ubo.a13;
+    float y_in = ubo.a21 * fx + ubo.a22 * fy + ubo.a23;
 
     // Convert to normalized texture coords (pixel-center = (n + 0.5) / size)
     vec2 in_size = vec2(textureSize(img_input, 0));
@@ -57,7 +55,7 @@ void main() {
     float val;
     if (tex_coords.x < 0.0 || tex_coords.x > 1.0 ||
         tex_coords.y < 0.0 || tex_coords.y > 1.0) {
-        val = push_const.fill_value;
+        val = ubo.fill_value;
     } else {
         val = textureLod(img_input, tex_coords, 0.0).r;
     }

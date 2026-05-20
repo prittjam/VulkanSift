@@ -12,12 +12,17 @@
 //
 
 layout(local_size_x = 64) in;
-layout(r32f, binding = 0) uniform image2D img;
+layout(set = 0, binding = 0, r32f) uniform image2D img;
 
-layout(push_constant) uniform PushConst {
-    uint width;
-    uint height;
-} push_const;
+layout(set = 1, binding = 0, std140) uniform WarpParamsBlock {
+    float a11, a12, a13;
+    float a21, a22, a23;
+    float fill_value;
+    float fproj_bg_value;
+    uint  W_rot, H_rot, H_sub, canvas_w, canvas_h, valid_w, valid_h, warp_idx;
+    float sigma_aa, t_factor, quantize_fill, gauss_dir_x, gauss_dir_y;
+    float _pad1, _pad2, _pad3;
+} ubo;
 
 const float POLE   = -0.26794919;
 const float INV_Z  = -3.7320508;
@@ -25,8 +30,8 @@ const float LAMBDA = 6.0;
 
 void main() {
     uint c = gl_GlobalInvocationID.x;
-    if (c >= push_const.width) return;
-    int H = int(push_const.height);
+    if (c >= ubo.W_rot) return;
+    int H = int(ubo.H_rot);
 
     // 1. λ scaling of this column
     for (int i = 0; i < H; ++i) {

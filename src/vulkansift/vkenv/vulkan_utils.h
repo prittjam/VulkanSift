@@ -40,6 +40,17 @@ bool vkenv_createShaderModule(VkDevice device, const char *shader_file_path, VkS
 bool vkenv_createComputePipeline(VkDevice device, VkShaderModule shader_module, VkDescriptorSetLayout descriptor_set_layout, uint32_t push_constant_size,
                                  VkPipelineLayout *pipeline_layout, VkPipeline *pipeline);
 
+// Variant of vkenv_createComputePipeline that accepts a second descriptor set
+// layout (bound at set = 1 in the shader). Used by the IMAS / on-IMAS detect
+// pipelines, where set = 0 holds the per-pass image bindings and set = 1
+// holds the per-slot WarpParamsUBO (shared across the whole IMAS chain).
+// Pass push_constant_size = 0 if the shader has no push constants.
+bool vkenv_createComputePipeline2(VkDevice device, VkShaderModule shader_module,
+                                  VkDescriptorSetLayout descriptor_set_layout_0,
+                                  VkDescriptorSetLayout descriptor_set_layout_1,
+                                  uint32_t push_constant_size,
+                                  VkPipelineLayout *pipeline_layout, VkPipeline *pipeline);
+
 ////////////////////////////////////////////////////////////////////////
 // RESOURCES
 ////////////////////////////////////////////////////////////////////////

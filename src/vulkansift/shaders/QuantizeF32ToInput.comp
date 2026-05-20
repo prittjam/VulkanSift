@@ -6,7 +6,7 @@
 // and writes into the SIFT detector's `input_image` (R8_UNORM). Skips the
 // host roundtrip that used to consume 91% of the full-GPU IMAS wallclock.
 //
-// Output dims are constrained by push_const.width/height, which the caller
+// Output dims are constrained by ubo.canvas_w/h, which the caller
 // sets to the actual IMAS-tilted output size (the rotated_image is allocated
 // at max W×H and the IMAS pipeline writes into the top-left out_w × out_h
 // sub-region).
@@ -17,27 +17,27 @@
 //
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(r32f, binding = 0) uniform image2D img_input;
-layout(r8,   binding = 1) uniform image2D img_output;
+layout(set = 0, binding = 0, r32f) uniform image2D img_input;
+layout(set = 0, binding = 1, r8)   uniform image2D img_output;
 
-layout(push_constant) uniform PushConst {
-    uint canvas_w;   // Dispatch dims (= input_image dims / SIFT pyramid input dims)
-    uint canvas_h;
-    uint valid_w;    // Actual sub-region the IMAS pipeline wrote into; rest of
-    uint valid_h;    // canvas is filled with FILL_VALUE (matches host-roundtrip
-                     // path's pad_tilted layout, which had 0x80 outside the
-                     // tilted region).
+layout(set = 1, binding = 0, std140) uniform WarpParamsBlock {
+    float a11, a12, a13;
+    float a21, a22, a23;
     float fill_value;
-} push_const;
+    float fproj_bg_value;
+    uint  W_rot, H_rot, H_sub, canvas_w, canvas_h, valid_w, valid_h, warp_idx;
+    float sigma_aa, t_factor, quantize_fill, gauss_dir_x, gauss_dir_y;
+    float _pad1, _pad2, _pad3;
+} ubo;
 
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
-    if (coords.x >= int(push_const.canvas_w) || coords.y >= int(push_const.canvas_h)) return;
+    if (coords.x >= int(ubo.canvas_w) || coords.y >= int(ubo.canvas_h)) return;
     float v;
-    if (coords.x < int(push_const.valid_w) && coords.y < int(push_const.valid_h)) {
+    if (coords.x < int(ubo.valid_w) && coords.y < int(ubo.valid_h)) {
         v = imageLoad(img_input, coords).r;
     } else {
-        v = push_const.fill_value;
+        v = ubo.quantize_fill;
     }
     // R8_UNORM hardware-converts float in [0, 1] → byte 0..255 on store.
     imageStore(img_output, coords, vec4(clamp(v, 0.0, 1.0), 0.0, 0.0, 1.0));

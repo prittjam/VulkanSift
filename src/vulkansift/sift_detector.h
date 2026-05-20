@@ -2,6 +2,7 @@
 #define VKSIFT_SIFTDETECTOR
 
 #include "sift_memory.h"
+#include "sift_warp_ubo.h"
 #include "vulkansift/vulkansift_types.h"
 
 #include "vkenv/vulkan_device.h"
@@ -42,6 +43,16 @@ typedef struct vksift_SiftDetector_T
   bool debug_marker_supported;
   PFN_vkCmdDebugMarkerBeginEXT vkCmdDebugMarkerBeginEXT;
   PFN_vkCmdDebugMarkerEndEXT vkCmdDebugMarkerEndEXT;
+
+  // Shared WarpParamsUBO descriptor set (set = 1 in AffineWarp.comp and
+  // QuantizeF32ToInput.comp). One layout, one pool, one descriptor set per
+  // pyramid slot — the set's binding 0 points at mem->slots[s].warp_params_ubo.
+  // Phase B-2 only consumes warp_ubo_desc_sets[0]; the rest are wired up so
+  // the parallel-wave dispatcher (Phase C) can bind a different slot's UBO
+  // per submitted command buffer without rewriting descriptors.
+  VkDescriptorSetLayout warp_ubo_desc_set_layout;
+  VkDescriptorPool warp_ubo_desc_pool;
+  VkDescriptorSet warp_ubo_desc_sets[VKSIFT_MAX_PYRAMID_SLOTS];
 
   // Gaussian kernels
   uint32_t *gaussian_kernel_sizes;

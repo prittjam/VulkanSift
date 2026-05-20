@@ -11,18 +11,23 @@
 // In/out same buffer (read row → IIR-filter → write back). Out-of-place not
 // needed — we write c[r, i] after reading the row's previous c values.
 //
-// Push constants:
-//   width  : image width in pixels (length of the IIR loop)
-//   height : image height (used for bounds; thread.x must be < height)
+// Parameters (set=1, binding=0 WarpParamsUBO):
+//   W_rot : image width in pixels (length of the IIR loop)
+//   H_rot : image height (used for bounds; thread.x must be < height)
 //
 
 layout(local_size_x = 64) in;
-layout(r32f, binding = 0) uniform image2D img;
+layout(set = 0, binding = 0, r32f) uniform image2D img;
 
-layout(push_constant) uniform PushConst {
-    uint width;
-    uint height;
-} push_const;
+layout(set = 1, binding = 0, std140) uniform WarpParamsBlock {
+    float a11, a12, a13;
+    float a21, a22, a23;
+    float fill_value;
+    float fproj_bg_value;
+    uint  W_rot, H_rot, H_sub, canvas_w, canvas_h, valid_w, valid_h, warp_idx;
+    float sigma_aa, t_factor, quantize_fill, gauss_dir_x, gauss_dir_y;
+    float _pad1, _pad2, _pad3;
+} ubo;
 
 const float POLE   = -0.26794919;          // √3 - 2
 const float INV_Z  = -3.7320508;            // 1/POLE
@@ -30,8 +35,8 @@ const float LAMBDA = 6.0;                  // (1-z)(1-1/z) = 6 for cubic
 
 void main() {
     uint r = gl_GlobalInvocationID.x;
-    if (r >= push_const.height) return;
-    int W = int(push_const.width);
+    if (r >= ubo.H_rot) return;
+    int W = int(ubo.W_rot);
 
     // 1. Multiply this row by λ (matches splines.cpp:36-37 inside invspline1D)
     for (int i = 0; i < W; ++i) {

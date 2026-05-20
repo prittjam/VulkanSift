@@ -33,38 +33,16 @@ typedef struct
                            // Downsample2x).
 } ExtractKeypointsPushConsts;
 
-// Mirrors AffineWarp.comp's push_constant layout. Order matters:
-// uint, uint, 7×float = 36 bytes total.
-typedef struct
-{
-  uint32_t output_width;
-  uint32_t output_height;
-  float    a11;
-  float    a12;
-  float    a13;
-  float    a21;
-  float    a22;
-  float    a23;
-  float    fill_value;
-} AffineWarpPushConsts;
-
 // Push constants for PreBlur1D.comp: sigma + direction vector (3 × float = 12 B).
+// PreBlur1D stays on push constants in Phase B-2 (plan explicitly leaves it
+// as optional). AffineWarp + QuantizeF32ToInput migrated to the WarpParamsUBO
+// (set = 1, binding = 0) — see sift_warp_ubo.h.
 typedef struct
 {
   float sigma;
   float dir_x;
   float dir_y;
 } PreBlur1DPushConsts;
-
-// Push constants for QuantizeF32ToInput.comp.
-typedef struct
-{
-  uint32_t canvas_w;
-  uint32_t canvas_h;
-  uint32_t valid_w;
-  uint32_t valid_h;
-  float    fill_value;
-} QuantizePushConsts;
 
 // Push constants for Downsample2x.comp: layer indices + dst dims (16 B).
 typedef struct
@@ -340,6 +318,55 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     {
       logError(LOG_TAG, "Failed to allocate PreBlur1D descriptor set");
       return false;
+    }
+  }
+
+  ///////////////////////////////////////////////////
+  // Shared WarpParamsUBO descriptor set (set = 1 in AffineWarp.comp +
+  // QuantizeF32ToInput.comp). One layout, one pool sized for nb_pyramid_slots
+  // sets — each set's binding 0 references mem->slots[s].warp_params_ubo.
+  // Phase B-2 only binds warp_ubo_desc_sets[0]; the slot[1..] descriptors
+  // are wired up for forward-compatibility with the Phase C parallel waves.
+  ///////////////////////////////////////////////////
+  {
+    VkDescriptorSetLayoutBinding ubo_binding = {.binding = 0,
+                                                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                                .descriptorCount = 1,
+                                                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutCreateInfo ubo_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &ubo_binding};
+    if (vkCreateDescriptorSetLayout(detector->dev->device, &ubo_layout_info, NULL,
+                                    &detector->warp_ubo_desc_set_layout) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create WarpParamsUBO descriptor set layout");
+      return false;
+    }
+    uint32_t n_slots = detector->mem->nb_pyramid_slots;
+    if (n_slots == 0u) n_slots = 1u;
+    VkDescriptorPoolSize ubo_pool_size = {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = n_slots};
+    VkDescriptorPoolCreateInfo ubo_pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                                .maxSets = n_slots, .poolSizeCount = 1,
+                                                .pPoolSizes = &ubo_pool_size};
+    if (vkCreateDescriptorPool(detector->dev->device, &ubo_pool_info, NULL,
+                               &detector->warp_ubo_desc_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create WarpParamsUBO descriptor pool");
+      return false;
+    }
+    for (uint32_t s = 0u; s < n_slots; ++s)
+    {
+      VkDescriptorSetAllocateInfo ubo_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                    .descriptorPool = detector->warp_ubo_desc_pool,
+                                                    .descriptorSetCount = 1,
+                                                    .pSetLayouts = &detector->warp_ubo_desc_set_layout};
+      if (vkAllocateDescriptorSets(detector->dev->device, &ubo_alloc_info,
+                                   &detector->warp_ubo_desc_sets[s]) != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "Failed to allocate WarpParamsUBO descriptor set %u", s);
+        return false;
+      }
     }
   }
 
@@ -903,8 +930,11 @@ static bool setupComputePipelines(vksift_SiftDetector detector)
       logError(LOG_TAG, "Failed to create AffineWarp shader module");
       return false;
     }
-    if (!vkenv_createComputePipeline(detector->dev->device, aw_shader_module, detector->affinewarp_desc_set_layout, sizeof(AffineWarpPushConsts),
-                                     &detector->affinewarp_pipeline_layout, &detector->affinewarp_pipeline))
+    if (!vkenv_createComputePipeline2(detector->dev->device, aw_shader_module,
+                                      detector->affinewarp_desc_set_layout,
+                                      detector->warp_ubo_desc_set_layout,
+                                      0u,
+                                      &detector->affinewarp_pipeline_layout, &detector->affinewarp_pipeline))
     {
       logError(LOG_TAG, "Failed to create AffineWarp pipeline");
       vkDestroyShaderModule(detector->dev->device, aw_shader_module, NULL);
@@ -988,8 +1018,11 @@ static bool setupComputePipelines(vksift_SiftDetector detector)
       logError(LOG_TAG, "Failed to create QuantizeF32ToInput shader module");
       return false;
     }
-    if (!vkenv_createComputePipeline(detector->dev->device, q_shader_module, detector->quantize_desc_set_layout, sizeof(QuantizePushConsts),
-                                     &detector->quantize_pipeline_layout, &detector->quantize_pipeline))
+    if (!vkenv_createComputePipeline2(detector->dev->device, q_shader_module,
+                                      detector->quantize_desc_set_layout,
+                                      detector->warp_ubo_desc_set_layout,
+                                      0u,
+                                      &detector->quantize_pipeline_layout, &detector->quantize_pipeline))
     {
       logError(LOG_TAG, "Failed to create QuantizeF32ToInput pipeline");
       vkDestroyShaderModule(detector->dev->device, q_shader_module, NULL);
@@ -1151,6 +1184,27 @@ static bool setupSyncObjects(vksift_SiftDetector detector)
 
 static bool writeDescriptorSets(vksift_SiftDetector detector)
 {
+  /////////////////////////////////////////////////////
+  // Write bindings for the per-slot WarpParamsUBO descriptor sets
+  // (set = 1 in AffineWarp.comp + QuantizeF32ToInput.comp). Each set's
+  // binding 0 points at mem->slots[s].warp_params_ubo.
+  {
+    uint32_t n_slots = detector->mem->nb_pyramid_slots;
+    if (n_slots == 0u) n_slots = 1u;
+    for (uint32_t s = 0u; s < n_slots; ++s)
+    {
+      VkDescriptorBufferInfo bi = {.buffer = detector->mem->slots[s].warp_params_ubo,
+                                   .offset = 0, .range = VK_WHOLE_SIZE};
+      VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                .dstSet = detector->warp_ubo_desc_sets[s],
+                                .dstBinding = 0, .dstArrayElement = 0,
+                                .descriptorCount = 1,
+                                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                .pBufferInfo = &bi};
+      vkUpdateDescriptorSets(detector->dev->device, 1, &w, 0, NULL);
+    }
+  }
+
   /////////////////////////////////////////////////////
   // Write bindings for PreBlur1D pipeline (ASIFT σ_aa pre-blur)
   // Binds (sampler input_image_view) and (storage blurred_input_image_view).
@@ -1714,17 +1768,14 @@ static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBu
   // Dispatch covers the FULL input_image canvas (curr_input_image_*); regions
   // outside the IMAS-written sub-rectangle (quantize_valid_*) are filled with
   // quantize_fill_value to match the host-roundtrip path's pad_tilted layout.
-  QuantizePushConsts qpc = {
-      .canvas_w   = detector->mem->curr_input_image_width,
-      .canvas_h   = detector->mem->curr_input_image_height,
-      .valid_w    = detector->quantize_valid_w,
-      .valid_h    = detector->quantize_valid_h,
-      .fill_value = detector->quantize_fill_value};
+  // After Phase B-2, all these fields live in the WarpParamsUBO at set = 1,
+  // which the host populates in dispatchDetectionCmdBuffer before submitting
+  // this pre-recorded command buffer.
   vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline);
   vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
                           0, 1, &detector->quantize_desc_set, 0, NULL);
-  vkCmdPushConstants(cmdbuf, detector->quantize_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                     0, sizeof(qpc), &qpc);
+  vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
+                          1, 1, &detector->warp_ubo_desc_sets[0], 0, NULL);
   vkCmdDispatch(cmdbuf,
       (uint32_t)ceilf((float)detector->mem->curr_input_image_width / 8.f),
       (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
@@ -1802,15 +1853,11 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
     vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->affinewarp_pipeline);
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->affinewarp_pipeline_layout,
                             0, 1, &detector->affinewarp_desc_set, 0, NULL);
-    AffineWarpPushConsts aw_pc = {
-        .output_width  = detector->mem->curr_input_image_width,
-        .output_height = detector->mem->curr_input_image_height,
-        .a11 = detector->pending_warp_a11, .a12 = detector->pending_warp_a12, .a13 = detector->pending_warp_a13,
-        .a21 = detector->pending_warp_a21, .a22 = detector->pending_warp_a22, .a23 = detector->pending_warp_a23,
-        .fill_value = detector->pending_warp_fill,
-    };
-    vkCmdPushConstants(cmdbuf, detector->affinewarp_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(AffineWarpPushConsts), &aw_pc);
+    // set = 1: WarpParamsUBO for slot 0. Phase B-2 reads pending_warp_* +
+    // curr_input_image_* from the UBO that the host populated in
+    // dispatchDetectionCmdBuffer below before this command buffer ran.
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->affinewarp_pipeline_layout,
+                            1, 1, &detector->warp_ubo_desc_sets[0], 0, NULL);
     vkCmdDispatch(cmdbuf,
                   (uint32_t)ceilf((float)detector->mem->curr_input_image_width  / 8.f),
                   (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
@@ -2458,15 +2505,57 @@ static bool dispatchDetectionCmdBuffer(vksift_SiftDetector detector,
                                        VkCommandBuffer *cmd_buffer_to_submit)
 {
   // We need to setup the descriptor sets and command buffers if the input resolution, target buffer,
-  // or pending AffineWarp matrix changed.
+  // or pending PreBlur changed. (PreBlur1D still uses push constants so the
+  // cmd buffer needs re-record when the σ changes. AffineWarp + Quantize no
+  // longer require re-record since their params come from the WarpParamsUBO.)
   if (memory_layout_updated || detector->curr_buffer_idx != target_buffer_idx ||
-      detector->pending_warp_dirty || detector->pending_blur_dirty)
+      detector->pending_blur_dirty)
   {
     detector->curr_buffer_idx = target_buffer_idx;
     writeDescriptorSets(detector);
     recordCommandBuffers(detector);
-    detector->pending_warp_dirty = false;
     detector->pending_blur_dirty = false;
+  }
+  // pending_warp_dirty is no longer a re-record trigger — the affine matrix
+  // is read from the UBO every dispatch. Clear it for callers tracking it.
+  detector->pending_warp_dirty = false;
+
+  // Populate the per-slot WarpParamsUBO (slot 0 in Phase B-2) with the
+  // values the pre-recorded command buffer's AffineWarp + Quantize dispatches
+  // will read. HOST_COHERENT memory was used at allocation time so the write
+  // is immediately visible when the GPU executes the cmd buffer.
+  {
+    WarpParamsUBO ubo_data = {0};
+    ubo_data.a11 = detector->pending_warp_a11;
+    ubo_data.a12 = detector->pending_warp_a12;
+    ubo_data.a13 = detector->pending_warp_a13;
+    ubo_data.a21 = detector->pending_warp_a21;
+    ubo_data.a22 = detector->pending_warp_a22;
+    ubo_data.a23 = detector->pending_warp_a23;
+    ubo_data.fill_value    = detector->pending_warp_fill;
+    // Detector never invokes Fproj{Cubic,Bilinear}Y — IMAS pipeline owns those.
+    // Populate fproj_bg_value defensively so the slot's UBO stays consistent
+    // if a downstream consumer ever reads it.
+    ubo_data.fproj_bg_value = 0.0f;
+    // AffineWarp output dims (= input_image dims on detect path).
+    ubo_data.W_rot         = detector->mem->curr_input_image_width;
+    ubo_data.H_rot         = detector->mem->curr_input_image_height;
+    ubo_data.H_sub         = detector->mem->curr_input_image_height;
+    // Quantize fields.
+    ubo_data.canvas_w      = detector->mem->curr_input_image_width;
+    ubo_data.canvas_h      = detector->mem->curr_input_image_height;
+    ubo_data.valid_w       = detector->quantize_valid_w;
+    ubo_data.valid_h       = detector->quantize_valid_h;
+    ubo_data.warp_idx      = 0u;
+    ubo_data.quantize_fill = detector->quantize_fill_value;
+    // sigma_aa / t_factor / gauss_dir_* aren't read by the detector's
+    // AffineWarp + Quantize shaders, but populate them defensively so the
+    // UBO is in a consistent state.
+    ubo_data.sigma_aa      = 0.0f;
+    ubo_data.t_factor      = 1.0f;
+    ubo_data.gauss_dir_x   = 0.0f;
+    ubo_data.gauss_dir_y   = 1.0f;
+    memcpy(detector->mem->slots[0].warp_params_ubo_ptr, &ubo_data, sizeof(WarpParamsUBO));
   }
 
   // Mark the detection pipeline as busy/GPU locked
@@ -2611,6 +2700,11 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   VK_NULL_SAFE_DELETE(detector->affinewarp_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->affinewarp_desc_pool, NULL));
   VK_NULL_SAFE_DELETE(detector->affinewarp_desc_set_layout,
                       vkDestroyDescriptorSetLayout(detector->dev->device, detector->affinewarp_desc_set_layout, NULL));
+  // Shared WarpParamsUBO descriptor pool + layout
+  VK_NULL_SAFE_DELETE(detector->warp_ubo_desc_pool,
+                      vkDestroyDescriptorPool(detector->dev->device, detector->warp_ubo_desc_pool, NULL));
+  VK_NULL_SAFE_DELETE(detector->warp_ubo_desc_set_layout,
+                      vkDestroyDescriptorSetLayout(detector->dev->device, detector->warp_ubo_desc_set_layout, NULL));
   // Gaussian blur
   VK_NULL_SAFE_DELETE(detector->blur_pipeline, vkDestroyPipeline(detector->dev->device, detector->blur_pipeline, NULL));
   VK_NULL_SAFE_DELETE(detector->blur_pipeline_layout, vkDestroyPipelineLayout(detector->dev->device, detector->blur_pipeline_layout, NULL));

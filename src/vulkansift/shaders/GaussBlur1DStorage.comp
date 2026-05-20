@@ -11,32 +11,34 @@
 // supports only axis-aligned blur direction (assumed integer-offset
 // along dir), and replicates pixels at the boundary by clamping coords.
 //
-// Push constants (16 B):
-//   sigma : Gaussian std
-//   dir_x : 0 or 1 (axis-aligned)
-//   dir_y : 0 or 1
-//   in_w  : valid width
-//   in_h  : valid height
+// Parameters (set=1, binding=0 WarpParamsUBO):
+//   sigma_aa    : Gaussian std (= 0.8 * sqrt(t² - 1); 0 at identity tilt)
+//   gauss_dir_x : 0 or 1 (axis-aligned)
+//   gauss_dir_y : 0 or 1
+//   W_rot       : valid width
+//   H_rot       : valid height
 //
 
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(r32f, binding = 0) uniform image2D img_in;
-layout(r32f, binding = 1) uniform image2D img_out;
+layout(set = 0, binding = 0, r32f) uniform image2D img_in;
+layout(set = 0, binding = 1, r32f) uniform image2D img_out;
 
-layout(push_constant) uniform PushConst {
-    float sigma;
-    float dir_x;
-    float dir_y;
-    uint  in_w;
-    uint  in_h;
-} push_const;
+layout(set = 1, binding = 0, std140) uniform WarpParamsBlock {
+    float a11, a12, a13;
+    float a21, a22, a23;
+    float fill_value;
+    float fproj_bg_value;
+    uint  W_rot, H_rot, H_sub, canvas_w, canvas_h, valid_w, valid_h, warp_idx;
+    float sigma_aa, t_factor, quantize_fill, gauss_dir_x, gauss_dir_y;
+    float _pad1, _pad2, _pad3;
+} ubo;
 
 const float GAUSS_TRUNCATE = 4.0;
 const int   MAX_TAPS       = 33;
 
 float fetch_clamped(int x, int y) {
-    int W = int(push_const.in_w);
-    int H = int(push_const.in_h);
+    int W = int(ubo.W_rot);
+    int H = int(ubo.H_rot);
     int xc = clamp(x, 0, W - 1);
     int yc = clamp(y, 0, H - 1);
     return imageLoad(img_in, ivec2(xc, yc)).r;
@@ -45,17 +47,17 @@ float fetch_clamped(int x, int y) {
 void main() {
     int x = int(gl_GlobalInvocationID.x);
     int y = int(gl_GlobalInvocationID.y);
-    if (x >= int(push_const.in_w) || y >= int(push_const.in_h)) return;
+    if (x >= int(ubo.W_rot) || y >= int(ubo.H_rot)) return;
 
-    float sigma = push_const.sigma;
+    float sigma = ubo.sigma_aa;
     if (sigma < 0.1) {
         // Pass-through (σ_aa = 0 at identity tilt)
         imageStore(img_out, ivec2(x, y), vec4(fetch_clamped(x, y), 0.0, 0.0, 1.0));
         return;
     }
 
-    int dx = int(push_const.dir_x);  // 0 or 1
-    int dy = int(push_const.dir_y);
+    int dx = int(ubo.gauss_dir_x);  // 0 or 1
+    int dy = int(ubo.gauss_dir_y);
     int half_taps = int(ceil(GAUSS_TRUNCATE * sigma));
     if (half_taps > (MAX_TAPS - 1) / 2) half_taps = (MAX_TAPS - 1) / 2;
 

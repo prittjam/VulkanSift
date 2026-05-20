@@ -214,6 +214,59 @@ bool vkenv_createComputePipeline(VkDevice device, VkShaderModule shader_module, 
   return true;
 }
 
+bool vkenv_createComputePipeline2(VkDevice device, VkShaderModule shader_module,
+                                  VkDescriptorSetLayout descriptor_set_layout_0,
+                                  VkDescriptorSetLayout descriptor_set_layout_1,
+                                  uint32_t push_constant_size,
+                                  VkPipelineLayout *pipeline_layout, VkPipeline *pipeline)
+{
+  VkPipelineShaderStageCreateInfo pipeline_shader_stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                           .pNext = NULL,
+                                                           .flags = 0,
+                                                           .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                           .module = shader_module,
+                                                           .pName = "main",
+                                                           .pSpecializationInfo = NULL};
+
+  VkDescriptorSetLayout set_layouts[2] = {descriptor_set_layout_0, descriptor_set_layout_1};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                                     .pNext = NULL,
+                                                     .flags = 0,
+                                                     .setLayoutCount = 2,
+                                                     .pSetLayouts = set_layouts,
+                                                     .pushConstantRangeCount = 0,
+                                                     .pPushConstantRanges = NULL};
+  VkPushConstantRange push_constant_range;
+  if (push_constant_size > 0)
+  {
+    push_constant_range = (VkPushConstantRange){.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0u, .size = push_constant_size};
+    pipeline_layout_info.pushConstantRangeCount = 1;
+    pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  }
+
+  VkResult vkres = vkCreatePipelineLayout(device, &pipeline_layout_info, NULL, pipeline_layout);
+  if (vkres != VK_SUCCESS)
+  {
+    logError(LOG_TAG, "Pipeline layout creation failed (vkCreatePipelineLayout: %s)", vkenv_getVkResultString(vkres));
+    return false;
+  }
+
+  VkComputePipelineCreateInfo pipeline_info = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                               .pNext = NULL,
+                                               .flags = 0,
+                                               .stage = pipeline_shader_stage,
+                                               .layout = *pipeline_layout,
+                                               .basePipelineHandle = VK_NULL_HANDLE,
+                                               .basePipelineIndex = -1};
+  vkres = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, pipeline);
+  if (vkres != VK_SUCCESS)
+  {
+    logError(LOG_TAG, "Compute pipeline creation failed (vkCreateComputePipelines: %s)", vkenv_getVkResultString(vkres));
+    return false;
+  }
+  return true;
+}
+
 ////////////////////////////////////////////////////////////////////////
 // RESOURCES
 ////////////////////////////////////////////////////////////////////////

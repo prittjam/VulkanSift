@@ -1,0 +1,64 @@
+#ifndef VKSIFT_WARP_UBO_H
+#define VKSIFT_WARP_UBO_H
+//
+// WarpParamsUBO — host↔GLSL contract for the IMAS+detect parallel-pyramid
+// pipeline. Single uniform buffer, bound at descriptor set 1, binding 0 in
+// every IMAS-chain shader (AffineWarp, GaussBlur1DStorage, FinvsplineRow,
+// FinvsplineCol, FprojCubicY, FprojBilinearY, QuantizeF32ToInput) plus the
+// detector's on-IMAS path (AffineWarp + Quantize).
+//
+// All scalars pack tightly at 4-byte alignment in std140 (no implicit
+// padding inside a flat block of scalars — std140 alignment only kicks in
+// for vec3/vec4/struct members). The fields below are organized in 16-byte
+// rows for readability; the explicit _padN floats keep the C and GLSL
+// layouts in sync if the compiler ever inserts implicit padding.
+//
+// Phase B-2 consumer: a single UBO write per command-buffer recording is
+// reused by all 5 IMAS shaders for one warp. Future phases will reuse the
+// same struct for the GPU back-projection shader (warp_idx slot).
+//
+
+#include <stdint.h>
+
+typedef struct
+{
+  // [bytes  0..31] — AffineWarp inverse matrix + OOB fills (32 B)
+  float a11, a12, a13;
+  float a21, a22, a23;
+  // AffineWarp OOB sample fill. IMAS path: 0.5 (matches imas_cpu.jl FROT_FILL).
+  // Detector AffineWarp path: detector->pending_warp_fill (caller-settable).
+  float fill_value;
+  // Fproj{Cubic,Bilinear}Y OOB fill — separate from AffineWarp fill because
+  // IMAS pushes 0.5 to AffineWarp and 0.0 to Fproj. Unifying them broke
+  // bit-exact output at boundary taps. Default in Phase B: 0.0 for Fproj.
+  float fproj_bg_value;
+
+  // [bytes 32..63] — dimension fields (32 B)
+  // W_rot / H_rot semantics by shader:
+  //   AffineWarp.comp   : (output_width, output_height) of the rotated canvas
+  //   GaussBlur1D.comp  : (in_w, in_h) of the storage image being blurred
+  //   Finvspline{Row,Col}.comp : (width, height) of the IIR domain
+  //   FprojCubicY.comp / FprojBilinearY.comp : (input_width, input_height) =
+  //       (W_rot, H_rot) — and the output dims are (W_rot, H_sub).
+  // canvas_w/h, valid_w/h, warp_idx are for QuantizeF32ToInput / back-project.
+  uint32_t W_rot;
+  uint32_t H_rot;
+  uint32_t H_sub;     // FprojCubicY output_height = floor(H_rot / t_factor)
+  uint32_t canvas_w;  // QuantizeF32ToInput canvas (= curr_input_image_width)
+  uint32_t canvas_h;  // QuantizeF32ToInput canvas (= curr_input_image_height)
+  uint32_t valid_w;   // QuantizeF32ToInput valid sub-region (= W_rot)
+  uint32_t valid_h;   // QuantizeF32ToInput valid sub-region (= H_sub)
+  uint32_t warp_idx;  // Tag stamped onto back-projected features (Phase D)
+
+  // [bytes 64..95] — float scalars (32 B)
+  float sigma_aa;       // = 0.8 * sqrt(t^2 - 1); 0 at identity tilt
+  float t_factor;       // Tilt factor used by Fproj{Cubic,Bilinear}Y
+  float quantize_fill;  // Value to fill outside the IMAS-written sub-region
+  float gauss_dir_x;    // GaussBlur1D direction X component (0 or 1)
+  float gauss_dir_y;    // GaussBlur1D direction Y component (0 or 1)
+  float _pad1;
+  float _pad2;
+  float _pad3;
+} WarpParamsUBO;
+
+#endif // VKSIFT_WARP_UBO_H
