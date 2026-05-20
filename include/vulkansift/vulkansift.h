@@ -119,6 +119,32 @@ extern "C"
                                                     uint32_t canvas_w, uint32_t canvas_h,
                                                     uint32_t gpu_buffer_id);
 
+  // Phase C-3: parallel-pyramid IMAS+detect dispatch. Lazily creates the IMAS
+  // pipeline on first call (same as vksift_detectFeaturesFusedImas) and
+  // dispatches the supplied warp schedule across nb_pyramid_slots in waves.
+  //
+  // Per wave: each slot s in [0..wave) gets its WarpParamsUBO + dispatch buffer
+  // filled for warps[base+s], then all wave fused command buffers are submitted
+  // in a single vkQueueSubmit (batch). The host waits one fence per wave;
+  // after the wait, slot s's feature count is copied into
+  // out_features_per_warp[base+s] and slot s's sift_buffer_arr[s] holds the
+  // features for that warp. Callers should download features immediately after
+  // each wave because the next wave overwrites the slot's SIFT buffer.
+  //
+  // (canvas_w, canvas_h) must be stable across all warps in a single call.
+  // out_features_per_warp must be sized at least n_warps.
+  typedef struct {
+    float t_factor;
+    float theta_rad;
+  } vksift_WarpSpec;
+
+  VKSIFT_EXPORT void vksift_dispatchParallelIMAS(
+      vksift_Instance instance,
+      uint32_t W, uint32_t H,
+      const vksift_WarpSpec *warps, uint32_t n_warps,
+      uint32_t canvas_w, uint32_t canvas_h,
+      uint32_t *out_features_per_warp);
+
   // For each SIFT feature in the buffer A, find the 2-nearest neighbors in the buffer B, store feature index and descriptors L2 distance
   // for the two neighbors.
   VKSIFT_EXPORT void vksift_matchFeatures(vksift_Instance instance, const uint32_t gpu_buffer_id_A, const uint32_t gpu_buffer_id_B);

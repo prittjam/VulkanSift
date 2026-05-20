@@ -248,6 +248,28 @@ bool vksift_dispatchFusedImasWarpForSlot(vksift_SiftDetector detector,
                                          uint32_t canvas_w, uint32_t canvas_h,
                                          bool memory_layout_updated);
 
+// Phase C-3 helper: fill slot's WarpParamsUBO + SlotDispatchBuffer with the
+// per-warp host-side params. No GPU submission; the caller is responsible for
+// submitting (or batch-submitting) the slot's fused_imas_detect_command_buffer
+// afterwards. warp_idx is the IMAS schedule index stamped into the UBO's
+// warp_idx field (read by the back-projection shader in Phase D); for the
+// serial entry point it's currently set to slot_idx.
+void vksift_fillFusedWarpState(vksift_SiftDetector detector,
+                               uint32_t slot_idx, uint32_t warp_idx,
+                               uint32_t W, uint32_t H,
+                               float t_factor, float theta_rad,
+                               uint32_t canvas_w, uint32_t canvas_h);
+
+// Phase C-3 helper: ensure the detector's command buffers (including the
+// per-slot fused IMAS+detect ones) are recorded for the supplied
+// target_buffer_idx and the current memory layout. Mirrors the gating logic
+// from dispatchDetectionCmdBuffer / vksift_dispatchFusedImasWarpForSlot so the
+// parallel-wave dispatcher can re-record once per wave when needed (memory
+// layout changed, target_buffer_idx changed, blur dirty, etc.).
+bool vksift_ensureDetectorCmdBuffersRecorded(vksift_SiftDetector detector,
+                                             uint32_t target_buffer_idx,
+                                             bool memory_layout_updated);
+
 // Set the affine matrix that will be pushed to AffineWarp.comp on the next
 // detect dispatch. Marks the command buffer for re-record. Matrix layout:
 //   a_ij are entries of the 2x3 inverse affine A_inv mapping warped pixel

@@ -245,6 +245,13 @@ bool vksift_createSiftMemory(vkenv_Device device, vksift_SiftMemory *memory_ptr,
 bool vksift_prepareSiftMemoryForDetection(vksift_SiftMemory memory, const uint8_t *image_data, const uint32_t input_width, const uint32_t input_height,
                                           const uint32_t target_buffer_idx, bool *memory_layout_updated);
 
+// Phase C-3: bring sift_buffers_info[buffer_idx] (octave section offsets,
+// max-feature counts, is_packed flag) up to date with the current pyramid
+// resolution. Called by vksift_dispatchParallelIMAS for every slot ≥ 1 since
+// vksift_prepareSiftMemoryForDetection only refreshes the explicitly-targeted
+// buffer. Returns true if the buffer info was actually changed.
+bool vksift_Memory_refreshBufferInfo(vksift_SiftMemory memory, uint32_t buffer_idx);
+
 // Update the buffer structure to a packed format with a 2-uint32 header (containing the number of features) and all the features aligned
 // after this header (requirement for the matching pipeline)
 bool vksift_prepareSiftMemoryForMatching(vksift_SiftMemory memory, const uint32_t target_buffer_A_idx, const uint32_t target_buffer_B_idx);

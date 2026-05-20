@@ -30,7 +30,9 @@ typedef struct {
 } vksift_jl_feature;
 
 // Initialize VulkanSift with detection-only, 2D NMS configuration.
-// Returns NULL on failure.
+// Returns NULL on failure. Defaults to nb_pyramid_slots=1 (single-slot
+// semantics). Use vksift_jl_init_ex to request a higher slot count for the
+// Phase C-3 parallel IMAS dispatch.
 vksift_jl_handle vksift_jl_init(
     uint32_t max_width, uint32_t max_height,
     float intensity_threshold, float edge_threshold,
@@ -38,6 +40,19 @@ vksift_jl_handle vksift_jl_init(
     uint8_t nb_scales_per_octave, uint8_t nb_octaves,
     int use_upsampling, int use_2d_nms,
     int use_rgba_input, int use_rgb_input);
+
+// Phase C-3: extended init with nb_pyramid_slots. Identical to vksift_jl_init
+// except the caller can request a pyramid-slot count > 1 for the parallel
+// IMAS path. nb_pyramid_slots is clamped to VKSIFT_MAX_PYRAMID_SLOTS (= 8).
+// Pass 1 for the legacy single-slot behavior.
+vksift_jl_handle vksift_jl_init_ex(
+    uint32_t max_width, uint32_t max_height,
+    float intensity_threshold, float edge_threshold,
+    float seed_scale_sigma, float input_blur_level,
+    uint8_t nb_scales_per_octave, uint8_t nb_octaves,
+    int use_upsampling, int use_2d_nms,
+    int use_rgba_input, int use_rgb_input,
+    uint32_t nb_pyramid_slots);
 
 // Set the pending AffineWarp matrix used by the NEXT detect call.
 // 2x3 inverse affine mapping warped pixel → input pixel:
@@ -141,6 +156,34 @@ uint32_t vksift_jl_detect_fused_imas(vksift_jl_handle h,
                                      uint32_t W, uint32_t H,
                                      float t_factor, float theta_rad,
                                      uint32_t canvas_w, uint32_t canvas_h);
+
+// Phase C-3: parallel-pyramid IMAS+detect dispatch. Submits n_warps warps in
+// waves of size min(nb_pyramid_slots, remaining). After EACH wave (and
+// BEFORE the next wave overwrites sift_buffer_arr[s]), the FFI downloads the
+// wave's features into a caller-invisible host-side cache keyed by warp_idx.
+// This makes the per-warp data safe to read until the next call to
+// vksift_jl_dispatch_parallel_imas (or vksift_jl_destroy).
+//
+// Caller must have uploaded the original (untilted) image via
+// vksift_jl_detect() first to populate cached_input_image.
+//
+// out_features_per_warp must be sized at least n_warps. On return, it holds
+// the number of features detected for each warp.
+void vksift_jl_dispatch_parallel_imas(
+    vksift_jl_handle h,
+    uint32_t W, uint32_t H,
+    const float *t_factors, const float *theta_rads, uint32_t n_warps,
+    uint32_t canvas_w, uint32_t canvas_h,
+    uint32_t *out_features_per_warp);
+
+// Phase C-3: read features for warp `warp_idx` from the most recent
+// vksift_jl_dispatch_parallel_imas call. The caller must allocate `out` with
+// at least `n` entries, where n ≤ out_features_per_warp[warp_idx]. Features
+// come from the FFI's host-side cache; safe to call any number of times until
+// the next dispatch_parallel_imas / destroy.
+void vksift_jl_get_features_for_warp(
+    vksift_jl_handle h, uint32_t warp_idx,
+    vksift_jl_feature *out, uint32_t n);
 
 #ifdef __cplusplus
 }

@@ -859,3 +859,187 @@ void vksift_detectFeaturesFusedImas(vksift_Instance instance,
     instance->error_cb_func(VKSIFT_VULKAN_ERROR);
   }
 }
+
+// =============================================================================
+// Phase C-3: parallel-pyramid IMAS+detect dispatch. Submits warps in waves of
+// up to nb_pyramid_slots fused command buffers per vkQueueSubmit. Each slot
+// writes its features to sift_buffer_arr[slot] (guaranteed independent by
+// C-2's sift_buffer_count bump). Host waits one fence per wave, then reads
+// per-wave feature counts.
+//
+// CAVEAT: after a wave finishes, slot s's SIFT buffer holds features for that
+// wave's warp s; the NEXT wave overwrites it. Callers that need to keep
+// features from multiple waves must download per-wave outside of this entry
+// point (the JL FFI does exactly that by chunking the call into one wave per
+// invocation). When n_warps ≤ nb_pyramid_slots this is a single wave and the
+// caller can safely call vksift_downloadFeatures(instance, ..., slot_idx)
+// after this returns.
+// =============================================================================
+void vksift_dispatchParallelIMAS(vksift_Instance instance,
+                                 uint32_t W, uint32_t H,
+                                 const vksift_WarpSpec *warps, uint32_t n_warps,
+                                 uint32_t canvas_w, uint32_t canvas_h,
+                                 uint32_t *out_features_per_warp)
+{
+  if (instance == NULL || warps == NULL || n_warps == 0u ||
+      out_features_per_warp == NULL ||
+      !isInputResolutionValid(instance, canvas_w, canvas_h))
+  {
+    logError(LOG_TAG, "vksift_dispatchParallelIMAS() error: invalid input.");
+    if (instance != NULL) instance->error_cb_func(VKSIFT_INVALID_INPUT_ERROR);
+    return;
+  }
+
+  vksift_SiftDetector detector = instance->sift_detector;
+  vksift_SiftMemory   memory   = instance->sift_memory;
+  VkDevice            device   = instance->vulkan_device->device;
+  const uint32_t      n_slots  = memory->nb_pyramid_slots;
+
+  // Wait on the prior detect/match fences so any previous dispatch (single-
+  // warp or wave) has fully retired before we reuse end_of_detection_fence.
+  VkFence prior_fences[2] = {detector->end_of_detection_fence,
+                             instance->sift_matcher->end_of_matching_fence};
+  vkWaitForFences(device, 2, prior_fences, VK_TRUE, UINT64_MAX);
+
+  // Lazy-create the IMAS pipeline on first call (same pattern as
+  // vksift_detectFeaturesFusedImas). The fused cmd buffer recording needs
+  // imas_pipeline_ref wired up before recordCommandBuffers runs.
+  bool imas_just_created = false;
+  if (instance->imas_pipeline == NULL)
+  {
+    instance->imas_pipeline = vksift_createImasPipeline(
+        instance->vulkan_device, instance->sift_memory, detector->image_sampler);
+    if (instance->imas_pipeline == NULL)
+    {
+      logError(LOG_TAG, "vksift_dispatchParallelIMAS() error: failed to create IMAS pipeline");
+      instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+      return;
+    }
+    detector->imas_pipeline_ref =
+        (struct vksift_ImasPipeline_T *)instance->imas_pipeline;
+    imas_just_created = true;
+  }
+
+  // Prepare the SIFT memory for the stable canvas once — every warp in the
+  // schedule shares this canvas (parallel-pyramid plan §9.2). Slot 0's
+  // gpu_buffer_id is passed; the canvas / pyramid is shared across slots.
+  bool memory_layout_updated = false;
+  if (!vksift_prepareSiftMemoryForDetection(memory, NULL, canvas_w, canvas_h,
+                                            0u, &memory_layout_updated))
+  {
+    logError(LOG_TAG, "vksift_dispatchParallelIMAS() error: failed to prepare SIFT memory");
+    instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+    return;
+  }
+
+  // prepareSiftMemoryForDetection only refreshes buffer-section info for
+  // target_buffer_idx=0. The parallel path also writes into sift_buffer_arr[s]
+  // for s in [1..n_slots), so make sure each slot's buffer info matches the
+  // current canvas resolution before writeDescriptorSets binds the per-octave
+  // offsets. Triggers on first parallel dispatch (when slots 1+ still have
+  // their init-time square-canvas offsets) and after a memory-layout change.
+  for (uint32_t s = 1u; s < n_slots; ++s)
+  {
+    if (vksift_Memory_refreshBufferInfo(memory, s))
+    {
+      memory_layout_updated = true;
+    }
+  }
+
+  // If the pyramid was resized or the IMAS pipeline just came up, rewire all
+  // slots' IMAS-pipeline descriptor sets. Without this the IMAS shader bindings
+  // would reference dead image views from before the resize.
+  if (memory_layout_updated || imas_just_created)
+  {
+    vksift_imasRefreshDescriptorSets(instance->imas_pipeline);
+  }
+
+  // TODO(phase-c-async): async-transfer's slot-0-aliased ownership cmd buffers
+  // are wrong for parallel waves (acquire/release_buffer_ownership_command_buffer
+  // are recorded against slot 0 only — see recordCommandBuffers). For now,
+  // refuse to use the async path even if the device exposes it. Mirror the
+  // non-async branch of dispatchDetectionCmdBuffer below.
+  if (detector->dev->async_transfer_available)
+  {
+    logWarning(LOG_TAG,
+        "vksift_dispatchParallelIMAS: async-transfer available but unsupported on "
+        "the parallel path; falling back to single-queue submission for this call.");
+  }
+
+  // Force a re-record on the very first wave after IMAS-pipeline lazy init or
+  // a memory-layout change. Subsequent waves reuse the existing recording.
+  bool need_record = imas_just_created || memory_layout_updated;
+  if (!vksift_ensureDetectorCmdBuffersRecorded(detector, 0u, need_record))
+  {
+    logError(LOG_TAG, "vksift_dispatchParallelIMAS() error: failed to (re)record command buffers");
+    instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+    return;
+  }
+
+  // Mark every slot's sift buffer as not-packed; the detection pipeline writes
+  // raw counts into sift_count_staging, so the cached nb_stored_feats from a
+  // prior pack (e.g. a matcher run) would shadow the new counts otherwise.
+  // prepareSiftMemoryForDetection only flips is_packed for target_buffer_idx,
+  // which we always pass as 0u above — handle the rest here.
+  for (uint32_t s = 1u; s < n_slots; ++s)
+  {
+    memory->sift_buffers_info[s].is_packed = false;
+  }
+
+  // Process warps in waves of min(n_slots, remaining). One vkQueueSubmit per
+  // wave (single batched VkSubmitInfo array), one fence per wave. Reuses the
+  // detector's end_of_detection_fence between waves — safe because we wait
+  // before each reset.
+  VkSubmitInfo submits[VKSIFT_MAX_PYRAMID_SLOTS];
+  for (uint32_t base = 0u; base < n_warps; base += n_slots)
+  {
+    uint32_t remaining = n_warps - base;
+    uint32_t wave = (remaining < n_slots) ? remaining : n_slots;
+
+    // (a) Fill each slot's per-warp UBO + dispatch buffer.
+    for (uint32_t s = 0u; s < wave; ++s)
+    {
+      vksift_fillFusedWarpState(detector, s, base + s, W, H,
+                                warps[base + s].t_factor, warps[base + s].theta_rad,
+                                canvas_w, canvas_h);
+    }
+
+    // (b) Build wave VkSubmitInfo entries — one per slot's fused cmd buffer.
+    for (uint32_t s = 0u; s < wave; ++s)
+    {
+      submits[s] = (VkSubmitInfo){
+          .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+          .pNext = NULL,
+          .waitSemaphoreCount = 0,
+          .pWaitSemaphores = NULL,
+          .pWaitDstStageMask = NULL,
+          .commandBufferCount = 1,
+          .pCommandBuffers = &detector->fused_imas_detect_command_buffer[s],
+          .signalSemaphoreCount = 0,
+          .pSignalSemaphores = NULL};
+    }
+    vkResetFences(device, 1, &detector->end_of_detection_fence);
+    if (vkQueueSubmit(detector->general_queue, wave, submits,
+                      detector->end_of_detection_fence) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "vksift_dispatchParallelIMAS() error: vkQueueSubmit failed for wave starting at warp %u", base);
+      instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+      return;
+    }
+    vkWaitForFences(device, 1, &detector->end_of_detection_fence, VK_TRUE, UINT64_MAX);
+
+    // (c) Read per-slot feature counts from sift_count_staging_buffer. These
+    // remain valid until the next wave on the same slot dispatches.
+    for (uint32_t s = 0u; s < wave; ++s)
+    {
+      uint32_t feat_count = 0u;
+      if (!vksift_Memory_getBufferFeatureCount(memory, s, &feat_count))
+      {
+        logError(LOG_TAG, "vksift_dispatchParallelIMAS() error: failed to read feature count for slot %u (warp %u)", s, base + s);
+        instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+        return;
+      }
+      out_features_per_warp[base + s] = feat_count;
+    }
+  }
+}

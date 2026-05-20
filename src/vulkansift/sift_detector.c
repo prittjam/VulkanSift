@@ -1239,16 +1239,12 @@ static inline uint32_t slot_oct_idx(const vksift_SiftDetector det, uint32_t slot
 // features into sift_buffer_arr[s] so concurrent waves are independent. The
 // caller-supplied target_buffer_idx (vksift_dispatchSiftDetection's parameter)
 // is honored for slot 0 (legacy single-slot path); slots [1..N) hard-bind to
-// their own index.
+// their own index. Phase C-2 guarantees nb_sift_buffer >= nb_pyramid_slots, so
+// no clamp is needed.
 static inline uint32_t slot_sift_buffer_idx(const vksift_SiftDetector det, uint32_t slot)
 {
   if (slot == 0u) return det->curr_buffer_idx;
-  // Clamp to nb_sift_buffer-1 if the user under-provisioned. Phase C-2 will
-  // bump default sift_buffer_count to nb_pyramid_slots so this clamp is
-  // never hit in practice.
-  uint32_t nb = det->mem->nb_sift_buffer;
-  if (nb == 0u) nb = 1u;
-  return (slot < nb) ? slot : (nb - 1u);
+  return slot;
 }
 
 static bool writeDescriptorSets(vksift_SiftDetector detector)
@@ -3038,24 +3034,20 @@ bool vksift_dispatchSiftDetectionFromImas(vksift_SiftDetector detector, const ui
                                     &detector->detection_command_buffer_from_imas);
 }
 
-// Phase B-3 — see sift_detector.h for the contract. Builds the WarpParamsUBO
-// + SlotDispatchBuffer for the requested warp, writes them into the slot's
-// host-mapped buffers, then submits the pre-recorded fused command buffer for
-// the slot. The host populates exactly the fields each shader (IMAS chain +
-// Quantize) reads; the SIFT-detect chain has no per-warp params (its canvas
-// is curr_input_image_*).
-bool vksift_dispatchFusedImasWarpForSlot(vksift_SiftDetector detector,
-                                         uint32_t slot_idx, const uint32_t target_buffer_idx,
-                                         uint32_t W, uint32_t H,
-                                         float t_factor, float theta_rad,
-                                         uint32_t canvas_w, uint32_t canvas_h,
-                                         bool memory_layout_updated)
+// Phase C-3 helper: fill slot's WarpParamsUBO + SlotDispatchBuffer with the
+// per-warp host-side params. No GPU submission; pure host work. Used by both
+// the serial entry point (vksift_dispatchFusedImasWarpForSlot) and the
+// parallel one (vksift_dispatchParallelIMAS). Float math is single-precision
+// throughout to match the shader's f32 input. Non-static — also called from
+// vulkansift.c's parallel dispatch entry point.
+void vksift_fillFusedWarpState(vksift_SiftDetector detector,
+                               uint32_t slot_idx, uint32_t warp_idx,
+                               uint32_t W, uint32_t H,
+                               float t_factor, float theta_rad,
+                               uint32_t canvas_w, uint32_t canvas_h)
 {
-  if (detector == NULL || slot_idx >= VKSIFT_MAX_PYRAMID_SLOTS) return false;
-
   // ---- 1. Compute rotated canvas + inverse-rotation affine (same formula
-  // as vksift_runImasWarp). Float math is single-precision throughout to
-  // match the shader's f32 input. ----
+  // as vksift_runImasWarp). ----
   float ca = cosf(theta_rad);
   float sa = sinf(theta_rad);
   int xmin, xmax, ymin, ymax;
@@ -3094,7 +3086,7 @@ bool vksift_dispatchFusedImasWarpForSlot(vksift_SiftDetector detector,
     ubo.quantize_fill  = 0.5f;
     ubo.gauss_dir_x    = 0.0f;
     ubo.gauss_dir_y    = 1.0f;  // IMAS vertical σ_aa blur
-    ubo.warp_idx       = slot_idx;
+    ubo.warp_idx       = warp_idx;
     memcpy(detector->mem->slots[slot_idx].warp_params_ubo_ptr, &ubo, sizeof(WarpParamsUBO));
   }
 
@@ -3109,11 +3101,23 @@ bool vksift_dispatchFusedImasWarpForSlot(vksift_SiftDetector detector,
     disp.quantize         = (VkDispatchIndirectCommand){(canvas_w + 7u) / 8u, (canvas_h + 7u) / 8u, 1u};
     memcpy(detector->mem->slots[slot_idx].dispatch_buffer_ptr, &disp, sizeof(SlotDispatchBuffer));
   }
+}
 
-  // ---- 4. Re-record the fused cmd buffer if the memory layout changed,
-  // pending_warp_dirty is set (e.g. caller switched paths), or the target
-  // buffer changed. The recording references detector->curr_buffer_idx and
-  // mem->curr_nb_octaves so it must be re-emitted when either changes. ----
+// Phase B-3 — see sift_detector.h for the contract. Builds the WarpParamsUBO
+// + SlotDispatchBuffer for the requested warp, writes them into the slot's
+// host-mapped buffers, then submits the pre-recorded fused command buffer for
+// the slot. The host populates exactly the fields each shader (IMAS chain +
+// Quantize) reads; the SIFT-detect chain has no per-warp params (its canvas
+// is curr_input_image_*).
+// Phase C-3: ensure the fused-cmd buffers are freshly recorded for the given
+// target_buffer_idx (legacy curr_buffer_idx tracking). Returns true if the
+// recording is current. Used by both the serial dispatch entry point and the
+// parallel one (vulkansift.c::vksift_dispatchParallelIMAS) before submitting
+// any of the pre-recorded fused command buffers.
+bool vksift_ensureDetectorCmdBuffersRecorded(vksift_SiftDetector detector,
+                                             uint32_t target_buffer_idx,
+                                             bool memory_layout_updated)
+{
   bool need_record = memory_layout_updated || detector->pending_warp_dirty ||
                      detector->curr_buffer_idx != target_buffer_idx ||
                      detector->pending_blur_dirty;
@@ -3124,6 +3128,27 @@ bool vksift_dispatchFusedImasWarpForSlot(vksift_SiftDetector detector,
     if (!recordCommandBuffers(detector)) return false;
     detector->pending_warp_dirty = false;
     detector->pending_blur_dirty = false;
+  }
+  return true;
+}
+
+bool vksift_dispatchFusedImasWarpForSlot(vksift_SiftDetector detector,
+                                         uint32_t slot_idx, const uint32_t target_buffer_idx,
+                                         uint32_t W, uint32_t H,
+                                         float t_factor, float theta_rad,
+                                         uint32_t canvas_w, uint32_t canvas_h,
+                                         bool memory_layout_updated)
+{
+  if (detector == NULL || slot_idx >= VKSIFT_MAX_PYRAMID_SLOTS) return false;
+
+  // ---- 1+2+3. Fill UBO + dispatch buffer for this (slot, warp) ----
+  vksift_fillFusedWarpState(detector, slot_idx, slot_idx,
+                            W, H, t_factor, theta_rad, canvas_w, canvas_h);
+
+  // ---- 4. Ensure the fused cmd buffer is freshly recorded ----
+  if (!vksift_ensureDetectorCmdBuffersRecorded(detector, target_buffer_idx, memory_layout_updated))
+  {
+    return false;
   }
 
   // ---- 5. Submit the fused command buffer. Mirrors dispatchDetectionCmdBuffer's
