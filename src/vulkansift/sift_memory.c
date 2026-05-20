@@ -265,7 +265,15 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
   // as scratch for: AffineWarp(rotate) → rotated; PreBlur1D(vertical σ_aa)
   // in-place; FprojBilinearY samples FROM here to produce tilted_image.
   {
-    uint32_t rot_max = memory->curr_input_image_width + memory->curr_input_image_height;
+    // Tight bound on the rotated-canvas dims for arbitrary θ: a W×H rectangle
+    // rotated by θ has axis-aligned bounding-box dims (W·|cosθ|+H·|sinθ|,
+    // W·|sinθ|+H·|cosθ|), each ≤ sqrt(W²+H²) (Cauchy-Schwarz). The earlier
+    // (W+H) bound was loose by ~2× in area — at n_pyramid_slots>1 on large
+    // inputs that was the difference between fitting and OOM on a 24 GB GPU
+    // (parallel-pyramid plan §9.6).
+    const double Wd = (double)memory->curr_input_image_width;
+    const double Hd = (double)memory->curr_input_image_height;
+    uint32_t rot_max = (uint32_t)ceil(sqrt(Wd * Wd + Hd * Hd));
     memory->slots[slot_idx].rotated_image_max_width = rot_max;
     memory->slots[slot_idx].rotated_image_max_height = rot_max;
     res = true;
