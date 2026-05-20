@@ -83,10 +83,19 @@ extern "C"
 
   // Run SIFT detection on the most-recent IMAS-tilted image (mem->rotated_image,
   // device-side) — no host roundtrip. Caller must have run vksift_runImas first
-  // to populate rotated_image. (tilted_w, tilted_h) are the actual dims of the
-  // sub-region the IMAS pipeline wrote (= out_w, out_h from runImas).
+  // to populate rotated_image.
+  //
+  // (canvas_w, canvas_h) = SIFT pyramid input dims — keep stable across warps
+  //   to avoid per-warp pyramid reallocation. Pass the same (W, H) used at
+  //   init for the entire IMAS-25 schedule.
+  // (valid_w, valid_h)   = the sub-region the IMAS pipeline wrote into
+  //   rotated_image (= out_w, out_h returned by vksift_runImas). The quantize
+  //   shader writes those pixels from rotated_image and fills the rest of
+  //   input_image with `fill_value`.
   VKSIFT_EXPORT void vksift_detectFeaturesOnImas(vksift_Instance instance,
-                                                 const uint32_t tilted_w, const uint32_t tilted_h,
+                                                 const uint32_t canvas_w, const uint32_t canvas_h,
+                                                 const uint32_t valid_w, const uint32_t valid_h,
+                                                 const float fill_value,
                                                  const uint32_t gpu_buffer_id);
 
   // For each SIFT feature in the buffer A, find the 2-nearest neighbors in the buffer B, store feature index and descriptors L2 distance

@@ -147,7 +147,12 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
   if (!alloc_set(device, p->warp_pool, p->warp_layout, &p->warp_set)) goto fail;
   if (!make_pipeline(device, "shaders/AffineWarp.comp.spv", p->warp_layout, sizeof(ImasAffineWarpPushConsts),
                      &p->warp_pipeline_layout, &p->warp_pipeline)) goto fail;
-  write_sampler_storage(device, p->warp_set, sampler, mem->input_image_view, mem->rotated_image_view);
+  // IMAS samples cached_input_image (kept in sync by recCopyInputImageCmds)
+  // instead of input_image, so the on-IMAS detect path can overwrite
+  // input_image with quantized tilted content without corrupting the next
+  // warp's IMAS source. The cache is updated whenever a regular
+  // vksift_detectFeatures uploads new content.
+  write_sampler_storage(device, p->warp_set, sampler, mem->cached_input_image_view, mem->rotated_image_view);
 
   // ----- GaussBlur1DStorage — two storage images (rotated → tilted) -----
   if (!create_two_image_layout(device, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,

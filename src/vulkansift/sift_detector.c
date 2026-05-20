@@ -56,11 +56,14 @@ typedef struct
   float dir_y;
 } PreBlur1DPushConsts;
 
-// Push constants for QuantizeF32ToInput.comp (8 B).
+// Push constants for QuantizeF32ToInput.comp.
 typedef struct
 {
-  uint32_t width;
-  uint32_t height;
+  uint32_t canvas_w;
+  uint32_t canvas_h;
+  uint32_t valid_w;
+  uint32_t valid_h;
+  float    fill_value;
 } QuantizePushConsts;
 
 // Push constants for Downsample2x.comp: layer indices + dst dims (16 B).
@@ -1626,6 +1629,53 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
   }
 
+  // Sync cached_input_image with the just-populated input_image. The IMAS
+  // pipeline samples from cached_input_image_view, so the on-IMAS detect
+  // path can overwrite input_image with quantized tilted content without
+  // corrupting the next warp's IMAS source.
+  {
+    VkImageMemoryBarrier barriers[2];
+    barriers[0] = vkenv_genImageMemoryBarrier(
+        detector->mem->input_image,
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    barriers[1] = vkenv_genImageMemoryBarrier(
+        detector->mem->cached_input_image,
+        0, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmdbuf,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, NULL, 0, NULL, 2, barriers);
+
+    VkImageCopy region = {
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .srcOffset = {0, 0, 0},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .dstOffset = {0, 0, 0},
+        .extent = {detector->mem->curr_input_image_width, detector->mem->curr_input_image_height, 1}};
+    vkCmdCopyImage(cmdbuf,
+        detector->mem->input_image,        VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->cached_input_image, VK_IMAGE_LAYOUT_GENERAL,
+        1, &region);
+
+    VkImageMemoryBarrier post = vkenv_genImageMemoryBarrier(
+        detector->mem->cached_input_image,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmdbuf,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, &post);
+  }
+
   endMarkerRegion(detector, cmdbuf);
 }
 
@@ -1661,15 +1711,23 @@ static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBu
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       0, 0, NULL, 0, NULL, 1, &input_barrier);
 
-  QuantizePushConsts qpc = {.width = detector->quantize_width, .height = detector->quantize_height};
+  // Dispatch covers the FULL input_image canvas (curr_input_image_*); regions
+  // outside the IMAS-written sub-rectangle (quantize_valid_*) are filled with
+  // quantize_fill_value to match the host-roundtrip path's pad_tilted layout.
+  QuantizePushConsts qpc = {
+      .canvas_w   = detector->mem->curr_input_image_width,
+      .canvas_h   = detector->mem->curr_input_image_height,
+      .valid_w    = detector->quantize_valid_w,
+      .valid_h    = detector->quantize_valid_h,
+      .fill_value = detector->quantize_fill_value};
   vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline);
   vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
                           0, 1, &detector->quantize_desc_set, 0, NULL);
   vkCmdPushConstants(cmdbuf, detector->quantize_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                      0, sizeof(qpc), &qpc);
   vkCmdDispatch(cmdbuf,
-      (uint32_t)ceilf((float)detector->quantize_width / 8.f),
-      (uint32_t)ceilf((float)detector->quantize_height / 8.f), 1);
+      (uint32_t)ceilf((float)detector->mem->curr_input_image_width / 8.f),
+      (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
 
   VkImageMemoryBarrier post_barrier = vkenv_genImageMemoryBarrier(
       detector->mem->input_image,

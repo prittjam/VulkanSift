@@ -107,10 +107,14 @@ typedef struct vksift_SiftDetector_T
   VkDescriptorSet quantize_desc_set;
   VkPipelineLayout quantize_pipeline_layout;
   VkPipeline quantize_pipeline;
-  // Dims used for the quantize dispatch — set per-call before submitting
-  // detection_command_buffer_from_imas.
-  uint32_t quantize_width;
-  uint32_t quantize_height;
+  // Valid sub-region of mem->rotated_image the IMAS pipeline wrote into
+  // (= run_imas's out_w / out_h). Set per-call before submitting
+  // detection_command_buffer_from_imas. The quantize shader fills the rest
+  // of input_image with quantize_fill_value (matches the host-roundtrip
+  // path's pad_tilted layout).
+  uint32_t quantize_valid_w;
+  uint32_t quantize_valid_h;
+  float    quantize_fill_value;
   // ExtractKeypoints set
   VkDescriptorSetLayout extractkpts_desc_set_layout;
   VkDescriptorPool extractkpts_desc_pool;

@@ -184,6 +184,46 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
     return false;
   }
 
+  // Create cached_input_image — same R8 format and dims as input_image. The
+  // IMAS pipeline samples from this image (rather than input_image) so the
+  // on-IMAS detect path can overwrite input_image with quantized tilted
+  // content without corrupting the next warp's IMAS source.
+  // recCopyInputImageCmds keeps cached_input_image in sync after every
+  // regular detect upload via vkCmdCopyImage.
+  res = true;
+  res = res && vkenv_createImage(&memory->cached_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM,
+                                 (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
+                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+  if (is_init)
+  {
+    res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height, &memory_requirement, 0,
+                                                  VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+  }
+  else if (res)
+  {
+    vkGetImageMemoryRequirements(memory->device->device, memory->cached_input_image, &memory_requirement);
+  }
+  if (memory_requirement.size > memory->cached_input_image_memory_size)
+  {
+    VK_NULL_SAFE_DELETE(memory->cached_input_image_memory, vkFreeMemory(memory->device->device, memory->cached_input_image_memory, NULL));
+    res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_type_idx);
+    res = res && vkenv_allocateMemory(&memory->cached_input_image_memory, memory->device, memory_requirement.size, memory_type_idx);
+    memory->cached_input_image_memory_size = memory_requirement.size;
+  }
+  res = res && vkenv_bindImageMemory(memory->device, memory->cached_input_image, memory->cached_input_image_memory, 0u);
+  res = res && vkenv_createImageView(&memory->cached_input_image_view, memory->device, 0, memory->cached_input_image, VK_IMAGE_VIEW_TYPE_2D,
+                                     VK_FORMAT_R8_UNORM, VKENV_DEFAULT_COMPONENT_MAPPING,
+                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+  if (!res)
+  {
+    logError(LOG_TAG, "An error occured when setting up the cached input image");
+    return false;
+  }
+
   // Create blurred input image (r32f). Output of PreBlur1D.comp; the
   // AffineWarp pass then samples FROM it. Needs SAMPLED + STORAGE bits.
   res = true;
@@ -1118,6 +1158,9 @@ void vksift_destroySiftMemory(vksift_SiftMemory *memory_ptr)
   }
   VK_NULL_SAFE_DELETE(memory->input_image_view, vkDestroyImageView(memory->device->device, memory->input_image_view, NULL));
   VK_NULL_SAFE_DELETE(memory->input_image, vkDestroyImage(memory->device->device, memory->input_image, NULL));
+  VK_NULL_SAFE_DELETE(memory->cached_input_image_view, vkDestroyImageView(memory->device->device, memory->cached_input_image_view, NULL));
+  VK_NULL_SAFE_DELETE(memory->cached_input_image, vkDestroyImage(memory->device->device, memory->cached_input_image, NULL));
+  VK_NULL_SAFE_DELETE(memory->cached_input_image_memory, vkFreeMemory(memory->device->device, memory->cached_input_image_memory, NULL));
   VK_NULL_SAFE_DELETE(memory->blurred_input_image_view, vkDestroyImageView(memory->device->device, memory->blurred_input_image_view, NULL));
   VK_NULL_SAFE_DELETE(memory->blurred_input_image, vkDestroyImage(memory->device->device, memory->blurred_input_image, NULL));
   VK_NULL_SAFE_DELETE(memory->blurred_input_image_memory, vkFreeMemory(memory->device->device, memory->blurred_input_image_memory, NULL));
@@ -1199,6 +1242,8 @@ bool vksift_prepareSiftMemoryForDetection(vksift_SiftMemory memory, const uint8_
     // (to avoid extremely slow memory reallocation)
     VK_NULL_SAFE_DELETE(memory->input_image_view, vkDestroyImageView(memory->device->device, memory->input_image_view, NULL));
     VK_NULL_SAFE_DELETE(memory->input_image, vkDestroyImage(memory->device->device, memory->input_image, NULL));
+    VK_NULL_SAFE_DELETE(memory->cached_input_image_view, vkDestroyImageView(memory->device->device, memory->cached_input_image_view, NULL));
+    VK_NULL_SAFE_DELETE(memory->cached_input_image, vkDestroyImage(memory->device->device, memory->cached_input_image, NULL));
     VK_NULL_SAFE_DELETE(memory->blurred_input_image_view, vkDestroyImageView(memory->device->device, memory->blurred_input_image_view, NULL));
     VK_NULL_SAFE_DELETE(memory->blurred_input_image, vkDestroyImage(memory->device->device, memory->blurred_input_image, NULL));
     VK_NULL_SAFE_DELETE(memory->warped_input_image_view, vkDestroyImageView(memory->device->device, memory->warped_input_image_view, NULL));

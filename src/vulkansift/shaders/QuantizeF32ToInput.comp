@@ -21,14 +21,24 @@ layout(r32f, binding = 0) uniform image2D img_input;
 layout(r8,   binding = 1) uniform image2D img_output;
 
 layout(push_constant) uniform PushConst {
-    uint width;
-    uint height;
+    uint canvas_w;   // Dispatch dims (= input_image dims / SIFT pyramid input dims)
+    uint canvas_h;
+    uint valid_w;    // Actual sub-region the IMAS pipeline wrote into; rest of
+    uint valid_h;    // canvas is filled with FILL_VALUE (matches host-roundtrip
+                     // path's pad_tilted layout, which had 0x80 outside the
+                     // tilted region).
+    float fill_value;
 } push_const;
 
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
-    if (coords.x >= int(push_const.width) || coords.y >= int(push_const.height)) return;
-    float v = imageLoad(img_input, coords).r;
+    if (coords.x >= int(push_const.canvas_w) || coords.y >= int(push_const.canvas_h)) return;
+    float v;
+    if (coords.x < int(push_const.valid_w) && coords.y < int(push_const.valid_h)) {
+        v = imageLoad(img_input, coords).r;
+    } else {
+        v = push_const.fill_value;
+    }
     // R8_UNORM hardware-converts float in [0, 1] → byte 0..255 on store.
     imageStore(img_output, coords, vec4(clamp(v, 0.0, 1.0), 0.0, 0.0, 1.0));
 }

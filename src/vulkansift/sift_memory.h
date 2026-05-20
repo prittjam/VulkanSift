@@ -61,6 +61,17 @@ typedef struct vksift_SiftMemory_T
   VkDeviceMemory input_image_memory;
   VkDeviceSize input_image_memory_size;
 
+  // Cached copy of input_image, kept in sync by recCopyInputImageCmds whenever
+  // a regular vksift_detectFeatures uploads new content. The IMAS pipeline
+  // reads from cached_input_image_view instead of input_image_view so that
+  // the device-side on-IMAS detect path (which overwrites input_image with
+  // quantized tilted content) doesn't corrupt the IMAS source between warps.
+  // Eliminates the per-warp host→staging→input_image re-upload.
+  VkImage cached_input_image;
+  VkImageView cached_input_image_view;
+  VkDeviceMemory cached_input_image_memory;
+  VkDeviceSize cached_input_image_memory_size;
+
   // Pre-blurred input image (r32f). Output of the per-warp PreBlur1D.comp
   // pass that applies the Morel-Yu σ_aa = 0.8·√(t²−1) anti-alias filter
   // along the warp's squash direction. Sized at the input resolution; serves

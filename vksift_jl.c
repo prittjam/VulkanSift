@@ -185,10 +185,12 @@ const float *vksift_jl_get_imas_buffer(vksift_jl_handle h)
 }
 
 uint32_t vksift_jl_detect_on_imas(vksift_jl_handle h,
-                                  uint32_t tilted_w, uint32_t tilted_h)
+                                  uint32_t canvas_w, uint32_t canvas_h,
+                                  uint32_t valid_w,  uint32_t valid_h,
+                                  float    fill_value)
 {
     if (!h) return 0;
-    vksift_detectFeaturesOnImas(h->instance, tilted_w, tilted_h, 0);
+    vksift_detectFeaturesOnImas(h->instance, canvas_w, canvas_h, valid_w, valid_h, fill_value, 0);
     h->last_nb_features = vksift_getFeaturesNumber(h->instance, 0);
     return h->last_nb_features;
 }

@@ -107,10 +107,21 @@ const float *vksift_jl_get_imas_buffer(vksift_jl_handle h);
 
 // Run SIFT detection on the most-recent IMAS-tilted image (mem->rotated_image,
 // device-side) — no host roundtrip. Caller must have run vksift_jl_run_imas()
-// first. tilted_w / tilted_h are the dims returned by run_imas. Returns the
-// number of features detected; use vksift_jl_get_features() to download.
+// first.
+//
+// (canvas_w, canvas_h): SIFT pyramid input dims — pass the SAME values for
+//   every warp in an IMAS schedule (e.g. max tilted W×H), so the pyramid
+//   stays stable and isn't reallocated per warp.
+// (valid_w, valid_h)  : actual dims the IMAS pipeline wrote (= out_w/out_h
+//   from vksift_jl_run_imas). The quantize shader writes those pixels from
+//   rotated_image and fills the rest of input_image with `fill_value` (a
+//   normalized float in [0, 1]; typically 0.5).
+//
+// Returns the number of features detected; use vksift_jl_get_features().
 uint32_t vksift_jl_detect_on_imas(vksift_jl_handle h,
-                                  uint32_t tilted_w, uint32_t tilted_h);
+                                  uint32_t canvas_w, uint32_t canvas_h,
+                                  uint32_t valid_w,  uint32_t valid_h,
+                                  float    fill_value);
 
 #ifdef __cplusplus
 }
