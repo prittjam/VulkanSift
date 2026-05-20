@@ -77,9 +77,11 @@ typedef struct vksift_SiftDetector_T
   // PreBlur1D set — Morel-Yu σ_aa anti-alias 1D Gaussian blur on the input
   // image. Runs BEFORE AffineWarp; writes blurred_input_image which AffineWarp
   // then samples. σ=0 yields a pass-through copy (identity path).
+  // Phase C-1: per-slot — slot s binds mem->slots[s].input_image_view (in) +
+  // mem->slots[s].blurred_input_image_view (out).
   VkDescriptorSetLayout preblur_desc_set_layout;
   VkDescriptorPool preblur_desc_pool;
-  VkDescriptorSet preblur_desc_set;
+  VkDescriptorSet preblur_desc_set[VKSIFT_MAX_PYRAMID_SLOTS];
   VkPipelineLayout preblur_pipeline_layout;
   VkPipeline preblur_pipeline;
 
@@ -92,9 +94,11 @@ typedef struct vksift_SiftDetector_T
 
   // AffineWarp set — used by the ASIFT batch detect path to pre-warp the
   // input image before each pyramid build. Idle on the standard detect path.
+  // Phase C-1: per-slot — slot s binds mem->slots[s].blurred_input_image_view
+  // (in) + mem->slots[s].warped_input_image_view (out).
   VkDescriptorSetLayout affinewarp_desc_set_layout;
   VkDescriptorPool affinewarp_desc_pool;
-  VkDescriptorSet affinewarp_desc_set;
+  VkDescriptorSet affinewarp_desc_set[VKSIFT_MAX_PYRAMID_SLOTS];
   VkPipelineLayout affinewarp_pipeline_layout;
   VkPipeline affinewarp_pipeline;
 
@@ -107,31 +111,38 @@ typedef struct vksift_SiftDetector_T
   bool  pending_warp_dirty;
 
   // Gaussian Blur set
+  // Phase C-1: blur_desc_sets is a flat array of nb_pyramid_slots * max_nb_octaves * 2
+  // sets, indexed as `blur_desc_sets[slot * (max_nb_octaves * 2) + pass * max_nb_octaves + oct]`
+  // (pass=0 horizontal, pass=1 vertical). The blur_h_desc_sets / blur_v_desc_sets
+  // arrays are flat per-slot views of size nb_pyramid_slots * max_nb_octaves
+  // each — use the BLUR_DESC_SET helper macros in sift_detector.c to index.
   VkDescriptorSetLayout blur_desc_set_layout;
   VkDescriptorPool blur_desc_pool;
-  VkDescriptorSet *blur_desc_sets;
-  VkDescriptorSet *blur_h_desc_sets;
-  VkDescriptorSet *blur_v_desc_sets;
+  VkDescriptorSet *blur_desc_sets;     // [N*max_oct*2]
+  VkDescriptorSet *blur_h_desc_sets;   // [N*max_oct], = blur_desc_sets
+  VkDescriptorSet *blur_v_desc_sets;   // [N*max_oct], = blur_desc_sets + N*max_oct
   VkPipelineLayout blur_pipeline_layout;
   VkPipeline blur_pipeline;
-  // Difference of Gaussian set
+  // Difference of Gaussian set — flat [slot*max_nb_octaves + oct].
   VkDescriptorSetLayout dog_desc_set_layout;
   VkDescriptorPool dog_desc_pool;
   VkDescriptorSet *dog_desc_sets;
   VkPipelineLayout dog_pipeline_layout;
   VkPipeline dog_pipeline;
-  // Downsample2x set (Lowe pixel-aligned octave downsample, replaces blit)
+  // Downsample2x set (Lowe pixel-aligned octave downsample, replaces blit) —
+  // flat [slot*max_nb_octaves + oct].
   VkDescriptorSetLayout downsample_desc_set_layout;
   VkDescriptorPool downsample_desc_pool;
   VkDescriptorSet *downsample_desc_sets;
   VkPipelineLayout downsample_pipeline_layout;
   VkPipeline downsample_pipeline;
-  // QuantizeF32ToInput set — device-side R32F (mem->rotated_image, IMAS
-  // output) → R8_UNORM (mem->input_image) copy with quantization. Replaces
+  // QuantizeF32ToInput set — device-side R32F (slots[s].rotated_image, IMAS
+  // output) → R8_UNORM (slots[s].input_image) copy with quantization. Replaces
   // the host roundtrip on the on-IMAS detect path.
+  // Phase C-1: per-slot.
   VkDescriptorSetLayout quantize_desc_set_layout;
   VkDescriptorPool quantize_desc_pool;
-  VkDescriptorSet quantize_desc_set;
+  VkDescriptorSet quantize_desc_set[VKSIFT_MAX_PYRAMID_SLOTS];
   VkPipelineLayout quantize_pipeline_layout;
   VkPipeline quantize_pipeline;
   // Valid sub-region of mem->rotated_image the IMAS pipeline wrote into
@@ -142,38 +153,45 @@ typedef struct vksift_SiftDetector_T
   uint32_t quantize_valid_w;
   uint32_t quantize_valid_h;
   float    quantize_fill_value;
-  // ExtractKeypoints set
+  // ExtractKeypoints set — flat [slot*max_nb_octaves + oct]. Slot s's
+  // descriptor set binds sift_buffer_arr[s] so concurrent waves write to
+  // independent feature buffers. Requires nb_sift_buffer >= nb_pyramid_slots
+  // (clamped at create time — see prepareDescriptorSets).
   VkDescriptorSetLayout extractkpts_desc_set_layout;
   VkDescriptorPool extractkpts_desc_pool;
   VkDescriptorSet *extractkpts_desc_sets;
   VkPipelineLayout extractkpts_pipeline_layout;
   VkPipeline extractkpts_pipeline;
   VkPipeline extractkpts_2d_pipeline;
-  // ComputeOrientation set
+  // ComputeOrientation set — flat [slot*max_nb_octaves + oct].
   VkDescriptorSetLayout orientation_desc_set_layout;
   VkDescriptorPool orientation_desc_pool;
   VkDescriptorSet *orientation_desc_sets;
   VkPipelineLayout orientation_pipeline_layout;
   VkPipeline orientation_pipeline;
-  // ComputeDescriptor set
+  // ComputeDescriptor set — flat [slot*max_nb_octaves + oct].
   VkDescriptorSetLayout descriptor_desc_set_layout;
   VkDescriptorPool descriptor_desc_pool;
   VkDescriptorSet *descriptor_desc_sets;
   VkPipelineLayout descriptor_pipeline_layout;
   VkPipeline descriptor_pipeline;
 
-  // RGBA→Gray conversion set (only when use_rgba_input=true)
+  // RGBA→Gray conversion set (only when use_rgba_input=true). Per-slot —
+  // slot s binds mem->slots[s].rgba_input_image_view (in) +
+  // mem->slots[s].input_image_view (out).
   VkDescriptorSetLayout rgba_convert_desc_set_layout;
   VkDescriptorPool rgba_convert_desc_pool;
-  VkDescriptorSet rgba_convert_desc_set;
+  VkDescriptorSet rgba_convert_desc_set[VKSIFT_MAX_PYRAMID_SLOTS];
   VkPipelineLayout rgba_convert_pipeline_layout;
   VkPipeline rgba_convert_pipeline;
 
-  // RGB→Gray conversion set (only when use_rgb_input=true)
+  // RGB→Gray conversion set (only when use_rgb_input=true). Per-slot —
+  // slot s binds mem->slots[s].rgb_input_buffer (in) +
+  // mem->slots[s].input_image_view (out).
   // Uses SSBO for RGB input since VK_FORMAT_R8G8B8 has poor storage image support
   VkDescriptorSetLayout rgb_convert_desc_set_layout;
   VkDescriptorPool rgb_convert_desc_pool;
-  VkDescriptorSet rgb_convert_desc_set;
+  VkDescriptorSet rgb_convert_desc_set[VKSIFT_MAX_PYRAMID_SLOTS];
   VkPipelineLayout rgb_convert_pipeline_layout;
   VkPipeline rgb_convert_pipeline;
 
@@ -218,9 +236,11 @@ bool vksift_dispatchSiftDetectionFromImas(vksift_SiftDetector detector, const ui
 // in a run). (t_factor, theta_rad) define the IMAS warp. (canvas_w, canvas_h)
 // is the SIFT pyramid input canvas (keep stable across warps).
 //
-// Note (Phase B-3): only slot_idx == 0 is actually exercised, since the SIFT
-// detect descriptor sets (blur, dog, extractkpts, ...) are still bound to
-// mem->slots[0]'s image views. Phase C will rebind those per slot.
+// Phase C-1: every detector + IMAS descriptor set is now allocated per slot,
+// and the fused cmd buffer recording for slot s binds slot s's image views +
+// slot s's UBO. Concurrent submission of multiple slots' fused cmd buffers is
+// safe from a descriptor-state standpoint; the sift_buffer binding uses
+// sift_buffer_arr[s] so feature outputs are independent.
 bool vksift_dispatchFusedImasWarpForSlot(vksift_SiftDetector detector,
                                          uint32_t slot_idx, const uint32_t target_buffer_idx,
                                          uint32_t W, uint32_t H,

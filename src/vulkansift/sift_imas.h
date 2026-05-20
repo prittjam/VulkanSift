@@ -39,34 +39,39 @@ typedef struct vksift_ImasPipeline_T
   // but bound to (input_image → rotated_image) instead of
   // (blurred_input_image → warped_input_image). Reusing the shader binary so
   // we don't double up the SPIR-V.
+  // Phase C-1: per-slot descriptor sets. The descriptor pool is sized by
+  // mem->nb_pyramid_slots at create time; sets [0..nb_pyramid_slots) each bind
+  // mem->slots[s].rotated_image_view as the storage output (and the shared
+  // cached_input_image_view as the sampler input).
   VkDescriptorSetLayout warp_layout;
   VkDescriptorPool      warp_pool;
-  VkDescriptorSet       warp_set;
+  VkDescriptorSet       warp_set[VKSIFT_MAX_PYRAMID_SLOTS];
   VkPipelineLayout      warp_pipeline_layout;
   VkPipeline            warp_pipeline;
 
   // GaussianBlur1D.comp — vertical σ_aa pre-resample blur.
-  // Bound (rotated_image → tilted_image).
+  // Bound per-slot (slots[s].rotated_image → slots[s].tilted_image).
   VkDescriptorSetLayout blur_layout;
   VkDescriptorPool      blur_pool;
-  VkDescriptorSet       blur_set;
+  VkDescriptorSet       blur_set[VKSIFT_MAX_PYRAMID_SLOTS];
   VkPipelineLayout      blur_pipeline_layout;
   VkPipeline            blur_pipeline;
 
   // FinvsplineRow.comp / FinvsplineCol.comp — cubic B-spline coefficient IIR.
-  // Single image binding each, in-place on tilted_image.
+  // Per-slot, in-place on slots[s].tilted_image.
   VkDescriptorSetLayout finvspline_layout;
   VkDescriptorPool      finvspline_pool;
-  VkDescriptorSet       finvspline_row_set;
-  VkDescriptorSet       finvspline_col_set;
+  VkDescriptorSet       finvspline_row_set[VKSIFT_MAX_PYRAMID_SLOTS];
+  VkDescriptorSet       finvspline_col_set[VKSIFT_MAX_PYRAMID_SLOTS];
   VkPipelineLayout      finvspline_pipeline_layout;
   VkPipeline            finvspline_row_pipeline;
   VkPipeline            finvspline_col_pipeline;
 
-  // FprojCubicY.comp — final cubic resample. Bound (tilted → rotated).
+  // FprojCubicY.comp — final cubic resample. Per-slot (slots[s].tilted_image
+  // → slots[s].rotated_image).
   VkDescriptorSetLayout fproj_layout;
   VkDescriptorPool      fproj_pool;
-  VkDescriptorSet       fproj_set;
+  VkDescriptorSet       fproj_set[VKSIFT_MAX_PYRAMID_SLOTS];
   VkPipelineLayout      fproj_pipeline_layout;
   VkPipeline            fproj_pipeline;
 

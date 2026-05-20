@@ -166,44 +166,66 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
     }
   }
 
+  // Effective slot count for Phase C-1: allocate one descriptor set per active
+  // pyramid slot, each bound to that slot's image views. Pool sizes are scaled
+  // by N (not VKSIFT_MAX_PYRAMID_SLOTS — only the active slots' images exist).
+  uint32_t N = mem->nb_pyramid_slots;
+  if (N == 0u) N = 1u;
+
   // ----- AffineWarp layout (sampler + storage), pool, set, pipeline -----
   if (!create_two_image_layout(device, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                &p->warp_layout)) goto fail;
   {
-    VkDescriptorPoolSize sizes[2] = {{.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1},
-                                     {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1}};
-    if (!create_pool_with_sizes(device, sizes, 2, 1, &p->warp_pool)) goto fail;
+    VkDescriptorPoolSize sizes[2] = {{.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = N},
+                                     {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = N}};
+    if (!create_pool_with_sizes(device, sizes, 2, N, &p->warp_pool)) goto fail;
   }
-  if (!alloc_set(device, p->warp_pool, p->warp_layout, &p->warp_set)) goto fail;
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    if (!alloc_set(device, p->warp_pool, p->warp_layout, &p->warp_set[s])) goto fail;
+  }
   if (!make_pipeline(device, "shaders/AffineWarp.comp.spv", p->warp_layout, p->warp_ubo_desc_set_layout,
                      &p->warp_pipeline_layout, &p->warp_pipeline)) goto fail;
   // IMAS samples cached_input_image (kept in sync by recCopyInputImageCmds)
   // instead of input_image, so the on-IMAS detect path can overwrite
   // input_image with quantized tilted content without corrupting the next
   // warp's IMAS source. The cache is updated whenever a regular
-  // vksift_detectFeatures uploads new content.
-  write_sampler_storage(device, p->warp_set, sampler, mem->cached_input_image_view, mem->slots[0].rotated_image_view);
+  // vksift_detectFeatures uploads new content. Each slot's set writes the
+  // rotated image of THAT slot, so concurrent waves don't collide.
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    write_sampler_storage(device, p->warp_set[s], sampler, mem->cached_input_image_view, mem->slots[s].rotated_image_view);
+  }
 
   // ----- GaussBlur1DStorage — two storage images (rotated → tilted) -----
   if (!create_two_image_layout(device, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                &p->blur_layout)) goto fail;
   {
-    VkDescriptorPoolSize sizes[1] = {{.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 2}};
-    if (!create_pool_with_sizes(device, sizes, 1, 1, &p->blur_pool)) goto fail;
+    VkDescriptorPoolSize sizes[1] = {{.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 2u * N}};
+    if (!create_pool_with_sizes(device, sizes, 1, N, &p->blur_pool)) goto fail;
   }
-  if (!alloc_set(device, p->blur_pool, p->blur_layout, &p->blur_set)) goto fail;
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    if (!alloc_set(device, p->blur_pool, p->blur_layout, &p->blur_set[s])) goto fail;
+  }
   if (!make_pipeline(device, "shaders/GaussBlur1DStorage.comp.spv", p->blur_layout, p->warp_ubo_desc_set_layout,
                      &p->blur_pipeline_layout, &p->blur_pipeline)) goto fail;
-  write_two_storage(device, p->blur_set, mem->slots[0].rotated_image_view, mem->slots[0].tilted_image_view);
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    write_two_storage(device, p->blur_set[s], mem->slots[s].rotated_image_view, mem->slots[s].tilted_image_view);
+  }
 
   // ----- FinvsplineRow / FinvsplineCol — single storage image, in-place IIR -----
   if (!create_one_image_layout(device, &p->finvspline_layout)) goto fail;
   {
-    VkDescriptorPoolSize sizes[1] = {{.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 2}};
-    if (!create_pool_with_sizes(device, sizes, 1, 2, &p->finvspline_pool)) goto fail;
+    VkDescriptorPoolSize sizes[1] = {{.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 2u * N}};
+    if (!create_pool_with_sizes(device, sizes, 1, 2u * N, &p->finvspline_pool)) goto fail;
   }
-  if (!alloc_set(device, p->finvspline_pool, p->finvspline_layout, &p->finvspline_row_set)) goto fail;
-  if (!alloc_set(device, p->finvspline_pool, p->finvspline_layout, &p->finvspline_col_set)) goto fail;
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    if (!alloc_set(device, p->finvspline_pool, p->finvspline_layout, &p->finvspline_row_set[s])) goto fail;
+    if (!alloc_set(device, p->finvspline_pool, p->finvspline_layout, &p->finvspline_col_set[s])) goto fail;
+  }
   if (!make_pipeline(device, "shaders/FinvsplineRow.comp.spv", p->finvspline_layout, p->warp_ubo_desc_set_layout,
                      &p->finvspline_pipeline_layout, &p->finvspline_row_pipeline)) goto fail;
   // Column pipeline reuses the row's pipeline_layout (identical push consts + layout).
@@ -219,21 +241,30 @@ vksift_ImasPipeline vksift_createImasPipeline(vkenv_Device dev, vksift_SiftMemor
     vkDestroyShaderModule(device, col_module, NULL);
     if (res != VK_SUCCESS) goto fail;
   }
-  write_one_storage(device, p->finvspline_row_set, mem->slots[0].tilted_image_view);
-  write_one_storage(device, p->finvspline_col_set, mem->slots[0].tilted_image_view);
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    write_one_storage(device, p->finvspline_row_set[s], mem->slots[s].tilted_image_view);
+    write_one_storage(device, p->finvspline_col_set[s], mem->slots[s].tilted_image_view);
+  }
 
   // ----- FprojCubicY — sampler in, storage out, tilted_image → rotated_image -----
   // Shader binds: binding 0 = storage img_coeffs, binding 1 = storage img_out (per FprojCubicY.comp).
   if (!create_two_image_layout(device, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                &p->fproj_layout)) goto fail;
   {
-    VkDescriptorPoolSize sizes[1] = {{.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 2}};
-    if (!create_pool_with_sizes(device, sizes, 1, 1, &p->fproj_pool)) goto fail;
+    VkDescriptorPoolSize sizes[1] = {{.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 2u * N}};
+    if (!create_pool_with_sizes(device, sizes, 1, N, &p->fproj_pool)) goto fail;
   }
-  if (!alloc_set(device, p->fproj_pool, p->fproj_layout, &p->fproj_set)) goto fail;
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    if (!alloc_set(device, p->fproj_pool, p->fproj_layout, &p->fproj_set[s])) goto fail;
+  }
   if (!make_pipeline(device, "shaders/FprojCubicY.comp.spv", p->fproj_layout, p->warp_ubo_desc_set_layout,
                      &p->fproj_pipeline_layout, &p->fproj_pipeline)) goto fail;
-  write_two_storage(device, p->fproj_set, mem->slots[0].tilted_image_view, mem->slots[0].rotated_image_view);
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    write_two_storage(device, p->fproj_set[s], mem->slots[s].tilted_image_view, mem->slots[s].rotated_image_view);
+  }
 
   // (The same set-0 writes are encapsulated in vksift_imasRefreshDescriptorSets
   // below for callers to rewire after a pyramid resize destroys + recreates the
@@ -313,14 +344,21 @@ void vksift_imasRefreshDescriptorSets(vksift_ImasPipeline p)
   // set-0 image views go stale whenever vksift_prepareSiftMemoryForDetection
   // resizes the per-slot images on a canvas change; this routine rewires the
   // descriptor sets to the freshly-created views before the next dispatch.
-  write_sampler_storage(device, p->warp_set, p->sampler,
-                        mem->cached_input_image_view, mem->slots[0].rotated_image_view);
-  write_two_storage(device, p->blur_set,
-                    mem->slots[0].rotated_image_view, mem->slots[0].tilted_image_view);
-  write_one_storage(device, p->finvspline_row_set, mem->slots[0].tilted_image_view);
-  write_one_storage(device, p->finvspline_col_set, mem->slots[0].tilted_image_view);
-  write_two_storage(device, p->fproj_set,
-                    mem->slots[0].tilted_image_view, mem->slots[0].rotated_image_view);
+  // Phase C-1: loop over all active slots and rewire each set against its own
+  // slot's image views.
+  uint32_t N = mem->nb_pyramid_slots;
+  if (N == 0u) N = 1u;
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    write_sampler_storage(device, p->warp_set[s], p->sampler,
+                          mem->cached_input_image_view, mem->slots[s].rotated_image_view);
+    write_two_storage(device, p->blur_set[s],
+                      mem->slots[s].rotated_image_view, mem->slots[s].tilted_image_view);
+    write_one_storage(device, p->finvspline_row_set[s], mem->slots[s].tilted_image_view);
+    write_one_storage(device, p->finvspline_col_set[s], mem->slots[s].tilted_image_view);
+    write_two_storage(device, p->fproj_set[s],
+                      mem->slots[s].tilted_image_view, mem->slots[s].rotated_image_view);
+  }
 }
 
 void vksift_destroyImasPipeline(vksift_ImasPipeline *pipeline_ptr)
@@ -547,10 +585,13 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
   barrier_to_general_undef(p->cmd_buf, p->mem->slots[0].tilted_image);
 
   // ----- 1. AffineWarp (rotate) : input_image → rotated_image -----
+  // Legacy single-slot path: bind slot[0]'s descriptor sets (vksift_runImasWarp
+  // is only entered via the Phase A non-fused IMAS readback path and the JL FFI
+  // vksift_jl_run_imas, neither of which expose slot selection).
   {
     vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->warp_pipeline);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->warp_pipeline_layout,
-                            0, 1, &p->warp_set, 0, NULL);
+                            0, 1, &p->warp_set[0], 0, NULL);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->warp_pipeline_layout,
                             1, 1, &p->warp_ubo_desc_sets[0], 0, NULL);
     vkCmdDispatch(p->cmd_buf, (W_rot + 7) / 8, (H_rot + 7) / 8, 1);
@@ -572,7 +613,7 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
   {
     vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->blur_pipeline);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->blur_pipeline_layout,
-                            0, 1, &p->blur_set, 0, NULL);
+                            0, 1, &p->blur_set[0], 0, NULL);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->blur_pipeline_layout,
                             1, 1, &p->warp_ubo_desc_sets[0], 0, NULL);
     vkCmdDispatch(p->cmd_buf, (W_rot + 7) / 8, (H_rot + 7) / 8, 1);
@@ -594,7 +635,7 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
     {
       vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_row_pipeline);
       vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
-                              0, 1, &p->finvspline_row_set, 0, NULL);
+                              0, 1, &p->finvspline_row_set[0], 0, NULL);
       vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
                               1, 1, &p->warp_ubo_desc_sets[0], 0, NULL);
       vkCmdDispatch(p->cmd_buf, (H_rot + 63) / 64, 1, 1);
@@ -614,7 +655,7 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
     {
       vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_col_pipeline);
       vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
-                              0, 1, &p->finvspline_col_set, 0, NULL);
+                              0, 1, &p->finvspline_col_set[0], 0, NULL);
       vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->finvspline_pipeline_layout,
                               1, 1, &p->warp_ubo_desc_sets[0], 0, NULL);
       vkCmdDispatch(p->cmd_buf, (W_rot + 63) / 64, 1, 1);
@@ -632,7 +673,7 @@ bool vksift_runImasWarp(vksift_ImasPipeline p, uint32_t W, uint32_t H,
     VkPipeline fproj_pipe = use_bilinear ? p->fproj_bilinear_pipeline : p->fproj_pipeline;
     vkCmdBindPipeline(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, fproj_pipe);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->fproj_pipeline_layout,
-                            0, 1, &p->fproj_set, 0, NULL);
+                            0, 1, &p->fproj_set[0], 0, NULL);
     vkCmdBindDescriptorSets(p->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, p->fproj_pipeline_layout,
                             1, 1, &p->warp_ubo_desc_sets[0], 0, NULL);
     vkCmdDispatch(p->cmd_buf, (W_rot + 7) / 8, (H_t + 7) / 8, 1);

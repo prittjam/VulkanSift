@@ -291,6 +291,13 @@ static VkDescriptorSetLayout *allocMultLayoutCopy(VkDescriptorSetLayout layout, 
 static bool prepareDescriptorSets(vksift_SiftDetector detector)
 {
   VkResult alloc_res;
+  // Phase C-1: pool sizing factor for per-slot descriptor sets. Most per-slot
+  // pools are sized at exactly nb_pyramid_slots (active slots only — descriptor
+  // sets for slot indices >= nb_pyramid_slots are never allocated because the
+  // underlying images don't exist).
+  uint32_t N = detector->mem->nb_pyramid_slots;
+  if (N == 0u) N = 1u;
+  const uint32_t max_oct = detector->mem->max_nb_octaves;
   ///////////////////////////////////////////////////
   // Resource bindings for PreBlur1D pipeline (ASIFT σ_aa pre-blur)
   // binding 0 = sampler2D (input_image), binding 1 = image2D r32f (blurred_input_image)
@@ -315,23 +322,26 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
       return false;
     }
     VkDescriptorPoolSize pb_pool_sizes[2] = {
-        {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1},
-        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1}};
+        {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = N},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = N}};
     VkDescriptorPoolCreateInfo pb_pool_info = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = pb_pool_sizes};
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = N, .poolSizeCount = 2, .pPoolSizes = pb_pool_sizes};
     if (vkCreateDescriptorPool(detector->dev->device, &pb_pool_info, NULL, &detector->preblur_desc_pool) != VK_SUCCESS)
     {
       logError(LOG_TAG, "Failed to create PreBlur1D descriptor pool");
       return false;
     }
-    VkDescriptorSetAllocateInfo pb_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                                 .descriptorPool = detector->preblur_desc_pool,
-                                                 .descriptorSetCount = 1,
-                                                 .pSetLayouts = &detector->preblur_desc_set_layout};
-    if (vkAllocateDescriptorSets(detector->dev->device, &pb_alloc_info, &detector->preblur_desc_set) != VK_SUCCESS)
+    for (uint32_t s = 0u; s < N; ++s)
     {
-      logError(LOG_TAG, "Failed to allocate PreBlur1D descriptor set");
-      return false;
+      VkDescriptorSetAllocateInfo pb_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                   .descriptorPool = detector->preblur_desc_pool,
+                                                   .descriptorSetCount = 1,
+                                                   .pSetLayouts = &detector->preblur_desc_set_layout};
+      if (vkAllocateDescriptorSets(detector->dev->device, &pb_alloc_info, &detector->preblur_desc_set[s]) != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "Failed to allocate PreBlur1D descriptor set (slot %u)", s);
+        return false;
+      }
     }
   }
 
@@ -408,26 +418,29 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
       return false;
     }
     VkDescriptorPoolSize aw_pool_sizes[2] = {
-        {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1},
-        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1}};
+        {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = N},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = N}};
     VkDescriptorPoolCreateInfo aw_pool_info = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = aw_pool_sizes};
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = N, .poolSizeCount = 2, .pPoolSizes = aw_pool_sizes};
     if (vkCreateDescriptorPool(detector->dev->device, &aw_pool_info, NULL, &detector->affinewarp_desc_pool) != VK_SUCCESS)
     {
       logError(LOG_TAG, "Failed to create AffineWarp descriptor pool");
       return false;
     }
-    VkDescriptorSetAllocateInfo aw_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                                 .descriptorPool = detector->affinewarp_desc_pool,
-                                                 .descriptorSetCount = 1,
-                                                 .pSetLayouts = &detector->affinewarp_desc_set_layout};
-    if (vkAllocateDescriptorSets(detector->dev->device, &aw_alloc_info, &detector->affinewarp_desc_set) != VK_SUCCESS)
+    for (uint32_t s = 0u; s < N; ++s)
     {
-      logError(LOG_TAG, "Failed to allocate AffineWarp descriptor set");
-      return false;
+      VkDescriptorSetAllocateInfo aw_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                   .descriptorPool = detector->affinewarp_desc_pool,
+                                                   .descriptorSetCount = 1,
+                                                   .pSetLayouts = &detector->affinewarp_desc_set_layout};
+      if (vkAllocateDescriptorSets(detector->dev->device, &aw_alloc_info, &detector->affinewarp_desc_set[s]) != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "Failed to allocate AffineWarp descriptor set (slot %u)", s);
+        return false;
+      }
     }
     // Image-view bindings (input_image as sampler source, warped_input_image as
-    // storage output) are wired up by updateDynamicDescriptorSets in the
+    // storage output) are wired up by writeDescriptorSets in the
     // detect-dispatch path so they track allocation-on-resize.
   }
 
@@ -453,12 +466,13 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     return false;
   }
 
-  // Create descriptor pool to allocate descriptor sets (reserve x2 for the horizontal and vertical pass)
+  // Create descriptor pool to allocate descriptor sets (reserve x2 for the
+  // horizontal and vertical pass, x N for per-slot bindings)
   VkDescriptorPoolSize blur_pool_sizes[2];
-  blur_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = detector->mem->max_nb_octaves * 2};
-  blur_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = detector->mem->max_nb_octaves * 2};
+  blur_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = max_oct * 2u * N};
+  blur_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = max_oct * 2u * N};
   VkDescriptorPoolCreateInfo blur_descriptor_pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                                          .maxSets = detector->mem->max_nb_octaves * 2,
+                                                          .maxSets = max_oct * 2u * N,
                                                           .poolSizeCount = 2,
                                                           .pPoolSizes = blur_pool_sizes};
   if (vkCreateDescriptorPool(detector->dev->device, &blur_descriptor_pool_info, NULL, &detector->blur_desc_pool) != VK_SUCCESS)
@@ -467,14 +481,18 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     return false;
   }
 
-  // Create descriptor sets that can be bound in command buffer
-  VkDescriptorSetLayout *blur_layouts = allocMultLayoutCopy(detector->blur_desc_set_layout, detector->mem->max_nb_octaves * 2);
-  detector->blur_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * detector->mem->max_nb_octaves * 2);
+  // Create descriptor sets that can be bound in command buffer. Layout:
+  //   blur_desc_sets[0 .. N*max_oct)            : horizontal pass (h_desc_sets)
+  //   blur_desc_sets[N*max_oct .. 2*N*max_oct)  : vertical pass   (v_desc_sets)
+  // Within each half, slot s octave o lives at [s*max_oct + o].
+  const uint32_t blur_total = max_oct * 2u * N;
+  VkDescriptorSetLayout *blur_layouts = allocMultLayoutCopy(detector->blur_desc_set_layout, blur_total);
+  detector->blur_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * blur_total);
   detector->blur_h_desc_sets = detector->blur_desc_sets;
-  detector->blur_v_desc_sets = detector->blur_desc_sets + detector->mem->max_nb_octaves;
+  detector->blur_v_desc_sets = detector->blur_desc_sets + (max_oct * N);
   VkDescriptorSetAllocateInfo blur_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                                  .descriptorPool = detector->blur_desc_pool,
-                                                 .descriptorSetCount = detector->mem->max_nb_octaves * 2,
+                                                 .descriptorSetCount = blur_total,
                                                  .pSetLayouts = blur_layouts};
 
   alloc_res = vkAllocateDescriptorSets(detector->dev->device, &blur_alloc_info, detector->blur_desc_sets);
@@ -509,24 +527,25 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     return false;
   }
 
-  // Create descriptor pool to allocate descriptor sets (generic)
+  // Create descriptor pool to allocate descriptor sets (per-slot per-octave)
   VkDescriptorPoolSize dog_pool_sizes[2];
-  dog_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = detector->mem->max_nb_octaves};
-  dog_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = detector->mem->max_nb_octaves};
+  dog_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = max_oct * N};
+  dog_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = max_oct * N};
   VkDescriptorPoolCreateInfo dog_descriptor_pool_info = {
-      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = detector->mem->max_nb_octaves, .poolSizeCount = 2, .pPoolSizes = dog_pool_sizes};
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = max_oct * N, .poolSizeCount = 2, .pPoolSizes = dog_pool_sizes};
   if (vkCreateDescriptorPool(detector->dev->device, &dog_descriptor_pool_info, NULL, &detector->dog_desc_pool) != VK_SUCCESS)
   {
     logError(LOG_TAG, "Failed to create DifferenceOfGaussian descriptor pool");
     return false;
   }
 
-  // Create descriptor sets that can be bound in command buffer
-  VkDescriptorSetLayout *dog_layouts = allocMultLayoutCopy(detector->dog_desc_set_layout, detector->mem->max_nb_octaves);
-  detector->dog_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * detector->mem->max_nb_octaves);
+  // Create descriptor sets that can be bound in command buffer. Flat layout:
+  // [slot * max_oct + oct].
+  VkDescriptorSetLayout *dog_layouts = allocMultLayoutCopy(detector->dog_desc_set_layout, max_oct * N);
+  detector->dog_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * max_oct * N);
   VkDescriptorSetAllocateInfo dog_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                                 .descriptorPool = detector->dog_desc_pool,
-                                                .descriptorSetCount = detector->mem->max_nb_octaves,
+                                                .descriptorSetCount = max_oct * N,
                                                 .pSetLayouts = dog_layouts};
   alloc_res = vkAllocateDescriptorSets(detector->dev->device, &dog_alloc_info, detector->dog_desc_sets);
   free(dog_layouts);
@@ -562,20 +581,20 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
       return false;
     }
     VkDescriptorPoolSize ds_pool_sizes[2] = {
-        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = detector->mem->max_nb_octaves},
-        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = detector->mem->max_nb_octaves}};
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = max_oct * N},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = max_oct * N}};
     VkDescriptorPoolCreateInfo ds_pool_info = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = detector->mem->max_nb_octaves, .poolSizeCount = 2, .pPoolSizes = ds_pool_sizes};
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = max_oct * N, .poolSizeCount = 2, .pPoolSizes = ds_pool_sizes};
     if (vkCreateDescriptorPool(detector->dev->device, &ds_pool_info, NULL, &detector->downsample_desc_pool) != VK_SUCCESS)
     {
       logError(LOG_TAG, "Failed to create Downsample2x descriptor pool");
       return false;
     }
-    VkDescriptorSetLayout *ds_layouts = allocMultLayoutCopy(detector->downsample_desc_set_layout, detector->mem->max_nb_octaves);
-    detector->downsample_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * detector->mem->max_nb_octaves);
+    VkDescriptorSetLayout *ds_layouts = allocMultLayoutCopy(detector->downsample_desc_set_layout, max_oct * N);
+    detector->downsample_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * max_oct * N);
     VkDescriptorSetAllocateInfo ds_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                                  .descriptorPool = detector->downsample_desc_pool,
-                                                 .descriptorSetCount = detector->mem->max_nb_octaves,
+                                                 .descriptorSetCount = max_oct * N,
                                                  .pSetLayouts = ds_layouts};
     alloc_res = vkAllocateDescriptorSets(detector->dev->device, &ds_alloc_info, detector->downsample_desc_sets);
     free(ds_layouts);
@@ -612,23 +631,26 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
       return false;
     }
     VkDescriptorPoolSize q_pool_sizes[2] = {
-        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1},
-        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1}};
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = N},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = N}};
     VkDescriptorPoolCreateInfo q_pool_info = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = q_pool_sizes};
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = N, .poolSizeCount = 2, .pPoolSizes = q_pool_sizes};
     if (vkCreateDescriptorPool(detector->dev->device, &q_pool_info, NULL, &detector->quantize_desc_pool) != VK_SUCCESS)
     {
       logError(LOG_TAG, "Failed to create QuantizeF32ToInput descriptor pool");
       return false;
     }
-    VkDescriptorSetAllocateInfo q_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                                .descriptorPool = detector->quantize_desc_pool,
-                                                .descriptorSetCount = 1,
-                                                .pSetLayouts = &detector->quantize_desc_set_layout};
-    if (vkAllocateDescriptorSets(detector->dev->device, &q_alloc_info, &detector->quantize_desc_set) != VK_SUCCESS)
+    for (uint32_t s = 0u; s < N; ++s)
     {
-      logError(LOG_TAG, "Failed to allocate QuantizeF32ToInput descriptor set");
-      return false;
+      VkDescriptorSetAllocateInfo q_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                  .descriptorPool = detector->quantize_desc_pool,
+                                                  .descriptorSetCount = 1,
+                                                  .pSetLayouts = &detector->quantize_desc_set_layout};
+      if (vkAllocateDescriptorSets(detector->dev->device, &q_alloc_info, &detector->quantize_desc_set[s]) != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "Failed to allocate QuantizeF32ToInput descriptor set (slot %u)", s);
+        return false;
+      }
     }
   }
 
@@ -663,13 +685,13 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     return false;
   }
 
-  // Create descriptor pool to allocate descriptor sets (generic)
+  // Create descriptor pool to allocate descriptor sets (per-slot per-octave)
   VkDescriptorPoolSize extkpts_pool_sizes[3];
-  extkpts_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = detector->mem->max_nb_octaves};
-  extkpts_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = detector->mem->max_nb_octaves};
-  extkpts_pool_sizes[2] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = detector->mem->max_nb_octaves};
+  extkpts_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = max_oct * N};
+  extkpts_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = max_oct * N};
+  extkpts_pool_sizes[2] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = max_oct * N};
   VkDescriptorPoolCreateInfo extkpts_descriptor_pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                                             .maxSets = detector->mem->max_nb_octaves,
+                                                             .maxSets = max_oct * N,
                                                              .poolSizeCount = 3,
                                                              .pPoolSizes = extkpts_pool_sizes};
   if (vkCreateDescriptorPool(detector->dev->device, &extkpts_descriptor_pool_info, NULL, &detector->extractkpts_desc_pool) != VK_SUCCESS)
@@ -678,12 +700,13 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     return false;
   }
 
-  // Create descriptor sets that can be bound in command buffer
-  VkDescriptorSetLayout *extkpts_layouts = allocMultLayoutCopy(detector->extractkpts_desc_set_layout, detector->mem->max_nb_octaves);
-  detector->extractkpts_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * detector->mem->max_nb_octaves);
+  // Create descriptor sets that can be bound in command buffer. Flat layout
+  // [slot * max_oct + oct].
+  VkDescriptorSetLayout *extkpts_layouts = allocMultLayoutCopy(detector->extractkpts_desc_set_layout, max_oct * N);
+  detector->extractkpts_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * max_oct * N);
   VkDescriptorSetAllocateInfo extkpts_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                                     .descriptorPool = detector->extractkpts_desc_pool,
-                                                    .descriptorSetCount = detector->mem->max_nb_octaves,
+                                                    .descriptorSetCount = max_oct * N,
                                                     .pSetLayouts = extkpts_layouts};
 
   alloc_res = vkAllocateDescriptorSets(detector->dev->device, &extkpts_alloc_info, detector->extractkpts_desc_sets);
@@ -724,13 +747,13 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     return false;
   }
 
-  // Create descriptor pool to allocate descriptor sets (generic)
+  // Create descriptor pool to allocate descriptor sets (per-slot per-octave)
   VkDescriptorPoolSize orientation_pool_sizes[3];
-  orientation_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = detector->mem->max_nb_octaves};
-  orientation_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = detector->mem->max_nb_octaves};
-  orientation_pool_sizes[2] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = detector->mem->max_nb_octaves};
+  orientation_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = max_oct * N};
+  orientation_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = max_oct * N};
+  orientation_pool_sizes[2] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = max_oct * N};
   VkDescriptorPoolCreateInfo orientation_descriptor_pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                                                 .maxSets = detector->mem->max_nb_octaves,
+                                                                 .maxSets = max_oct * N,
                                                                  .poolSizeCount = 3,
                                                                  .pPoolSizes = orientation_pool_sizes};
   if (vkCreateDescriptorPool(detector->dev->device, &orientation_descriptor_pool_info, NULL, &detector->orientation_desc_pool) != VK_SUCCESS)
@@ -739,12 +762,13 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     return false;
   }
 
-  // Create descriptor sets that can be bound in command buffer
-  VkDescriptorSetLayout *orientation_layouts = allocMultLayoutCopy(detector->orientation_desc_set_layout, detector->mem->max_nb_octaves);
-  detector->orientation_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * detector->mem->max_nb_octaves);
+  // Create descriptor sets that can be bound in command buffer. Flat layout
+  // [slot * max_oct + oct].
+  VkDescriptorSetLayout *orientation_layouts = allocMultLayoutCopy(detector->orientation_desc_set_layout, max_oct * N);
+  detector->orientation_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * max_oct * N);
   VkDescriptorSetAllocateInfo orientation_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                                         .descriptorPool = detector->orientation_desc_pool,
-                                                        .descriptorSetCount = detector->mem->max_nb_octaves,
+                                                        .descriptorSetCount = max_oct * N,
                                                         .pSetLayouts = orientation_layouts};
 
   alloc_res = vkAllocateDescriptorSets(detector->dev->device, &orientation_alloc_info, detector->orientation_desc_sets);
@@ -781,12 +805,12 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     return false;
   }
 
-  // Create descriptor pool to allocate descriptor sets (generic)
+  // Create descriptor pool to allocate descriptor sets (per-slot per-octave)
   VkDescriptorPoolSize descriptor_pool_sizes[2];
-  descriptor_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = detector->mem->max_nb_octaves};
-  descriptor_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = detector->mem->max_nb_octaves};
+  descriptor_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = max_oct * N};
+  descriptor_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = max_oct * N};
   VkDescriptorPoolCreateInfo descriptor_descriptor_pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                                                .maxSets = detector->mem->max_nb_octaves,
+                                                                .maxSets = max_oct * N,
                                                                 .poolSizeCount = 2,
                                                                 .pPoolSizes = descriptor_pool_sizes};
   if (vkCreateDescriptorPool(detector->dev->device, &descriptor_descriptor_pool_info, NULL, &detector->descriptor_desc_pool) != VK_SUCCESS)
@@ -795,12 +819,13 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     return false;
   }
 
-  // Create descriptor sets that can be bound in command buffer
-  VkDescriptorSetLayout *descriptor_layouts = allocMultLayoutCopy(detector->descriptor_desc_set_layout, detector->mem->max_nb_octaves);
-  detector->descriptor_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * detector->mem->max_nb_octaves);
+  // Create descriptor sets that can be bound in command buffer. Flat layout
+  // [slot * max_oct + oct].
+  VkDescriptorSetLayout *descriptor_layouts = allocMultLayoutCopy(detector->descriptor_desc_set_layout, max_oct * N);
+  detector->descriptor_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * max_oct * N);
   VkDescriptorSetAllocateInfo descriptor_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                                        .descriptorPool = detector->descriptor_desc_pool,
-                                                       .descriptorSetCount = detector->mem->max_nb_octaves,
+                                                       .descriptorSetCount = max_oct * N,
                                                        .pSetLayouts = descriptor_layouts};
 
   alloc_res = vkAllocateDescriptorSets(detector->dev->device, &descriptor_alloc_info, detector->descriptor_desc_sets);
@@ -836,9 +861,9 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     }
 
     VkDescriptorPoolSize rgba_pool_sizes[1];
-    rgba_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 2};
+    rgba_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 2u * N};
     VkDescriptorPoolCreateInfo rgba_pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                                  .maxSets = 1,
+                                                  .maxSets = N,
                                                   .poolSizeCount = 1,
                                                   .pPoolSizes = rgba_pool_sizes};
     if (vkCreateDescriptorPool(detector->dev->device, &rgba_pool_info, NULL, &detector->rgba_convert_desc_pool) != VK_SUCCESS)
@@ -847,15 +872,18 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
       return false;
     }
 
-    VkDescriptorSetAllocateInfo rgba_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                                    .descriptorPool = detector->rgba_convert_desc_pool,
-                                                    .descriptorSetCount = 1,
-                                                    .pSetLayouts = &detector->rgba_convert_desc_set_layout};
-    alloc_res = vkAllocateDescriptorSets(detector->dev->device, &rgba_alloc_info, &detector->rgba_convert_desc_set);
-    if (alloc_res != VK_SUCCESS)
+    for (uint32_t s = 0u; s < N; ++s)
     {
-      logError(LOG_TAG, "Failed to allocate RGBAtoGray descriptor set");
-      return false;
+      VkDescriptorSetAllocateInfo rgba_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                     .descriptorPool = detector->rgba_convert_desc_pool,
+                                                     .descriptorSetCount = 1,
+                                                     .pSetLayouts = &detector->rgba_convert_desc_set_layout};
+      alloc_res = vkAllocateDescriptorSets(detector->dev->device, &rgba_alloc_info, &detector->rgba_convert_desc_set[s]);
+      if (alloc_res != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "Failed to allocate RGBAtoGray descriptor set (slot %u)", s);
+        return false;
+      }
     }
   }
 
@@ -885,10 +913,10 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     }
 
     VkDescriptorPoolSize rgb_pool_sizes[2];
-    rgb_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1};
-    rgb_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1};
+    rgb_pool_sizes[0] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = N};
+    rgb_pool_sizes[1] = (VkDescriptorPoolSize){.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = N};
     VkDescriptorPoolCreateInfo rgb_pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                                 .maxSets = 1,
+                                                 .maxSets = N,
                                                  .poolSizeCount = 2,
                                                  .pPoolSizes = rgb_pool_sizes};
     if (vkCreateDescriptorPool(detector->dev->device, &rgb_pool_info, NULL, &detector->rgb_convert_desc_pool) != VK_SUCCESS)
@@ -897,15 +925,18 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
       return false;
     }
 
-    VkDescriptorSetAllocateInfo rgb_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                                   .descriptorPool = detector->rgb_convert_desc_pool,
-                                                   .descriptorSetCount = 1,
-                                                   .pSetLayouts = &detector->rgb_convert_desc_set_layout};
-    alloc_res = vkAllocateDescriptorSets(detector->dev->device, &rgb_alloc_info, &detector->rgb_convert_desc_set);
-    if (alloc_res != VK_SUCCESS)
+    for (uint32_t s = 0u; s < N; ++s)
     {
-      logError(LOG_TAG, "Failed to allocate RGBtoGray descriptor set");
-      return false;
+      VkDescriptorSetAllocateInfo rgb_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                    .descriptorPool = detector->rgb_convert_desc_pool,
+                                                    .descriptorSetCount = 1,
+                                                    .pSetLayouts = &detector->rgb_convert_desc_set_layout};
+      alloc_res = vkAllocateDescriptorSets(detector->dev->device, &rgb_alloc_info, &detector->rgb_convert_desc_set[s]);
+      if (alloc_res != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "Failed to allocate RGBtoGray descriptor set (slot %u)", s);
+        return false;
+      }
     }
   }
 
@@ -1196,179 +1227,216 @@ static bool setupSyncObjects(vksift_SiftDetector detector)
   return true;
 }
 
+// Phase C-1: index helper for the flat per-slot per-octave arrays.
+// Layout: [slot * max_nb_octaves + oct]. max_nb_octaves is the static cap
+// (vksift_SiftMemory::max_nb_octaves); curr_nb_octaves <= max_nb_octaves.
+static inline uint32_t slot_oct_idx(const vksift_SiftDetector det, uint32_t slot, uint32_t oct)
+{
+  return slot * det->mem->max_nb_octaves + oct;
+}
+
+// Index helper for the slot s in [0..N) sift buffer. Slot s writes its SIFT
+// features into sift_buffer_arr[s] so concurrent waves are independent. The
+// caller-supplied target_buffer_idx (vksift_dispatchSiftDetection's parameter)
+// is honored for slot 0 (legacy single-slot path); slots [1..N) hard-bind to
+// their own index.
+static inline uint32_t slot_sift_buffer_idx(const vksift_SiftDetector det, uint32_t slot)
+{
+  if (slot == 0u) return det->curr_buffer_idx;
+  // Clamp to nb_sift_buffer-1 if the user under-provisioned. Phase C-2 will
+  // bump default sift_buffer_count to nb_pyramid_slots so this clamp is
+  // never hit in practice.
+  uint32_t nb = det->mem->nb_sift_buffer;
+  if (nb == 0u) nb = 1u;
+  return (slot < nb) ? slot : (nb - 1u);
+}
+
 static bool writeDescriptorSets(vksift_SiftDetector detector)
 {
+  uint32_t N = detector->mem->nb_pyramid_slots;
+  if (N == 0u) N = 1u;
   /////////////////////////////////////////////////////
   // Write bindings for the per-slot WarpParamsUBO descriptor sets
   // (set = 1 in AffineWarp.comp + QuantizeF32ToInput.comp). Each set's
   // binding 0 points at mem->slots[s].warp_params_ubo.
+  for (uint32_t s = 0u; s < N; ++s)
   {
-    uint32_t n_slots = detector->mem->nb_pyramid_slots;
-    if (n_slots == 0u) n_slots = 1u;
-    for (uint32_t s = 0u; s < n_slots; ++s)
-    {
-      VkDescriptorBufferInfo bi = {.buffer = detector->mem->slots[s].warp_params_ubo,
-                                   .offset = 0, .range = VK_WHOLE_SIZE};
-      VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                .dstSet = detector->warp_ubo_desc_sets[s],
-                                .dstBinding = 0, .dstArrayElement = 0,
-                                .descriptorCount = 1,
-                                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                                .pBufferInfo = &bi};
-      vkUpdateDescriptorSets(detector->dev->device, 1, &w, 0, NULL);
-    }
+    VkDescriptorBufferInfo bi = {.buffer = detector->mem->slots[s].warp_params_ubo,
+                                 .offset = 0, .range = VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                              .dstSet = detector->warp_ubo_desc_sets[s],
+                              .dstBinding = 0, .dstArrayElement = 0,
+                              .descriptorCount = 1,
+                              .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                              .pBufferInfo = &bi};
+    vkUpdateDescriptorSets(detector->dev->device, 1, &w, 0, NULL);
   }
 
   /////////////////////////////////////////////////////
-  // Write bindings for PreBlur1D pipeline (ASIFT σ_aa pre-blur)
-  // Binds (sampler input_image_view) and (storage blurred_input_image_view).
+  // Write bindings for PreBlur1D pipeline (ASIFT σ_aa pre-blur).
+  // Per-slot: slot s binds slots[s].input_image_view (sampler) +
+  // slots[s].blurred_input_image_view (storage).
+  for (uint32_t s = 0u; s < N; ++s)
   {
     VkDescriptorImageInfo pb_in_info = {
-        .sampler = detector->image_sampler, .imageView = detector->mem->slots[0].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = detector->image_sampler, .imageView = detector->mem->slots[s].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo pb_out_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].blurred_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].blurred_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet pb_writes[2] = {
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-         .dstSet = detector->preblur_desc_set, .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1,
+         .dstSet = detector->preblur_desc_set[s], .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &pb_in_info},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-         .dstSet = detector->preblur_desc_set, .dstBinding = 1, .dstArrayElement = 0, .descriptorCount = 1,
+         .dstSet = detector->preblur_desc_set[s], .dstBinding = 1, .dstArrayElement = 0, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &pb_out_info}};
     vkUpdateDescriptorSets(detector->dev->device, 2, pb_writes, 0, NULL);
   }
 
   /////////////////////////////////////////////////////
-  // Write bindings for AffineWarp pipeline (ASIFT batch path)
-  // Binds (sampler blurred_input_image_view) and (storage warped_input_image_view).
-  // NOTE: AffineWarp now samples FROM the PreBlur1D output (blurred_input_image),
-  // not the raw input_image, so the σ_aa pre-blur is included in the warp.
+  // Write bindings for AffineWarp pipeline (ASIFT batch path) — per-slot.
+  // AffineWarp samples FROM the PreBlur1D output (blurred_input_image), not
+  // the raw input_image, so the σ_aa pre-blur is included in the warp.
+  for (uint32_t s = 0u; s < N; ++s)
   {
     VkDescriptorImageInfo aw_in_info = {
-        .sampler = detector->image_sampler, .imageView = detector->mem->slots[0].blurred_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = detector->image_sampler, .imageView = detector->mem->slots[s].blurred_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo aw_out_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].warped_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].warped_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet aw_writes[2] = {
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-         .dstSet = detector->affinewarp_desc_set, .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1,
+         .dstSet = detector->affinewarp_desc_set[s], .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &aw_in_info},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-         .dstSet = detector->affinewarp_desc_set, .dstBinding = 1, .dstArrayElement = 0, .descriptorCount = 1,
+         .dstSet = detector->affinewarp_desc_set[s], .dstBinding = 1, .dstArrayElement = 0, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &aw_out_info}};
     vkUpdateDescriptorSets(detector->dev->device, 2, aw_writes, 0, NULL);
   }
 
   /////////////////////////////////////////////////////
-  // Write sets for gaussian blur pipeline
-  for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+  // Write sets for gaussian blur pipeline (per-slot per-octave).
+  for (uint32_t s = 0u; s < N; ++s)
   {
-    VkDescriptorImageInfo blur_input_image_info = {
-        .sampler = detector->image_sampler, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorImageInfo blur_work_image_info = {
-        .sampler = detector->image_sampler, .imageView = detector->mem->slots[0].blur_tmp_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorImageInfo blur_output_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet blur_descriptor_writes[2];
-    // First write for horizontal pass
-    blur_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                       .dstSet = detector->blur_h_desc_sets[i],
-                                                       .dstBinding = 0,
-                                                       .dstArrayElement = 0,
-                                                       .descriptorCount = 1,
-                                                       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                                       .pImageInfo = &blur_input_image_info,
-                                                       .pBufferInfo = NULL,
-                                                       .pTexelBufferView = NULL};
-    blur_descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                       .dstSet = detector->blur_h_desc_sets[i],
-                                                       .dstBinding = 1,
-                                                       .dstArrayElement = 0,
-                                                       .descriptorCount = 1,
-                                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                                       .pImageInfo = &blur_work_image_info,
-                                                       .pBufferInfo = NULL,
-                                                       .pTexelBufferView = NULL};
-    vkUpdateDescriptorSets(detector->dev->device, 2, blur_descriptor_writes, 0, NULL);
-    // Then write for vertical pass
-    blur_descriptor_writes[0].dstSet = detector->blur_v_desc_sets[i];
-    blur_descriptor_writes[0].pImageInfo = &blur_work_image_info;
-    blur_descriptor_writes[1].dstSet = detector->blur_v_desc_sets[i];
-    blur_descriptor_writes[1].pImageInfo = &blur_output_image_info;
-    vkUpdateDescriptorSets(detector->dev->device, 2, blur_descriptor_writes, 0, NULL);
+    for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+    {
+      const uint32_t idx = slot_oct_idx(detector, s, i);
+      VkDescriptorImageInfo blur_input_image_info = {
+          .sampler = detector->image_sampler, .imageView = detector->mem->slots[s].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorImageInfo blur_work_image_info = {
+          .sampler = detector->image_sampler, .imageView = detector->mem->slots[s].blur_tmp_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorImageInfo blur_output_image_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkWriteDescriptorSet blur_descriptor_writes[2];
+      // First write for horizontal pass
+      blur_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                         .dstSet = detector->blur_h_desc_sets[idx],
+                                                         .dstBinding = 0,
+                                                         .dstArrayElement = 0,
+                                                         .descriptorCount = 1,
+                                                         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                         .pImageInfo = &blur_input_image_info,
+                                                         .pBufferInfo = NULL,
+                                                         .pTexelBufferView = NULL};
+      blur_descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                         .dstSet = detector->blur_h_desc_sets[idx],
+                                                         .dstBinding = 1,
+                                                         .dstArrayElement = 0,
+                                                         .descriptorCount = 1,
+                                                         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                         .pImageInfo = &blur_work_image_info,
+                                                         .pBufferInfo = NULL,
+                                                         .pTexelBufferView = NULL};
+      vkUpdateDescriptorSets(detector->dev->device, 2, blur_descriptor_writes, 0, NULL);
+      // Then write for vertical pass
+      blur_descriptor_writes[0].dstSet = detector->blur_v_desc_sets[idx];
+      blur_descriptor_writes[0].pImageInfo = &blur_work_image_info;
+      blur_descriptor_writes[1].dstSet = detector->blur_v_desc_sets[idx];
+      blur_descriptor_writes[1].pImageInfo = &blur_output_image_info;
+      vkUpdateDescriptorSets(detector->dev->device, 2, blur_descriptor_writes, 0, NULL);
+    }
   }
 
   /////////////////////////////////////////////////////
-  // Write sets for Difference of Gaussian pipeline
-  for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+  // Write sets for Difference of Gaussian pipeline (per-slot per-octave).
+  for (uint32_t s = 0u; s < N; ++s)
   {
-    VkDescriptorImageInfo dog_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorImageInfo dog_output_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_DoG_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet dog_descriptor_writes[2];
-    dog_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                      .dstSet = detector->dog_desc_sets[i],
-                                                      .dstBinding = 0,
-                                                      .dstArrayElement = 0,
-                                                      .descriptorCount = 1,
-                                                      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                                      .pImageInfo = &dog_input_image_info,
-                                                      .pBufferInfo = NULL,
-                                                      .pTexelBufferView = NULL};
-    dog_descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                      .dstSet = detector->dog_desc_sets[i],
-                                                      .dstBinding = 1,
-                                                      .dstArrayElement = 0,
-                                                      .descriptorCount = 1,
-                                                      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                                      .pImageInfo = &dog_output_image_info,
-                                                      .pBufferInfo = NULL,
-                                                      .pTexelBufferView = NULL};
-    vkUpdateDescriptorSets(detector->dev->device, 2, dog_descriptor_writes, 0, NULL);
+    for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+    {
+      const uint32_t idx = slot_oct_idx(detector, s, i);
+      VkDescriptorImageInfo dog_input_image_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorImageInfo dog_output_image_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_DoG_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkWriteDescriptorSet dog_descriptor_writes[2];
+      dog_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                        .dstSet = detector->dog_desc_sets[idx],
+                                                        .dstBinding = 0,
+                                                        .dstArrayElement = 0,
+                                                        .descriptorCount = 1,
+                                                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                        .pImageInfo = &dog_input_image_info,
+                                                        .pBufferInfo = NULL,
+                                                        .pTexelBufferView = NULL};
+      dog_descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                        .dstSet = detector->dog_desc_sets[idx],
+                                                        .dstBinding = 1,
+                                                        .dstArrayElement = 0,
+                                                        .descriptorCount = 1,
+                                                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                        .pImageInfo = &dog_output_image_info,
+                                                        .pBufferInfo = NULL,
+                                                        .pTexelBufferView = NULL};
+      vkUpdateDescriptorSets(detector->dev->device, 2, dog_descriptor_writes, 0, NULL);
+    }
   }
 
   /////////////////////////////////////////////////////
-  // Write sets for Downsample2x pipeline. Transition i reads
-  // octave_image_view_arr[i] and writes octave_image_view_arr[i+1].
-  for (uint32_t i = 0; i + 1 < detector->mem->curr_nb_octaves; i++)
+  // Write sets for Downsample2x pipeline (per-slot per-octave). Transition i
+  // reads octave_image_view_arr[i] and writes octave_image_view_arr[i+1].
+  for (uint32_t s = 0u; s < N; ++s)
   {
-    VkDescriptorImageInfo ds_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorImageInfo ds_output_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i + 1], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet ds_writes[2];
-    ds_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                          .dstSet = detector->downsample_desc_sets[i],
-                                          .dstBinding = 0,
-                                          .dstArrayElement = 0,
-                                          .descriptorCount = 1,
-                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                          .pImageInfo = &ds_input_image_info,
-                                          .pBufferInfo = NULL,
-                                          .pTexelBufferView = NULL};
-    ds_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                          .dstSet = detector->downsample_desc_sets[i],
-                                          .dstBinding = 1,
-                                          .dstArrayElement = 0,
-                                          .descriptorCount = 1,
-                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                          .pImageInfo = &ds_output_image_info,
-                                          .pBufferInfo = NULL,
-                                          .pTexelBufferView = NULL};
-    vkUpdateDescriptorSets(detector->dev->device, 2, ds_writes, 0, NULL);
+    for (uint32_t i = 0; i + 1 < detector->mem->curr_nb_octaves; i++)
+    {
+      const uint32_t idx = slot_oct_idx(detector, s, i);
+      VkDescriptorImageInfo ds_input_image_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorImageInfo ds_output_image_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_image_view_arr[i + 1], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkWriteDescriptorSet ds_writes[2];
+      ds_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                            .dstSet = detector->downsample_desc_sets[idx],
+                                            .dstBinding = 0,
+                                            .dstArrayElement = 0,
+                                            .descriptorCount = 1,
+                                            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                            .pImageInfo = &ds_input_image_info,
+                                            .pBufferInfo = NULL,
+                                            .pTexelBufferView = NULL};
+      ds_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                            .dstSet = detector->downsample_desc_sets[idx],
+                                            .dstBinding = 1,
+                                            .dstArrayElement = 0,
+                                            .descriptorCount = 1,
+                                            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                            .pImageInfo = &ds_output_image_info,
+                                            .pBufferInfo = NULL,
+                                            .pTexelBufferView = NULL};
+      vkUpdateDescriptorSets(detector->dev->device, 2, ds_writes, 0, NULL);
+    }
   }
 
   /////////////////////////////////////////////////////
-  // Write set for QuantizeF32ToInput pipeline. Binds:
-  //   0: rotated_image_view (R32F, IMAS output)
-  //   1: input_image_view   (R8_UNORM, SIFT input)
+  // Write set for QuantizeF32ToInput pipeline (per-slot). Binds:
+  //   0: slots[s].rotated_image_view (R32F, IMAS output)
+  //   1: slots[s].input_image_view   (R8_UNORM, SIFT input)
+  for (uint32_t s = 0u; s < N; ++s)
   {
     VkDescriptorImageInfo q_in_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].rotated_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].rotated_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo q_out_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet q_writes[2];
     q_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                         .dstSet = detector->quantize_desc_set,
+                                         .dstSet = detector->quantize_desc_set[s],
                                          .dstBinding = 0,
                                          .dstArrayElement = 0,
                                          .descriptorCount = 1,
@@ -1377,7 +1445,7 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
                                          .pBufferInfo = NULL,
                                          .pTexelBufferView = NULL};
     q_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                         .dstSet = detector->quantize_desc_set,
+                                         .dstSet = detector->quantize_desc_set[s],
                                          .dstBinding = 1,
                                          .dstArrayElement = 0,
                                          .descriptorCount = 1,
@@ -1389,164 +1457,187 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
   }
 
   /////////////////////////////////////////////////////
-  // Write sets for ExtractKeypoints pipeline
-  for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+  // Write sets for ExtractKeypoints pipeline (per-slot per-octave). The
+  // descriptor binds sift_buffer_arr[slot_sift_buffer_idx(s)] so slot s writes
+  // into an independent buffer; slot 0 honors curr_buffer_idx for legacy
+  // compatibility with vksift_dispatchSiftDetection.
+  for (uint32_t s = 0u; s < N; ++s)
   {
-    VkDescriptorImageInfo dog_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_DoG_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorBufferInfo sift_buffer_info = {.buffer = detector->mem->sift_buffer_arr[detector->curr_buffer_idx],
-                                               .offset = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[i],
-                                               .range = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[i]};
-    VkDescriptorBufferInfo indispatch_buffer_info = {.buffer = detector->mem->indirect_orientation_dispatch_buffer,
-                                                     .offset = detector->mem->indirect_oridesc_offset_arr[i],
-                                                     .range = sizeof(uint32_t) * 3};
-    VkWriteDescriptorSet descriptor_writes[3];
-    descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                  .dstSet = detector->extractkpts_desc_sets[i],
-                                                  .dstBinding = 0,
-                                                  .dstArrayElement = 0,
-                                                  .descriptorCount = 1,
-                                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                                  .pImageInfo = &dog_input_image_info,
-                                                  .pBufferInfo = NULL,
-                                                  .pTexelBufferView = NULL};
-    descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                  .dstSet = detector->extractkpts_desc_sets[i],
-                                                  .dstBinding = 1,
-                                                  .dstArrayElement = 0,
-                                                  .descriptorCount = 1,
-                                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                                  .pImageInfo = NULL,
-                                                  .pBufferInfo = &sift_buffer_info,
-                                                  .pTexelBufferView = NULL};
-    descriptor_writes[2] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                  .dstSet = detector->extractkpts_desc_sets[i],
-                                                  .dstBinding = 2,
-                                                  .dstArrayElement = 0,
-                                                  .descriptorCount = 1,
-                                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                                  .pImageInfo = NULL,
-                                                  .pBufferInfo = &indispatch_buffer_info,
-                                                  .pTexelBufferView = NULL};
-    vkUpdateDescriptorSets(detector->dev->device, 3, descriptor_writes, 0, NULL);
+    const uint32_t buf_idx = slot_sift_buffer_idx(detector, s);
+    for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+    {
+      const uint32_t idx = slot_oct_idx(detector, s, i);
+      VkDescriptorImageInfo dog_input_image_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_DoG_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorBufferInfo sift_buffer_info = {.buffer = detector->mem->sift_buffer_arr[buf_idx],
+                                                 .offset = detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[i],
+                                                 .range = detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[i]};
+      VkDescriptorBufferInfo indispatch_buffer_info = {.buffer = detector->mem->indirect_orientation_dispatch_buffer,
+                                                       .offset = detector->mem->indirect_oridesc_offset_arr[i],
+                                                       .range = sizeof(uint32_t) * 3};
+      VkWriteDescriptorSet descriptor_writes[3];
+      descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                    .dstSet = detector->extractkpts_desc_sets[idx],
+                                                    .dstBinding = 0,
+                                                    .dstArrayElement = 0,
+                                                    .descriptorCount = 1,
+                                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                    .pImageInfo = &dog_input_image_info,
+                                                    .pBufferInfo = NULL,
+                                                    .pTexelBufferView = NULL};
+      descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                    .dstSet = detector->extractkpts_desc_sets[idx],
+                                                    .dstBinding = 1,
+                                                    .dstArrayElement = 0,
+                                                    .descriptorCount = 1,
+                                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                    .pImageInfo = NULL,
+                                                    .pBufferInfo = &sift_buffer_info,
+                                                    .pTexelBufferView = NULL};
+      descriptor_writes[2] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                    .dstSet = detector->extractkpts_desc_sets[idx],
+                                                    .dstBinding = 2,
+                                                    .dstArrayElement = 0,
+                                                    .descriptorCount = 1,
+                                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                    .pImageInfo = NULL,
+                                                    .pBufferInfo = &indispatch_buffer_info,
+                                                    .pTexelBufferView = NULL};
+      vkUpdateDescriptorSets(detector->dev->device, 3, descriptor_writes, 0, NULL);
+    }
   }
 
   /////////////////////////////////////////////////////
-  // Write sets for ComputeOrientation pipeline
-  for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+  // Write sets for ComputeOrientation pipeline (per-slot per-octave).
+  for (uint32_t s = 0u; s < N; ++s)
   {
-    VkDescriptorImageInfo octave_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorBufferInfo sift_buffer_info = {.buffer = detector->mem->sift_buffer_arr[detector->curr_buffer_idx],
-                                               .offset = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[i],
-                                               .range = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[i]};
-    VkDescriptorBufferInfo indispatch_buffer_info = {.buffer = detector->mem->indirect_descriptor_dispatch_buffer,
-                                                     .offset = detector->mem->indirect_oridesc_offset_arr[i],
-                                                     .range = sizeof(uint32_t) * 3};
+    const uint32_t buf_idx = slot_sift_buffer_idx(detector, s);
+    for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+    {
+      const uint32_t idx = slot_oct_idx(detector, s, i);
+      VkDescriptorImageInfo octave_input_image_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorBufferInfo sift_buffer_info = {.buffer = detector->mem->sift_buffer_arr[buf_idx],
+                                                 .offset = detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[i],
+                                                 .range = detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[i]};
+      VkDescriptorBufferInfo indispatch_buffer_info = {.buffer = detector->mem->indirect_descriptor_dispatch_buffer,
+                                                       .offset = detector->mem->indirect_oridesc_offset_arr[i],
+                                                       .range = sizeof(uint32_t) * 3};
 
-    VkWriteDescriptorSet descriptor_writes[3];
-    descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                  .dstSet = detector->orientation_desc_sets[i],
-                                                  .dstBinding = 0,
-                                                  .dstArrayElement = 0,
-                                                  .descriptorCount = 1,
-                                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                                  .pImageInfo = &octave_input_image_info,
-                                                  .pBufferInfo = NULL,
-                                                  .pTexelBufferView = NULL};
-    descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                  .dstSet = detector->orientation_desc_sets[i],
-                                                  .dstBinding = 1,
-                                                  .dstArrayElement = 0,
-                                                  .descriptorCount = 1,
-                                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                                  .pImageInfo = NULL,
-                                                  .pBufferInfo = &sift_buffer_info,
-                                                  .pTexelBufferView = NULL};
-    descriptor_writes[2] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                  .dstSet = detector->orientation_desc_sets[i],
-                                                  .dstBinding = 2,
-                                                  .dstArrayElement = 0,
-                                                  .descriptorCount = 1,
-                                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                                  .pImageInfo = NULL,
-                                                  .pBufferInfo = &indispatch_buffer_info,
-                                                  .pTexelBufferView = NULL};
-    vkUpdateDescriptorSets(detector->dev->device, 3, descriptor_writes, 0, NULL);
+      VkWriteDescriptorSet descriptor_writes[3];
+      descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                    .dstSet = detector->orientation_desc_sets[idx],
+                                                    .dstBinding = 0,
+                                                    .dstArrayElement = 0,
+                                                    .descriptorCount = 1,
+                                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                    .pImageInfo = &octave_input_image_info,
+                                                    .pBufferInfo = NULL,
+                                                    .pTexelBufferView = NULL};
+      descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                    .dstSet = detector->orientation_desc_sets[idx],
+                                                    .dstBinding = 1,
+                                                    .dstArrayElement = 0,
+                                                    .descriptorCount = 1,
+                                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                    .pImageInfo = NULL,
+                                                    .pBufferInfo = &sift_buffer_info,
+                                                    .pTexelBufferView = NULL};
+      descriptor_writes[2] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                    .dstSet = detector->orientation_desc_sets[idx],
+                                                    .dstBinding = 2,
+                                                    .dstArrayElement = 0,
+                                                    .descriptorCount = 1,
+                                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                    .pImageInfo = NULL,
+                                                    .pBufferInfo = &indispatch_buffer_info,
+                                                    .pTexelBufferView = NULL};
+      vkUpdateDescriptorSets(detector->dev->device, 3, descriptor_writes, 0, NULL);
+    }
   }
 
   /////////////////////////////////////////////////////
-  // Write sets for ComputeDescriptor pipeline
-  for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+  // Write sets for ComputeDescriptor pipeline (per-slot per-octave).
+  for (uint32_t s = 0u; s < N; ++s)
   {
-    VkDescriptorImageInfo octave_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorBufferInfo sift_buffer_info = {.buffer = detector->mem->sift_buffer_arr[detector->curr_buffer_idx],
-                                               .offset = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[i],
-                                               .range = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[i]};
-    VkWriteDescriptorSet descriptor_writes[2];
-    descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                  .dstSet = detector->descriptor_desc_sets[i],
-                                                  .dstBinding = 0,
-                                                  .dstArrayElement = 0,
-                                                  .descriptorCount = 1,
-                                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                                  .pImageInfo = &octave_input_image_info,
-                                                  .pBufferInfo = NULL,
-                                                  .pTexelBufferView = NULL};
-    descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                  .dstSet = detector->descriptor_desc_sets[i],
-                                                  .dstBinding = 1,
-                                                  .dstArrayElement = 0,
-                                                  .descriptorCount = 1,
-                                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                                  .pImageInfo = NULL,
-                                                  .pBufferInfo = &sift_buffer_info,
-                                                  .pTexelBufferView = NULL};
-    vkUpdateDescriptorSets(detector->dev->device, 2, descriptor_writes, 0, NULL);
+    const uint32_t buf_idx = slot_sift_buffer_idx(detector, s);
+    for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+    {
+      const uint32_t idx = slot_oct_idx(detector, s, i);
+      VkDescriptorImageInfo octave_input_image_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_image_view_arr[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorBufferInfo sift_buffer_info = {.buffer = detector->mem->sift_buffer_arr[buf_idx],
+                                                 .offset = detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[i],
+                                                 .range = detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[i]};
+      VkWriteDescriptorSet descriptor_writes[2];
+      descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                    .dstSet = detector->descriptor_desc_sets[idx],
+                                                    .dstBinding = 0,
+                                                    .dstArrayElement = 0,
+                                                    .descriptorCount = 1,
+                                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                    .pImageInfo = &octave_input_image_info,
+                                                    .pBufferInfo = NULL,
+                                                    .pTexelBufferView = NULL};
+      descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                    .dstSet = detector->descriptor_desc_sets[idx],
+                                                    .dstBinding = 1,
+                                                    .dstArrayElement = 0,
+                                                    .descriptorCount = 1,
+                                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                    .pImageInfo = NULL,
+                                                    .pBufferInfo = &sift_buffer_info,
+                                                    .pTexelBufferView = NULL};
+      vkUpdateDescriptorSets(detector->dev->device, 2, descriptor_writes, 0, NULL);
+    }
   }
 
   /////////////////////////////////////////////////////
-  // Write sets for RGBAtoGray pipeline (only when use_rgba_input)
+  // Write sets for RGBAtoGray pipeline (only when use_rgba_input). Per-slot.
   if (detector->use_rgba_input)
   {
-    VkDescriptorImageInfo rgba_input_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].rgba_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorImageInfo gray_output_image_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet rgba_descriptor_writes[2];
-    rgba_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                        .dstSet = detector->rgba_convert_desc_set,
-                                                        .dstBinding = 0,
-                                                        .dstArrayElement = 0,
-                                                        .descriptorCount = 1,
-                                                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                                        .pImageInfo = &rgba_input_image_info,
-                                                        .pBufferInfo = NULL,
-                                                        .pTexelBufferView = NULL};
-    rgba_descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                        .dstSet = detector->rgba_convert_desc_set,
-                                                        .dstBinding = 1,
-                                                        .dstArrayElement = 0,
-                                                        .descriptorCount = 1,
-                                                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                                        .pImageInfo = &gray_output_image_info,
-                                                        .pBufferInfo = NULL,
-                                                        .pTexelBufferView = NULL};
-    vkUpdateDescriptorSets(detector->dev->device, 2, rgba_descriptor_writes, 0, NULL);
+    for (uint32_t s = 0u; s < N; ++s)
+    {
+      VkDescriptorImageInfo rgba_input_image_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].rgba_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorImageInfo gray_output_image_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkWriteDescriptorSet rgba_descriptor_writes[2];
+      rgba_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                          .dstSet = detector->rgba_convert_desc_set[s],
+                                                          .dstBinding = 0,
+                                                          .dstArrayElement = 0,
+                                                          .descriptorCount = 1,
+                                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                          .pImageInfo = &rgba_input_image_info,
+                                                          .pBufferInfo = NULL,
+                                                          .pTexelBufferView = NULL};
+      rgba_descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                          .dstSet = detector->rgba_convert_desc_set[s],
+                                                          .dstBinding = 1,
+                                                          .dstArrayElement = 0,
+                                                          .descriptorCount = 1,
+                                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                          .pImageInfo = &gray_output_image_info,
+                                                          .pBufferInfo = NULL,
+                                                          .pTexelBufferView = NULL};
+      vkUpdateDescriptorSets(detector->dev->device, 2, rgba_descriptor_writes, 0, NULL);
+    }
   }
 
   /////////////////////////////////////////////////////
-  // Write sets for RGBtoGray pipeline (only when use_rgb_input)
+  // Write sets for RGBtoGray pipeline (only when use_rgb_input). Per-slot.
   if (detector->use_rgb_input)
   {
-    VkDescriptorBufferInfo rgb_ssbo_info = {
-        .buffer = detector->mem->slots[0].rgb_input_buffer, .offset = 0, .range = VK_WHOLE_SIZE};
-    VkDescriptorImageInfo rgb_gray_output_info = {
-        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[0].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet rgb_descriptor_writes[2];
-    rgb_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                       .dstSet = detector->rgb_convert_desc_set,
+    for (uint32_t s = 0u; s < N; ++s)
+    {
+      VkDescriptorBufferInfo rgb_ssbo_info = {
+          .buffer = detector->mem->slots[s].rgb_input_buffer, .offset = 0, .range = VK_WHOLE_SIZE};
+      VkDescriptorImageInfo rgb_gray_output_info = {
+          .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+      VkWriteDescriptorSet rgb_descriptor_writes[2];
+      rgb_descriptor_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                         .dstSet = detector->rgb_convert_desc_set[s],
                                                        .dstBinding = 0,
                                                        .dstArrayElement = 0,
                                                        .descriptorCount = 1,
@@ -1554,25 +1645,27 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
                                                        .pImageInfo = NULL,
                                                        .pBufferInfo = &rgb_ssbo_info,
                                                        .pTexelBufferView = NULL};
-    rgb_descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                       .dstSet = detector->rgb_convert_desc_set,
-                                                       .dstBinding = 1,
-                                                       .dstArrayElement = 0,
-                                                       .descriptorCount = 1,
-                                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                                       .pImageInfo = &rgb_gray_output_info,
-                                                       .pBufferInfo = NULL,
-                                                       .pTexelBufferView = NULL};
-    vkUpdateDescriptorSets(detector->dev->device, 2, rgb_descriptor_writes, 0, NULL);
+      rgb_descriptor_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                         .dstSet = detector->rgb_convert_desc_set[s],
+                                                         .dstBinding = 1,
+                                                         .dstArrayElement = 0,
+                                                         .descriptorCount = 1,
+                                                         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                         .pImageInfo = &rgb_gray_output_info,
+                                                         .pBufferInfo = NULL,
+                                                         .pTexelBufferView = NULL};
+      vkUpdateDescriptorSets(detector->dev->device, 2, rgb_descriptor_writes, 0, NULL);
+    }
   }
 
   return true;
 }
 
-static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf)
+static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx)
 {
   /////////////////////////////////////////////////
-  // Copy input image
+  // Copy input image — into slots[slot_idx].input_image. Also syncs
+  // cached_input_image (single-instance) from the just-populated slot input.
   /////////////////////////////////////////////////
   beginMarkerRegion(detector, cmdbuf, "CopyInputImage");
   VkImageMemoryBarrier image_barrier;
@@ -1582,7 +1675,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
     // RGBA path: copy staging → rgba_input_image, then compute shader → input_image
     // Transition rgba_input_image for transfer write
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].rgba_input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        detector->mem->slots[slot_idx].rgba_input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
@@ -1595,12 +1688,12 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
         .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
         .imageOffset = {.x = 0, .y = 0, .z = 0},
         .imageExtent = {.width = detector->mem->curr_input_image_width, .height = detector->mem->curr_input_image_height, .depth = 1}};
-    vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->slots[0].rgba_input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+    vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->slots[slot_idx].rgba_input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                            &buffer_image_region);
 
     // Transition rgba_input_image to GENERAL for compute read
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].rgba_input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        detector->mem->slots[slot_idx].rgba_input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
@@ -1608,7 +1701,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
 
     // Transition input_image (R8) to GENERAL for compute write
     VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[slot_idx].input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &input_barrier);
@@ -1616,13 +1709,13 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
     // Dispatch RGBA→Gray compute shader
     vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->rgba_convert_pipeline);
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->rgba_convert_pipeline_layout, 0, 1,
-                            &detector->rgba_convert_desc_set, 0, NULL);
+                            &detector->rgba_convert_desc_set[slot_idx], 0, NULL);
     vkCmdDispatch(cmdbuf, (uint32_t)ceilf((float)detector->mem->curr_input_image_width / 8.f),
                   (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
 
     // Transition input_image from compute write to shader read (for scale-space blit)
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[slot_idx].input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
@@ -1636,7 +1729,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
 
     // Copy staging buffer → device-local RGB buffer
     VkBufferCopy buf_copy = {.srcOffset = 0, .dstOffset = 0, .size = rgb_size};
-    vkCmdCopyBuffer(cmdbuf, detector->mem->image_staging_buffer, detector->mem->slots[0].rgb_input_buffer, 1, &buf_copy);
+    vkCmdCopyBuffer(cmdbuf, detector->mem->image_staging_buffer, detector->mem->slots[slot_idx].rgb_input_buffer, 1, &buf_copy);
 
     // Barrier: transfer write to RGB buffer → shader read
     VkBufferMemoryBarrier buf_barrier = {
@@ -1645,14 +1738,14 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = detector->mem->slots[0].rgb_input_buffer,
+        .buffer = detector->mem->slots[slot_idx].rgb_input_buffer,
         .offset = 0,
         .size = VK_WHOLE_SIZE};
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &buf_barrier, 0, NULL);
 
     // Transition input_image (R8) to GENERAL for compute write
     VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[slot_idx].input_image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &input_barrier);
@@ -1660,13 +1753,13 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
     // Dispatch RGB→Gray compute shader with push constant for image width
     vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->rgb_convert_pipeline);
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->rgb_convert_pipeline_layout, 0, 1,
-                            &detector->rgb_convert_desc_set, 0, NULL);
+                            &detector->rgb_convert_desc_set[slot_idx], 0, NULL);
     vkCmdPushConstants(cmdbuf, detector->rgb_convert_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &W);
     vkCmdDispatch(cmdbuf, (uint32_t)ceilf((float)W / 8.f), (uint32_t)ceilf((float)H / 8.f), 1);
 
     // Transition input_image from compute write to shader read (for scale-space blit)
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[slot_idx].input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
@@ -1675,7 +1768,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
   {
     // Grayscale path: copy staging → input_image directly (original code)
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        detector->mem->slots[slot_idx].input_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
@@ -1687,11 +1780,11 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
         .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
         .imageOffset = {.x = 0, .y = 0, .z = 0},
         .imageExtent = {.width = detector->mem->curr_input_image_width, .height = detector->mem->curr_input_image_height, .depth = 1}};
-    vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->slots[0].input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+    vkCmdCopyBufferToImage(cmdbuf, detector->mem->image_staging_buffer, detector->mem->slots[slot_idx].input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                            &buffer_image_region);
 
     image_barrier = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[slot_idx].input_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
@@ -1704,7 +1797,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
   {
     VkImageMemoryBarrier barriers[2];
     barriers[0] = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].input_image,
+        detector->mem->slots[slot_idx].input_image,
         VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_ACCESS_TRANSFER_READ_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
@@ -1728,7 +1821,7 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
         .dstOffset = {0, 0, 0},
         .extent = {detector->mem->curr_input_image_width, detector->mem->curr_input_image_height, 1}};
     vkCmdCopyImage(cmdbuf,
-        detector->mem->slots[0].input_image,        VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[slot_idx].input_image, VK_IMAGE_LAYOUT_GENERAL,
         detector->mem->cached_input_image, VK_IMAGE_LAYOUT_GENERAL,
         1, &region);
 
@@ -1749,15 +1842,15 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
 
 // Records the on-IMAS variant of input-image population: instead of copying
 // from the host staging buffer, runs the QuantizeF32ToInput compute shader to
-// copy device-side from mem->slots[0].rotated_image (R32F, IMAS output) into
-// mem->slots[0].input_image (R8_UNORM). Dispatch dims come from detector->quantize_width
-// / quantize_height, which the caller sets per-tilt before submitting the
-// from-IMAS detection command buffer.
-static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf)
+// copy device-side from mem->slots[slot_idx].rotated_image (R32F, IMAS output)
+// into mem->slots[slot_idx].input_image (R8_UNORM). Dispatch dims come from
+// detector->quantize_width / quantize_height (legacy non-fused path) or the
+// slot's indirect-dispatch buffer (fused path); both encode the same value.
+static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx)
 {
   beginMarkerRegion(detector, cmdbuf, "Quantize IMAS → input");
   VkImageMemoryBarrier rotated_barrier = vkenv_genImageMemoryBarrier(
-      detector->mem->slots[0].rotated_image,
+      detector->mem->slots[slot_idx].rotated_image,
       VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
       VK_ACCESS_SHADER_READ_BIT,
       VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
@@ -1769,7 +1862,7 @@ static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBu
       0, 0, NULL, 0, NULL, 1, &rotated_barrier);
 
   VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
-      detector->mem->slots[0].input_image,
+      detector->mem->slots[slot_idx].input_image,
       0, VK_ACCESS_SHADER_WRITE_BIT,
       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
@@ -1787,15 +1880,15 @@ static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBu
   // this pre-recorded command buffer.
   vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline);
   vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
-                          0, 1, &detector->quantize_desc_set, 0, NULL);
+                          0, 1, &detector->quantize_desc_set[slot_idx], 0, NULL);
   vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
-                          1, 1, &detector->warp_ubo_desc_sets[0], 0, NULL);
+                          1, 1, &detector->warp_ubo_desc_sets[slot_idx], 0, NULL);
   vkCmdDispatch(cmdbuf,
       (uint32_t)ceilf((float)detector->mem->curr_input_image_width / 8.f),
       (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
 
   VkImageMemoryBarrier post_barrier = vkenv_genImageMemoryBarrier(
-      detector->mem->slots[0].input_image,
+      detector->mem->slots[slot_idx].input_image,
       VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
       VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
@@ -1807,16 +1900,17 @@ static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBu
   endMarkerRegion(detector, cmdbuf);
 }
 
-static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, const uint32_t oct_idx)
+static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, const uint32_t oct_idx)
 {
   /////////////////////////////////////////////////
-  // Scale space construction
+  // Scale space construction (per-slot per-octave)
   /////////////////////////////////////////////////
   beginMarkerRegion(detector, cmdbuf, "Scale space construction");
 
   VkImageMemoryBarrier image_barriers[2];
   uint32_t nb_scales = detector->mem->nb_scales_per_octave;
   GaussianBlurPushConsts blur_push_const;
+  const uint32_t oct_set_idx = slot_oct_idx(detector, slot_idx, oct_idx);
 
   // Octave 0: dispatch PreBlur1D (input → blurred_input) then AffineWarp
   // (blurred_input → warped_input) BEFORE the blur pipeline is bound. The
@@ -1829,7 +1923,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
 
     // PreBlur1D: input_image → blurred_input_image.
     image_barriers[0] = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].blurred_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
+        detector->mem->slots[slot_idx].blurred_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
@@ -1838,7 +1932,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
 
     vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->preblur_pipeline);
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->preblur_pipeline_layout,
-                            0, 1, &detector->preblur_desc_set, 0, NULL);
+                            0, 1, &detector->preblur_desc_set[slot_idx], 0, NULL);
     PreBlur1DPushConsts pb_pc = {
         .sigma = detector->pending_blur_sigma,
         .dir_x = detector->pending_blur_dir_x,
@@ -1852,12 +1946,12 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
 
     // Barrier: blurred_input_image SHADER_WRITE → SHADER_READ for AffineWarp's sampler.
     image_barriers[0] = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].blurred_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        detector->mem->slots[slot_idx].blurred_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
     image_barriers[1] = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].warped_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
+        detector->mem->slots[slot_idx].warped_input_image, 0, VK_ACCESS_SHADER_WRITE_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
@@ -1866,19 +1960,20 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
 
     vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->affinewarp_pipeline);
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->affinewarp_pipeline_layout,
-                            0, 1, &detector->affinewarp_desc_set, 0, NULL);
-    // set = 1: WarpParamsUBO for slot 0. Phase B-2 reads pending_warp_* +
+                            0, 1, &detector->affinewarp_desc_set[slot_idx], 0, NULL);
+    // set = 1: WarpParamsUBO for slot slot_idx. Phase B-2 reads pending_warp_* +
     // curr_input_image_* from the UBO that the host populated in
-    // dispatchDetectionCmdBuffer below before this command buffer ran.
+    // dispatchDetectionCmdBuffer (slot 0) or vksift_dispatchFusedImasWarpForSlot
+    // (slot s) before this command buffer ran.
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->affinewarp_pipeline_layout,
-                            1, 1, &detector->warp_ubo_desc_sets[0], 0, NULL);
+                            1, 1, &detector->warp_ubo_desc_sets[slot_idx], 0, NULL);
     vkCmdDispatch(cmdbuf,
                   (uint32_t)ceilf((float)detector->mem->curr_input_image_width  / 8.f),
                   (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
 
     // Barrier: warped_input_image SHADER_WRITE → TRANSFER_READ for the BlitImage below.
     image_barriers[0] = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].warped_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        detector->mem->slots[slot_idx].warped_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
@@ -1900,14 +1995,14 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
         .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
         .dstOffsets = {{0, 0, 0},
                        {(int32_t)detector->mem->octave_resolutions[oct_idx].width, (int32_t)detector->mem->octave_resolutions[oct_idx].height, 1}}};
-    vkCmdBlitImage(cmdbuf, detector->mem->slots[0].warped_input_image, VK_IMAGE_LAYOUT_GENERAL,
-                   detector->mem->slots[0].octave_image_arr[oct_idx], VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
+    vkCmdBlitImage(cmdbuf, detector->mem->slots[slot_idx].warped_input_image, VK_IMAGE_LAYOUT_GENERAL,
+                   detector->mem->slots[slot_idx].octave_image_arr[oct_idx], VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
 
     // Setup memory access (horizontal pass read from source scale and write to temporary restul image)
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].blur_tmp_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].blur_tmp_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_image_arr[oct_idx], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}); // only scale 0
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
@@ -1919,15 +2014,15 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
     memcpy(blur_push_const.kernel, detector->gaussian_kernels, sizeof(float) * VKSIFT_DETECTOR_MAX_GAUSSIAN_KERNEL_SIZE);
 
     vkCmdPushConstants(cmdbuf, detector->blur_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GaussianBlurPushConsts), &blur_push_const);
-    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline_layout, 0, 1, &detector->blur_h_desc_sets[oct_idx], 0, NULL);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline_layout, 0, 1, &detector->blur_h_desc_sets[oct_set_idx], 0, NULL);
     vkCmdDispatch(cmdbuf, ceilf((float)(detector->mem->octave_resolutions[oct_idx].width) / 8.f),
                   ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), 1);
 
     // Setup the memory access masks for vertical pass (read from temp result and write to target scale)
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}); // only scale 0
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
@@ -1935,7 +2030,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
     // Vertical blur the first scale
     blur_push_const.is_vertical = 1;
     vkCmdPushConstants(cmdbuf, detector->blur_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GaussianBlurPushConsts), &blur_push_const);
-    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline_layout, 0, 1, &detector->blur_v_desc_sets[oct_idx], 0, NULL);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline_layout, 0, 1, &detector->blur_v_desc_sets[oct_set_idx], 0, NULL);
     vkCmdDispatch(cmdbuf, ceilf((float)(detector->mem->octave_resolutions[oct_idx].width) / 8.f),
                   ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), 1);
   }
@@ -1944,10 +2039,10 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
   {
     // Gaussian blur from one scale to the next
     // Setup read/write access for relevant scales
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_image_arr[oct_idx], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, scale_i - 1, 1}); // ony prev scale
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
@@ -1960,14 +2055,14 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
            sizeof(float) * VKSIFT_DETECTOR_MAX_GAUSSIAN_KERNEL_SIZE);
 
     vkCmdPushConstants(cmdbuf, detector->blur_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GaussianBlurPushConsts), &blur_push_const);
-    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline_layout, 0, 1, &detector->blur_h_desc_sets[oct_idx], 0, NULL);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline_layout, 0, 1, &detector->blur_h_desc_sets[oct_set_idx], 0, NULL);
     vkCmdDispatch(cmdbuf, ceilf((float)(detector->mem->octave_resolutions[oct_idx].width) / 8.f),
                   ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), 1);
     // Change read/write acces for vertical pass
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, scale_i, 1}); // ony curr scale
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
@@ -1977,12 +2072,12 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
     blur_push_const.array_layer = scale_i;
 
     vkCmdPushConstants(cmdbuf, detector->blur_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GaussianBlurPushConsts), &blur_push_const);
-    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline_layout, 0, 1, &detector->blur_v_desc_sets[oct_idx], 0, NULL);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline_layout, 0, 1, &detector->blur_v_desc_sets[oct_set_idx], 0, NULL);
     vkCmdDispatch(cmdbuf, ceilf((float)(detector->mem->octave_resolutions[oct_idx].width) / 8.f),
                   ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), 1);
 
     // Make sure the scale image writes are available for compute
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, scale_i, 1}); // ony curr scale
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
@@ -1997,14 +2092,14 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
     // at higher octaves. The compute shader is pixel-aligned with the
     // keypoint coord-conversion formula.
 
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
 
     vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->downsample_pipeline);
     vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->downsample_pipeline_layout, 0, 1,
-                            &detector->downsample_desc_sets[oct_idx], 0, NULL);
+                            &detector->downsample_desc_sets[oct_set_idx], 0, NULL);
     Downsample2xPushConsts ds_pc = {.src_layer = (int32_t)nb_scales,
                                     .dst_layer = 0,
                                     .dst_width = (int32_t)detector->mem->octave_resolutions[oct_idx + 1].width,
@@ -2012,7 +2107,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
     vkCmdPushConstants(cmdbuf, detector->downsample_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Downsample2xPushConsts), &ds_pc);
     vkCmdDispatch(cmdbuf, ceilf((float)ds_pc.dst_width / 8.f), ceilf((float)ds_pc.dst_height / 8.f), 1);
 
-    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_image_arr[oct_idx + 1], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
@@ -2021,13 +2116,13 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
   endMarkerRegion(detector, cmdbuf);
 }
 
-static void recDifferenceOfGaussianCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, const uint32_t oct_begin, const uint32_t oct_count)
+static void recDifferenceOfGaussianCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, const uint32_t oct_begin, const uint32_t oct_count)
 {
   VkImageMemoryBarrier *image_barriers = (VkImageMemoryBarrier *)malloc(sizeof(VkImageMemoryBarrier) * oct_count);
   uint32_t nb_scales = detector->mem->nb_scales_per_octave;
 
   /////////////////////////////////////////////////
-  // DifferenceOfGaussian
+  // DifferenceOfGaussian (per-slot per-octave)
   /////////////////////////////////////////////////
   beginMarkerRegion(detector, cmdbuf, "DoG computation");
 
@@ -2036,14 +2131,15 @@ static void recDifferenceOfGaussianCmds(vksift_SiftDetector detector, VkCommandB
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
     image_barriers[oct_idx - oct_begin] = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[0].octave_DoG_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        detector->mem->slots[slot_idx].octave_DoG_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, nb_scales + 2});
   }
   vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, oct_count, image_barriers);
 
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
-    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->dog_pipeline_layout, 0, 1, &detector->dog_desc_sets[oct_idx], 0, NULL);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->dog_pipeline_layout, 0, 1,
+                            &detector->dog_desc_sets[slot_oct_idx(detector, slot_idx, oct_idx)], 0, NULL);
     vkCmdDispatch(cmdbuf, ceilf((float)(detector->mem->octave_resolutions[oct_idx].width) / 8.f),
                   ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), nb_scales + 2);
   }
@@ -2052,7 +2148,7 @@ static void recDifferenceOfGaussianCmds(vksift_SiftDetector detector, VkCommandB
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
     image_barriers[oct_idx - oct_begin] =
-        vkenv_genImageMemoryBarrier(detector->mem->slots[0].octave_DoG_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_DoG_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, nb_scales + 2});
   }
@@ -2063,9 +2159,10 @@ static void recDifferenceOfGaussianCmds(vksift_SiftDetector detector, VkCommandB
   free(image_barriers);
 }
 
-static void recClearBufferDataCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, const uint32_t oct_begin, const uint32_t oct_count)
+static void recClearBufferDataCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, const uint32_t oct_begin, const uint32_t oct_count)
 {
   beginMarkerRegion(detector, cmdbuf, "Clear buffer data");
+  const uint32_t buf_idx = slot_sift_buffer_idx(detector, slot_idx);
 
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
@@ -2074,10 +2171,10 @@ static void recClearBufferDataCmds(vksift_SiftDetector detector, VkCommandBuffer
     vkCmdFillBuffer(cmdbuf, detector->mem->indirect_descriptor_dispatch_buffer, detector->mem->indirect_oridesc_offset_arr[oct_idx], sizeof(uint32_t) * 3,
                     1);
     // Only reset the indirect dispatch buffers and the SIFT buffer section headers (sift counter and max nb sift)
-    uint32_t sift_section_offset = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[oct_idx];
-    uint32_t section_max_nb_feat = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_max_nb_feat_arr[oct_idx];
-    vkCmdFillBuffer(cmdbuf, detector->mem->sift_buffer_arr[detector->curr_buffer_idx], sift_section_offset, sizeof(uint32_t), 0);
-    vkCmdFillBuffer(cmdbuf, detector->mem->sift_buffer_arr[detector->curr_buffer_idx], sift_section_offset + sizeof(uint32_t), sizeof(uint32_t),
+    uint32_t sift_section_offset = detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[oct_idx];
+    uint32_t section_max_nb_feat = detector->mem->sift_buffers_info[buf_idx].octave_section_max_nb_feat_arr[oct_idx];
+    vkCmdFillBuffer(cmdbuf, detector->mem->sift_buffer_arr[buf_idx], sift_section_offset, sizeof(uint32_t), 0);
+    vkCmdFillBuffer(cmdbuf, detector->mem->sift_buffer_arr[buf_idx], sift_section_offset + sizeof(uint32_t), sizeof(uint32_t),
                     section_max_nb_feat);
 
     // Set the group size x to 0 for the orientation and descriptor
@@ -2088,13 +2185,14 @@ static void recClearBufferDataCmds(vksift_SiftDetector detector, VkCommandBuffer
   endMarkerRegion(detector, cmdbuf);
 }
 
-static void recExtractKeypointsCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t oct_begin, uint32_t oct_count)
+static void recExtractKeypointsCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, uint32_t oct_begin, uint32_t oct_count)
 {
   /////////////////////////////////////////////////
-  // Extract keypoints
+  // Extract keypoints (per-slot per-octave)
   /////////////////////////////////////////////////
   VkBufferMemoryBarrier *buffer_barriers = (VkBufferMemoryBarrier *)malloc(sizeof(VkBufferMemoryBarrier) * oct_count * 2);
-  VkBuffer sift_buffer = detector->mem->sift_buffer_arr[detector->curr_buffer_idx];
+  const uint32_t buf_idx = slot_sift_buffer_idx(detector, slot_idx);
+  VkBuffer sift_buffer = detector->mem->sift_buffer_arr[buf_idx];
 
   beginMarkerRegion(detector, cmdbuf, "ExtractKeypoints");
 
@@ -2103,8 +2201,8 @@ static void recExtractKeypointsCmds(vksift_SiftDetector detector, VkCommandBuffe
   {
     buffer_barriers[(oct_idx - oct_begin) * 2 + 0] =
         vkenv_genBufferMemoryBarrier(sift_buffer, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-                                     detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[oct_idx],
-                                     detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[oct_idx]);
+                                     detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[oct_idx],
+                                     detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[oct_idx]);
     buffer_barriers[(oct_idx - oct_begin) * 2 + 1] =
         vkenv_genBufferMemoryBarrier(detector->mem->indirect_orientation_dispatch_buffer, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED,
                                      VK_QUEUE_FAMILY_IGNORED, detector->mem->indirect_oridesc_offset_arr[oct_idx], sizeof(uint32_t) * 3);
@@ -2124,7 +2222,8 @@ static void recExtractKeypointsCmds(vksift_SiftDetector detector, VkCommandBuffe
     pushconst.nb_scales = (int32_t)detector->mem->nb_scales_per_octave;
     pushconst.use_upsampling = detector->mem->use_upsampling ? 1 : 0;
     vkCmdPushConstants(cmdbuf, detector->extractkpts_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ExtractKeypointsPushConsts), &pushconst);
-    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->extractkpts_pipeline_layout, 0, 1, &detector->extractkpts_desc_sets[oct_idx],
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->extractkpts_pipeline_layout, 0, 1,
+                            &detector->extractkpts_desc_sets[slot_oct_idx(detector, slot_idx, oct_idx)],
                             0, NULL);
     // Both 2D and boundary-aware 3D NMS now dispatch ALL DoG slices
     // (nb_scales + 2). The 3D shader handles boundary slices (s == 0,
@@ -2138,8 +2237,8 @@ static void recExtractKeypointsCmds(vksift_SiftDetector detector, VkCommandBuffe
   {
     buffer_barriers[oct_idx - oct_begin] =
         vkenv_genBufferMemoryBarrier(sift_buffer, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-                                     detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[oct_idx],
-                                     detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[oct_idx]);
+                                     detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[oct_idx],
+                                     detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[oct_idx]);
   }
   vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, oct_count, buffer_barriers, 0,
                        NULL);
@@ -2179,13 +2278,14 @@ static void recExtractKeypointsCmds(vksift_SiftDetector detector, VkCommandBuffe
   free(buffer_barriers);
 }
 
-static void recComputeOrientationsCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, const uint32_t oct_begin, const uint32_t oct_count)
+static void recComputeOrientationsCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, const uint32_t oct_begin, const uint32_t oct_count)
 {
   /////////////////////////////////////////////////
-  // Compute orientation
+  // Compute orientation (per-slot per-octave)
   /////////////////////////////////////////////////
   VkBufferMemoryBarrier *buffer_barriers = (VkBufferMemoryBarrier *)malloc(sizeof(VkBufferMemoryBarrier) * oct_count);
-  VkBuffer sift_buffer = detector->mem->sift_buffer_arr[detector->curr_buffer_idx];
+  const uint32_t buf_idx = slot_sift_buffer_idx(detector, slot_idx);
+  VkBuffer sift_buffer = detector->mem->sift_buffer_arr[buf_idx];
 
   beginMarkerRegion(detector, cmdbuf, "ComputeOrientation");
   // Prepare the descriptor pipeline indirect dispatch buffer for writes access and make sure previous writes are visible
@@ -2201,7 +2301,8 @@ static void recComputeOrientationsCmds(vksift_SiftDetector detector, VkCommandBu
   vkCmdPushConstants(cmdbuf, detector->orientation_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &detector->max_nb_orientations);
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
-    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->orientation_pipeline_layout, 0, 1, &detector->orientation_desc_sets[oct_idx],
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->orientation_pipeline_layout, 0, 1,
+                            &detector->orientation_desc_sets[slot_oct_idx(detector, slot_idx, oct_idx)],
                             0, NULL);
     vkCmdDispatchIndirect(cmdbuf, detector->mem->indirect_orientation_dispatch_buffer, detector->mem->indirect_oridesc_offset_arr[oct_idx]);
   }
@@ -2211,8 +2312,8 @@ static void recComputeOrientationsCmds(vksift_SiftDetector detector, VkCommandBu
   {
     buffer_barriers[oct_idx - oct_begin] =
         vkenv_genBufferMemoryBarrier(sift_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-                                     detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[oct_idx],
-                                     detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[oct_idx]);
+                                     detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[oct_idx],
+                                     detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[oct_idx]);
   }
   vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, oct_count, buffer_barriers, 0,
                        NULL);
@@ -2231,10 +2332,10 @@ static void recComputeOrientationsCmds(vksift_SiftDetector detector, VkCommandBu
   free(buffer_barriers);
 }
 
-static void recComputeDestriptorsCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, const uint32_t oct_begin, const uint32_t oct_count)
+static void recComputeDestriptorsCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, const uint32_t oct_begin, const uint32_t oct_count)
 {
   /////////////////////////////////////////////////
-  // Compute descriptor
+  // Compute descriptor (per-slot per-octave)
   /////////////////////////////////////////////////
   beginMarkerRegion(detector, cmdbuf, "ComputeDescriptors");
   vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->descriptor_pipeline);
@@ -2242,20 +2343,22 @@ static void recComputeDestriptorsCmds(vksift_SiftDetector detector, VkCommandBuf
   vkCmdPushConstants(cmdbuf, detector->descriptor_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &detector->use_vlfeat_format);
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
-    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->descriptor_pipeline_layout, 0, 1, &detector->descriptor_desc_sets[oct_idx],
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->descriptor_pipeline_layout, 0, 1,
+                            &detector->descriptor_desc_sets[slot_oct_idx(detector, slot_idx, oct_idx)],
                             0, NULL);
     vkCmdDispatchIndirect(cmdbuf, detector->mem->indirect_descriptor_dispatch_buffer, detector->mem->indirect_oridesc_offset_arr[oct_idx]);
   }
   endMarkerRegion(detector, cmdbuf);
 }
 
-static void recCopySIFTCountCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, const uint32_t oct_begin, const uint32_t oct_count)
+static void recCopySIFTCountCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, const uint32_t oct_begin, const uint32_t oct_count)
 {
   /////////////////////////////////////////////////
-  // Copy SIFT count to staging
+  // Copy SIFT count to staging (per-slot sift buffer)
   /////////////////////////////////////////////////
   VkBufferMemoryBarrier *buffer_barriers = (VkBufferMemoryBarrier *)malloc(sizeof(VkBufferMemoryBarrier) * oct_count);
-  VkBuffer sift_buffer = detector->mem->sift_buffer_arr[detector->curr_buffer_idx];
+  const uint32_t buf_idx = slot_sift_buffer_idx(detector, slot_idx);
+  VkBuffer sift_buffer = detector->mem->sift_buffer_arr[buf_idx];
 
   beginMarkerRegion(detector, cmdbuf, "CopySiftCount");
 
@@ -2264,36 +2367,37 @@ static void recCopySIFTCountCmds(vksift_SiftDetector detector, VkCommandBuffer c
   {
     buffer_barriers[oct_idx - oct_begin] = vkenv_genBufferMemoryBarrier(
         sift_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-        detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[oct_idx],
-        detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[oct_idx]);
+        detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[oct_idx],
+        detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[oct_idx]);
   }
   vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, oct_count, buffer_barriers, 0, NULL);
 
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
-    VkBufferCopy sift_copy_region = {.srcOffset = detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[oct_idx],
+    VkBufferCopy sift_copy_region = {.srcOffset = detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[oct_idx],
                                      .dstOffset = sizeof(uint32_t) * oct_idx,
                                      .size = sizeof(uint32_t)};
-    vkCmdCopyBuffer(cmdbuf, sift_buffer, detector->mem->sift_count_staging_buffer_arr[detector->curr_buffer_idx], 1, &sift_copy_region);
+    vkCmdCopyBuffer(cmdbuf, sift_buffer, detector->mem->sift_count_staging_buffer_arr[buf_idx], 1, &sift_copy_region);
   }
   endMarkerRegion(detector, cmdbuf);
 
   free(buffer_barriers);
 }
 
-static void recBufferOwnershipTransferCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, const uint32_t oct_begin, const uint32_t oct_count,
+static void recBufferOwnershipTransferCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, const uint32_t oct_begin, const uint32_t oct_count,
                                            const uint32_t src_queue_family_idx, const uint32_t dst_queue_family_idx, VkPipelineStageFlags src_stage,
                                            VkPipelineStageFlags dst_stage)
 {
   beginMarkerRegion(detector, cmdbuf, "BufferOwnershipTransfer");
 
+  const uint32_t buf_idx = slot_sift_buffer_idx(detector, slot_idx);
   VkBufferMemoryBarrier *ownership_barriers = (VkBufferMemoryBarrier *)malloc(sizeof(VkBufferMemoryBarrier) * oct_count);
   for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
   {
     ownership_barriers[oct_idx - oct_begin] =
-        vkenv_genBufferMemoryBarrier(detector->mem->sift_buffer_arr[detector->curr_buffer_idx], 0, 0, src_queue_family_idx, dst_queue_family_idx,
-                                     detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_offset_arr[oct_idx],
-                                     detector->mem->sift_buffers_info[detector->curr_buffer_idx].octave_section_size_arr[oct_idx]);
+        vkenv_genBufferMemoryBarrier(detector->mem->sift_buffer_arr[buf_idx], 0, 0, src_queue_family_idx, dst_queue_family_idx,
+                                     detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[oct_idx],
+                                     detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[oct_idx]);
   }
   vkCmdPipelineBarrier(cmdbuf, src_stage, dst_stage, 0, 0, NULL, oct_count, ownership_barriers, 0, NULL);
   free(ownership_barriers);
@@ -2341,7 +2445,7 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t
   // ---- Acquire SIFT buffer ownership if async transfer is enabled ----
   if (detector->dev->async_transfer_available)
   {
-    recBufferOwnershipTransferCmds(detector, cmd, 0, detector->mem->curr_nb_octaves,
+    recBufferOwnershipTransferCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves,
                                    detector->dev->async_transfer_queues_family_idx,
                                    detector->dev->general_queues_family_idx,
                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -2397,7 +2501,7 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t
   // ---- 1. AffineWarp (rotate) : cached_input_image → slot.rotated_image ----
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->warp_pipeline);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->warp_pipeline_layout,
-                          0, 1, &imas->warp_set, 0, NULL);
+                          0, 1, &imas->warp_set[slot_idx], 0, NULL);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->warp_pipeline_layout,
                           1, 1, &ubo_set, 0, NULL);
   vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
@@ -2416,7 +2520,7 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t
   // ---- 2. GaussBlur1D vertical : slot.rotated_image → slot.tilted_image ----
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->blur_pipeline);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->blur_pipeline_layout,
-                          0, 1, &imas->blur_set, 0, NULL);
+                          0, 1, &imas->blur_set[slot_idx], 0, NULL);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->blur_pipeline_layout,
                           1, 1, &ubo_set, 0, NULL);
   vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
@@ -2435,7 +2539,7 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t
   // ---- 3. FinvsplineRow : in-place per-row IIR on slot.tilted_image ----
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_row_pipeline);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
-                          0, 1, &imas->finvspline_row_set, 0, NULL);
+                          0, 1, &imas->finvspline_row_set[slot_idx], 0, NULL);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
                           1, 1, &ubo_set, 0, NULL);
   vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
@@ -2454,7 +2558,7 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t
   // ---- 4. FinvsplineCol : in-place per-col IIR on slot.tilted_image ----
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_col_pipeline);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
-                          0, 1, &imas->finvspline_col_set, 0, NULL);
+                          0, 1, &imas->finvspline_col_set[slot_idx], 0, NULL);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
                           1, 1, &ubo_set, 0, NULL);
   vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
@@ -2478,7 +2582,7 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t
   // descriptor set + pipeline layout so it would be a one-line swap.
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->fproj_pipeline);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->fproj_pipeline_layout,
-                          0, 1, &imas->fproj_set, 0, NULL);
+                          0, 1, &imas->fproj_set[slot_idx], 0, NULL);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->fproj_pipeline_layout,
                           1, 1, &ubo_set, 0, NULL);
   vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
@@ -2514,7 +2618,7 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
-                            0, 1, &detector->quantize_desc_set, 0, NULL);
+                            0, 1, &detector->quantize_desc_set[slot_idx], 0, NULL);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
                             1, 1, &detector->warp_ubo_desc_sets[slot_idx], 0, NULL);
     vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
@@ -2533,30 +2637,28 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t
   }
   endMarkerRegion(detector, cmd);
 
-  // ---- 7. SIFT detect chain ----
+  // ---- 7. SIFT detect chain (per-slot) ----
   // Direct dispatches; canvas is curr_input_image_* which is stable across
-  // warps. recExtractKeypointsCmds / recCopySIFTCountCmds use
-  // detector->curr_buffer_idx (host sets it before re-recording) so the
-  // target sift_buffer is the caller-requested one. SIFT-detect descriptor
-  // sets bind mem->slots[0]'s image views (Phase A holdover) — that's why
-  // Phase B-3 only exercises slot_idx == 0.
-  recClearBufferDataCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
+  // warps. recExtractKeypointsCmds / recCopySIFTCountCmds use slot_idx to
+  // pick sift_buffer_arr[slot_idx] (slot 0 honors curr_buffer_idx), so
+  // concurrent waves write to independent feature buffers.
+  recClearBufferDataCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
-    recScaleSpaceConstructionCmds(detector, cmd, i);
+    recScaleSpaceConstructionCmds(detector, cmd, slot_idx, i);
   }
-  recDifferenceOfGaussianCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
-  recExtractKeypointsCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
+  recDifferenceOfGaussianCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
+  recExtractKeypointsCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
   if (!detector->detection_only)
   {
-    recComputeOrientationsCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
-    recComputeDestriptorsCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
+    recComputeOrientationsCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
+    recComputeDestriptorsCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
   }
-  recCopySIFTCountCmds(detector, cmd, 0, detector->mem->curr_nb_octaves);
+  recCopySIFTCountCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
 
   if (detector->dev->async_transfer_available)
   {
-    recBufferOwnershipTransferCmds(detector, cmd, 0, detector->mem->curr_nb_octaves,
+    recBufferOwnershipTransferCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves,
                                    detector->dev->general_queues_family_idx,
                                    detector->dev->async_transfer_queues_family_idx,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -2585,7 +2687,10 @@ static bool recordCommandBuffers(vksift_SiftDetector detector)
       logError(LOG_TAG, "Failed to begin the release-buffer-ownership command buffer recording");
       return false;
     }
-    recBufferOwnershipTransferCmds(detector, detector->release_buffer_ownership_command_buffer, 0, detector->mem->curr_nb_octaves,
+    // Legacy single-slot ownership transfer cmd buffers use slot 0's sift buffer
+    // (= sift_buffer_arr[curr_buffer_idx]). The fused per-slot path emits its
+    // own ownership barriers inline against the correct slot's buffer.
+    recBufferOwnershipTransferCmds(detector, detector->release_buffer_ownership_command_buffer, 0u, 0, detector->mem->curr_nb_octaves,
                                    detector->dev->async_transfer_queues_family_idx, detector->dev->general_queues_family_idx,
                                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     if (vkEndCommandBuffer(detector->release_buffer_ownership_command_buffer) != VK_SUCCESS)
@@ -2599,7 +2704,7 @@ static bool recordCommandBuffers(vksift_SiftDetector detector)
       logError(LOG_TAG, "Failed to begin the acquire-buffer-ownership command buffer recording");
       return false;
     }
-    recBufferOwnershipTransferCmds(detector, detector->acquire_buffer_ownership_command_buffer, 0, detector->mem->curr_nb_octaves,
+    recBufferOwnershipTransferCmds(detector, detector->acquire_buffer_ownership_command_buffer, 0u, 0, detector->mem->curr_nb_octaves,
                                    detector->dev->general_queues_family_idx, detector->dev->async_transfer_queues_family_idx,
                                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     if (vkEndCommandBuffer(detector->acquire_buffer_ownership_command_buffer) != VK_SUCCESS)
@@ -2618,49 +2723,50 @@ static bool recordCommandBuffers(vksift_SiftDetector detector)
     return false;
   }
 
-  // We start using the SIFT buffer, is the async transfer is used we need to acquire the buffer ownership before using it
+  // We start using the SIFT buffer, is the async transfer is used we need to acquire the buffer ownership before using it.
+  // Legacy non-fused single-slot path uses slot 0 (slot_idx = 0u).
   if (detector->dev->async_transfer_available)
   {
-    recBufferOwnershipTransferCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves,
+    recBufferOwnershipTransferCmds(detector, detector->detection_command_buffer, 0u, 0, detector->mem->curr_nb_octaves,
                                    detector->dev->async_transfer_queues_family_idx, detector->dev->general_queues_family_idx,
                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
   }
 
   // Clear buffer data
-  recClearBufferDataCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
+  recClearBufferDataCmds(detector, detector->detection_command_buffer, 0u, 0, detector->mem->curr_nb_octaves);
   // Copy input image
-  recCopyInputImageCmds(detector, detector->detection_command_buffer);
+  recCopyInputImageCmds(detector, detector->detection_command_buffer, 0u);
 
   // Scale space construction
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
     // Construct each octave
-    recScaleSpaceConstructionCmds(detector, detector->detection_command_buffer, i);
+    recScaleSpaceConstructionCmds(detector, detector->detection_command_buffer, 0u, i);
   }
 
   // Compute difference of Gaussian (on full range to synchronize every octave with a single barrier)
-  recDifferenceOfGaussianCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
+  recDifferenceOfGaussianCmds(detector, detector->detection_command_buffer, 0u, 0, detector->mem->curr_nb_octaves);
 
   // Extract extrema (keypoints) from DoG images
-  recExtractKeypointsCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
+  recExtractKeypointsCmds(detector, detector->detection_command_buffer, 0u, 0, detector->mem->curr_nb_octaves);
 
   if (!detector->detection_only)
   {
     // For the main orientations of each keypoint (this creates new keypoints if there's more than one orientation)
-    recComputeOrientationsCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
+    recComputeOrientationsCmds(detector, detector->detection_command_buffer, 0u, 0, detector->mem->curr_nb_octaves);
 
     // For each oriented keypoint compute its descriptor
-    recComputeDestriptorsCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
+    recComputeDestriptorsCmds(detector, detector->detection_command_buffer, 0u, 0, detector->mem->curr_nb_octaves);
   }
 
   // Copy the number of found keypoints to the sift_count staging buffer
   // (so that when the CPU want to download the result it can download only the number of SIFT found with a custom command buffer)
-  recCopySIFTCountCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves);
+  recCopySIFTCountCmds(detector, detector->detection_command_buffer, 0u, 0, detector->mem->curr_nb_octaves);
 
   // No more operation with the buffer we can release the buffer ownership if needed
   if (detector->dev->async_transfer_available)
   {
-    recBufferOwnershipTransferCmds(detector, detector->detection_command_buffer, 0, detector->mem->curr_nb_octaves,
+    recBufferOwnershipTransferCmds(detector, detector->detection_command_buffer, 0u, 0, detector->mem->curr_nb_octaves,
                                    detector->dev->general_queues_family_idx, detector->dev->async_transfer_queues_family_idx,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
   }
@@ -2683,27 +2789,27 @@ static bool recordCommandBuffers(vksift_SiftDetector detector)
   }
   if (detector->dev->async_transfer_available)
   {
-    recBufferOwnershipTransferCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves,
+    recBufferOwnershipTransferCmds(detector, detector->detection_command_buffer_from_imas, 0u, 0, detector->mem->curr_nb_octaves,
                                    detector->dev->async_transfer_queues_family_idx, detector->dev->general_queues_family_idx,
                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
   }
-  recClearBufferDataCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
-  recQuantizeImasToInputCmds(detector, detector->detection_command_buffer_from_imas);
+  recClearBufferDataCmds(detector, detector->detection_command_buffer_from_imas, 0u, 0, detector->mem->curr_nb_octaves);
+  recQuantizeImasToInputCmds(detector, detector->detection_command_buffer_from_imas, 0u);
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
-    recScaleSpaceConstructionCmds(detector, detector->detection_command_buffer_from_imas, i);
+    recScaleSpaceConstructionCmds(detector, detector->detection_command_buffer_from_imas, 0u, i);
   }
-  recDifferenceOfGaussianCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
-  recExtractKeypointsCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
+  recDifferenceOfGaussianCmds(detector, detector->detection_command_buffer_from_imas, 0u, 0, detector->mem->curr_nb_octaves);
+  recExtractKeypointsCmds(detector, detector->detection_command_buffer_from_imas, 0u, 0, detector->mem->curr_nb_octaves);
   if (!detector->detection_only)
   {
-    recComputeOrientationsCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
-    recComputeDestriptorsCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
+    recComputeOrientationsCmds(detector, detector->detection_command_buffer_from_imas, 0u, 0, detector->mem->curr_nb_octaves);
+    recComputeDestriptorsCmds(detector, detector->detection_command_buffer_from_imas, 0u, 0, detector->mem->curr_nb_octaves);
   }
-  recCopySIFTCountCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
+  recCopySIFTCountCmds(detector, detector->detection_command_buffer_from_imas, 0u, 0, detector->mem->curr_nb_octaves);
   if (detector->dev->async_transfer_available)
   {
-    recBufferOwnershipTransferCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves,
+    recBufferOwnershipTransferCmds(detector, detector->detection_command_buffer_from_imas, 0u, 0, detector->mem->curr_nb_octaves,
                                    detector->dev->general_queues_family_idx, detector->dev->async_transfer_queues_family_idx,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
   }

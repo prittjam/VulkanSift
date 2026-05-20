@@ -1049,6 +1049,21 @@ bool vksift_createSiftMemory(vkenv_Device device, vksift_SiftMemory *memory_ptr,
   {
     memory->nb_pyramid_slots = VKSIFT_MAX_PYRAMID_SLOTS;
   }
+  // Phase C-1: SIFT-detect descriptor sets bind sift_buffer_arr[s] for slot s
+  // so concurrent waves write to independent buffers. If the caller asked for
+  // fewer SIFT buffers than pyramid slots, slot indices >= nb_sift_buffer will
+  // collide on sift_buffer_arr[nb_sift_buffer - 1]. We emit a one-time warning
+  // and the detector's slot_sift_buffer_idx clamps to (nb_sift_buffer - 1).
+  // Phase C-2 will bump the default sift_buffer_count to match nb_pyramid_slots.
+  if (memory->nb_pyramid_slots > memory->nb_sift_buffer)
+  {
+    logWarning(LOG_TAG,
+        "nb_pyramid_slots (%u) > sift_buffer_count (%u): slot indices >= %u "
+        "will share sift_buffer_arr[%u]. Bump sift_buffer_count to at least "
+        "nb_pyramid_slots for independent feature outputs.",
+        memory->nb_pyramid_slots, memory->nb_sift_buffer,
+        memory->nb_sift_buffer, memory->nb_sift_buffer - 1u);
+  }
 
   // Define default input image width/height from configuration.
   // NOTE: VKS allocates a SQUARE buffer of side ceil(sqrt(input_image_max_size)).
