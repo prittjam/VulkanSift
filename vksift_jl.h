@@ -80,6 +80,38 @@ void vksift_jl_get_features(vksift_jl_handle h,
 // Destroy context and free GPU resources.
 void vksift_jl_destroy(vksift_jl_handle h);
 
+// =========================================================================
+// IMAS (ASIFT) GPU tilt-warp pipeline (sift_imas.c).
+//
+// Reproduces fast_imas_IPOL `simulate_digital_tilt` fully on GPU:
+//   AffineWarp_rot(input, θ) → GaussBlur1D_v(σ_aa = 0.8·√(t²-1))
+//   → finvspline_row → finvspline_col → fproj_cubic_y(t)
+// Result: a Float32 tilted image of size W_rot × ⌊H_rot/t⌋ landed in a
+// host-mapped readback buffer (`vksift_jl_get_imas_buffer`).
+//
+// Usage:
+//   1. vksift_jl_detect(h, original_bytes, W, H)   // primer: uploads input
+//   2. vksift_jl_run_imas(h, W, H, t, theta, &out_w, &out_h)
+//   3. const float *tilted = vksift_jl_get_imas_buffer(h);
+//      // read out_w × out_h Float32 pixels (row-major)
+//   4. (caller converts Float32 → UInt8 and calls vksift_jl_detect again,
+//       this time with identity warp + σ_aa=0 to detect on tilted image)
+//
+// Returns non-zero on success.
+// =========================================================================
+int vksift_jl_run_imas(vksift_jl_handle h, uint32_t W, uint32_t H,
+                       float t_factor, float theta_rad,
+                       uint32_t *out_w, uint32_t *out_h);
+
+const float *vksift_jl_get_imas_buffer(vksift_jl_handle h);
+
+// Run SIFT detection on the most-recent IMAS-tilted image (mem->rotated_image,
+// device-side) — no host roundtrip. Caller must have run vksift_jl_run_imas()
+// first. tilted_w / tilted_h are the dims returned by run_imas. Returns the
+// number of features detected; use vksift_jl_get_features() to download.
+uint32_t vksift_jl_detect_on_imas(vksift_jl_handle h,
+                                  uint32_t tilted_w, uint32_t tilted_h);
+
 #ifdef __cplusplus
 }
 #endif

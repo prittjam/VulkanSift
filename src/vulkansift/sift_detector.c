@@ -56,6 +56,13 @@ typedef struct
   float dir_y;
 } PreBlur1DPushConsts;
 
+// Push constants for QuantizeF32ToInput.comp (8 B).
+typedef struct
+{
+  uint32_t width;
+  uint32_t height;
+} QuantizePushConsts;
+
 // Push constants for Downsample2x.comp: layer indices + dst dims (16 B).
 typedef struct
 {
@@ -219,6 +226,11 @@ static bool allocateCommandBuffers(vksift_SiftDetector detector)
   if (vkAllocateCommandBuffers(detector->dev->device, &allocate_info, &detector->detection_command_buffer) != VK_SUCCESS)
   {
     logError(LOG_TAG, "Failed to allocate the detection command buffe");
+    return false;
+  }
+  if (vkAllocateCommandBuffers(detector->dev->device, &allocate_info, &detector->detection_command_buffer_from_imas) != VK_SUCCESS)
+  {
+    logError(LOG_TAG, "Failed to allocate the detection-from-IMAS command buffer");
     return false;
   }
 
@@ -526,6 +538,52 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
     if (alloc_res != VK_SUCCESS)
     {
       logError(LOG_TAG, "Failed to allocate Downsample2x descriptor set");
+      return false;
+    }
+  }
+
+  ///////////////////////////////////////////////////
+  // Descriptors for QuantizeF32ToInput pipeline. Single descriptor set,
+  // bindings 0 = STORAGE_IMAGE r32f (rotated_image, IMAS output) and
+  // 1 = STORAGE_IMAGE r8 (input_image). Used by the on-IMAS detect path
+  // to bridge device-side R32F → R8 without a host roundtrip.
+  ///////////////////////////////////////////////////
+  {
+    VkDescriptorSetLayoutBinding q_in = {.binding = 0,
+                                         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                         .descriptorCount = 1,
+                                         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                         .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding q_out = {.binding = 1,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .descriptorCount = 1,
+                                          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                          .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding q_bindings[2] = {q_in, q_out};
+    VkDescriptorSetLayoutCreateInfo q_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = q_bindings};
+    if (vkCreateDescriptorSetLayout(detector->dev->device, &q_layout_info, NULL, &detector->quantize_desc_set_layout) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create QuantizeF32ToInput descriptor set layout");
+      return false;
+    }
+    VkDescriptorPoolSize q_pool_sizes[2] = {
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1}};
+    VkDescriptorPoolCreateInfo q_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = q_pool_sizes};
+    if (vkCreateDescriptorPool(detector->dev->device, &q_pool_info, NULL, &detector->quantize_desc_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create QuantizeF32ToInput descriptor pool");
+      return false;
+    }
+    VkDescriptorSetAllocateInfo q_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                .descriptorPool = detector->quantize_desc_pool,
+                                                .descriptorSetCount = 1,
+                                                .pSetLayouts = &detector->quantize_desc_set_layout};
+    if (vkAllocateDescriptorSets(detector->dev->device, &q_alloc_info, &detector->quantize_desc_set) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to allocate QuantizeF32ToInput descriptor set");
       return false;
     }
   }
@@ -917,6 +975,27 @@ static bool setupComputePipelines(vksift_SiftDetector detector)
   }
 
   //////////////////////////////////////
+  // Setup QuantizeF32ToInput pipeline (device-side R32F → R8 copy, replaces
+  // host roundtrip on the on-IMAS detect path).
+  //////////////////////////////////////
+  {
+    VkShaderModule q_shader_module;
+    if (!vkenv_createShaderModule(detector->dev->device, "shaders/QuantizeF32ToInput.comp.spv", &q_shader_module))
+    {
+      logError(LOG_TAG, "Failed to create QuantizeF32ToInput shader module");
+      return false;
+    }
+    if (!vkenv_createComputePipeline(detector->dev->device, q_shader_module, detector->quantize_desc_set_layout, sizeof(QuantizePushConsts),
+                                     &detector->quantize_pipeline_layout, &detector->quantize_pipeline))
+    {
+      logError(LOG_TAG, "Failed to create QuantizeF32ToInput pipeline");
+      vkDestroyShaderModule(detector->dev->device, q_shader_module, NULL);
+      return false;
+    }
+    vkDestroyShaderModule(detector->dev->device, q_shader_module, NULL);
+  }
+
+  //////////////////////////////////////
   // Setup ExtractKeypoints pipeline
   //////////////////////////////////////
   VkShaderModule extractkpts_shader_module;
@@ -1205,6 +1284,37 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
                                           .pBufferInfo = NULL,
                                           .pTexelBufferView = NULL};
     vkUpdateDescriptorSets(detector->dev->device, 2, ds_writes, 0, NULL);
+  }
+
+  /////////////////////////////////////////////////////
+  // Write set for QuantizeF32ToInput pipeline. Binds:
+  //   0: rotated_image_view (R32F, IMAS output)
+  //   1: input_image_view   (R8_UNORM, SIFT input)
+  {
+    VkDescriptorImageInfo q_in_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->rotated_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo q_out_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet q_writes[2];
+    q_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                         .dstSet = detector->quantize_desc_set,
+                                         .dstBinding = 0,
+                                         .dstArrayElement = 0,
+                                         .descriptorCount = 1,
+                                         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                         .pImageInfo = &q_in_info,
+                                         .pBufferInfo = NULL,
+                                         .pTexelBufferView = NULL};
+    q_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                         .dstSet = detector->quantize_desc_set,
+                                         .dstBinding = 1,
+                                         .dstArrayElement = 0,
+                                         .descriptorCount = 1,
+                                         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                         .pImageInfo = &q_out_info,
+                                         .pBufferInfo = NULL,
+                                         .pTexelBufferView = NULL};
+    vkUpdateDescriptorSets(detector->dev->device, 2, q_writes, 0, NULL);
   }
 
   /////////////////////////////////////////////////////
@@ -1516,6 +1626,61 @@ static void recCopyInputImageCmds(vksift_SiftDetector detector, VkCommandBuffer 
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &image_barrier);
   }
 
+  endMarkerRegion(detector, cmdbuf);
+}
+
+// Records the on-IMAS variant of input-image population: instead of copying
+// from the host staging buffer, runs the QuantizeF32ToInput compute shader to
+// copy device-side from mem->rotated_image (R32F, IMAS output) into
+// mem->input_image (R8_UNORM). Dispatch dims come from detector->quantize_width
+// / quantize_height, which the caller sets per-tilt before submitting the
+// from-IMAS detection command buffer.
+static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf)
+{
+  beginMarkerRegion(detector, cmdbuf, "Quantize IMAS → input");
+  VkImageMemoryBarrier rotated_barrier = vkenv_genImageMemoryBarrier(
+      detector->mem->rotated_image,
+      VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_SHADER_READ_BIT,
+      VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+      (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+  vkCmdPipelineBarrier(cmdbuf,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0, 0, NULL, 0, NULL, 1, &rotated_barrier);
+
+  VkImageMemoryBarrier input_barrier = vkenv_genImageMemoryBarrier(
+      detector->mem->input_image,
+      0, VK_ACCESS_SHADER_WRITE_BIT,
+      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+      (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+  vkCmdPipelineBarrier(cmdbuf,
+      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0, 0, NULL, 0, NULL, 1, &input_barrier);
+
+  QuantizePushConsts qpc = {.width = detector->quantize_width, .height = detector->quantize_height};
+  vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline);
+  vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->quantize_pipeline_layout,
+                          0, 1, &detector->quantize_desc_set, 0, NULL);
+  vkCmdPushConstants(cmdbuf, detector->quantize_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                     0, sizeof(qpc), &qpc);
+  vkCmdDispatch(cmdbuf,
+      (uint32_t)ceilf((float)detector->quantize_width / 8.f),
+      (uint32_t)ceilf((float)detector->quantize_height / 8.f), 1);
+
+  VkImageMemoryBarrier post_barrier = vkenv_genImageMemoryBarrier(
+      detector->mem->input_image,
+      VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+      VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+      (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+  vkCmdPipelineBarrier(cmdbuf,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0, 0, NULL, 0, NULL, 1, &post_barrier);
   endMarkerRegion(detector, cmdbuf);
 }
 
@@ -2117,6 +2282,48 @@ static bool recordCommandBuffers(vksift_SiftDetector detector)
     return false;
   }
 
+  /////////////////////////////////////////////////////
+  // Write the on-IMAS variant — same as above, but recQuantizeImasToInputCmds
+  // replaces recCopyInputImageCmds (no host roundtrip — reads rotated_image
+  // device-side via the quantize shader).
+  /////////////////////////////////////////////////////
+  if (vkBeginCommandBuffer(detector->detection_command_buffer_from_imas, &begin_info) != VK_SUCCESS)
+  {
+    logError(LOG_TAG, "Failed to begin the on-IMAS detection command buffer recording");
+    return false;
+  }
+  if (detector->dev->async_transfer_available)
+  {
+    recBufferOwnershipTransferCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves,
+                                   detector->dev->async_transfer_queues_family_idx, detector->dev->general_queues_family_idx,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  }
+  recClearBufferDataCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
+  recQuantizeImasToInputCmds(detector, detector->detection_command_buffer_from_imas);
+  for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+  {
+    recScaleSpaceConstructionCmds(detector, detector->detection_command_buffer_from_imas, i);
+  }
+  recDifferenceOfGaussianCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
+  recExtractKeypointsCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
+  if (!detector->detection_only)
+  {
+    recComputeOrientationsCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
+    recComputeDestriptorsCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
+  }
+  recCopySIFTCountCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves);
+  if (detector->dev->async_transfer_available)
+  {
+    recBufferOwnershipTransferCmds(detector, detector->detection_command_buffer_from_imas, 0, detector->mem->curr_nb_octaves,
+                                   detector->dev->general_queues_family_idx, detector->dev->async_transfer_queues_family_idx,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+  }
+  if (vkEndCommandBuffer(detector->detection_command_buffer_from_imas) != VK_SUCCESS)
+  {
+    logError(LOG_TAG, "Failed to record on-IMAS detection command buffer");
+    return false;
+  }
+
   return true;
 }
 
@@ -2187,7 +2394,10 @@ bool vksift_createSiftDetector(vkenv_Device device, vksift_SiftMemory memory, vk
   }
 }
 
-bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t target_buffer_idx, const bool memory_layout_updated)
+static bool dispatchDetectionCmdBuffer(vksift_SiftDetector detector,
+                                       const uint32_t target_buffer_idx,
+                                       const bool memory_layout_updated,
+                                       VkCommandBuffer *cmd_buffer_to_submit)
 {
   // We need to setup the descriptor sets and command buffers if the input resolution, target buffer,
   // or pending AffineWarp matrix changed.
@@ -2210,7 +2420,6 @@ bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t t
   VkSubmitInfo submit_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = NULL};
   if (detector->dev->async_transfer_available)
   {
-    // Transfer SIFT buffer ownership for the detection
     submit_info.waitSemaphoreCount = 0;
     submit_info.pWaitSemaphores = NULL;
     submit_info.pWaitDstStageMask = NULL;
@@ -2225,10 +2434,8 @@ bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t t
     }
   }
 
-  // Main detection
   if (detector->dev->async_transfer_available)
   {
-    // wait for buffer ownership transfer to complete
     submit_info.waitSemaphoreCount = 1;
     submit_info.pWaitSemaphores = &detector->buffer_ownership_released_by_transfer_semaphore;
     submit_info.pWaitDstStageMask = &wait_dst_compute_shader_bit_stage_mask;
@@ -2244,7 +2451,7 @@ bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t t
     submit_info.pSignalSemaphores = NULL;
   }
   submit_info.commandBufferCount = 1;
-  submit_info.pCommandBuffers = &detector->detection_command_buffer;
+  submit_info.pCommandBuffers = cmd_buffer_to_submit;
   VkFence detect_submit_fence = detector->dev->async_transfer_available ? NULL : detector->end_of_detection_fence;
   if (vkQueueSubmit(detector->general_queue, 1, &submit_info, detect_submit_fence) != VK_SUCCESS)
   {
@@ -2254,7 +2461,6 @@ bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t t
 
   if (detector->dev->async_transfer_available)
   {
-    // Give back SIFT buffer ownership to the main memory
     submit_info.waitSemaphoreCount = 1;
     submit_info.pWaitSemaphores = &detector->end_of_detection_semaphore;
     submit_info.pWaitDstStageMask = &wait_dst_transfer_bit_stage_mask;
@@ -2268,8 +2474,19 @@ bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t t
       return false;
     }
   }
-
   return true;
+}
+
+bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t target_buffer_idx, const bool memory_layout_updated)
+{
+  return dispatchDetectionCmdBuffer(detector, target_buffer_idx, memory_layout_updated,
+                                    &detector->detection_command_buffer);
+}
+
+bool vksift_dispatchSiftDetectionFromImas(vksift_SiftDetector detector, const uint32_t target_buffer_idx, const bool memory_layout_updated)
+{
+  return dispatchDetectionCmdBuffer(detector, target_buffer_idx, memory_layout_updated,
+                                    &detector->detection_command_buffer_from_imas);
 }
 
 void vksift_setPendingAffineWarp(vksift_SiftDetector detector,

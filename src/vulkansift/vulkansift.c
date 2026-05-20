@@ -46,6 +46,8 @@ static void default_error_callback(vksift_Result err_type)
 }
 
 static vksift_Config vksift_Config_Default = {.input_image_max_size = 1920u * 1080u,
+                                              .input_image_max_width = 0u,   // 0 = use legacy square ceiling
+                                              .input_image_max_height = 0u,
                                               .sift_buffer_count = 2u, // minimum number of buffer to support the feature matching function
                                               .max_nb_sift_per_buffer = 100000u,
                                               .use_input_upsampling = true, // provide the best results (higher processing time)
@@ -720,4 +722,55 @@ const float *vksift_getImasReadbackPtr(vksift_Instance instance)
 {
   if (instance == NULL || instance->imas_pipeline == NULL) return NULL;
   return (const float *)instance->imas_pipeline->readback_ptr;
+}
+
+// Run SIFT detection on the tilted image produced by the IMAS pipeline,
+// reading mem->rotated_image device-side (no host roundtrip). Caller must
+// have run vksift_runImas() first to populate rotated_image.
+//
+// `tilted_w` × `tilted_h` are the dimensions of the actual sub-region the
+// IMAS pipeline wrote (the rotated_image is allocated at max W×H and IMAS
+// fills only the top-left sub-rectangle). These become the input dims for
+// the SIFT pyramid.
+void vksift_detectFeaturesOnImas(vksift_Instance instance,
+                                 const uint32_t tilted_w, const uint32_t tilted_h,
+                                 const uint32_t gpu_buffer_id)
+{
+  if (instance == NULL ||
+      !isBufferIdxValid(instance, gpu_buffer_id) ||
+      !isInputResolutionValid(instance, tilted_w, tilted_h))
+  {
+    logError(LOG_TAG, "vksift_detectFeaturesOnImas() error: invalid input.");
+    instance->error_cb_func(VKSIFT_INVALID_INPUT_ERROR);
+    return;
+  }
+
+  VkFence fences[2] = {instance->sift_detector->end_of_detection_fence, instance->sift_matcher->end_of_matching_fence};
+  vkWaitForFences(instance->vulkan_device->device, 2, fences, VK_TRUE, UINT64_MAX);
+
+  // Prepare memory; image_data=NULL signals "input_image will be populated
+  // device-side; skip the host→staging→input_image upload."
+  bool memory_layout_updated = false;
+  if (!vksift_prepareSiftMemoryForDetection(instance->sift_memory, NULL, tilted_w, tilted_h, gpu_buffer_id, &memory_layout_updated))
+  {
+    logError(LOG_TAG, "vksift_detectFeaturesOnImas() error: failed to prepare SIFT memory");
+    instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+    return;
+  }
+
+  // Tell the recorded from-IMAS cmd buffer how big the quantize dispatch is.
+  instance->sift_detector->quantize_width  = tilted_w;
+  instance->sift_detector->quantize_height = tilted_h;
+  // The dims are baked into the recorded command buffer; force a re-record.
+  if (!memory_layout_updated)
+  {
+    // Force re-record to pick up the new quantize_width/_height push consts.
+    instance->sift_detector->pending_warp_dirty = true;
+  }
+
+  if (!vksift_dispatchSiftDetectionFromImas(instance->sift_detector, gpu_buffer_id, memory_layout_updated))
+  {
+    logError(LOG_TAG, "vksift_detectFeaturesOnImas() error: failed to dispatch detection");
+    instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+  }
 }

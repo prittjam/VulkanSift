@@ -29,7 +29,11 @@ vksift_jl_handle vksift_jl_init(
     vksift_setLogLevel(VKSIFT_LOG_WARNING);
 
     vksift_Config config = vksift_getDefaultConfig();
+    // Pass non-square explicit dims through so VKS allocates a max_width × max_height
+    // canvas rather than a square ceil(sqrt(W·H)) one.
     config.input_image_max_size = max_width * max_height;
+    config.input_image_max_width = max_width;
+    config.input_image_max_height = max_height;
     config.intensity_threshold = intensity_threshold;
     config.edge_threshold = edge_threshold;
     config.seed_scale_sigma = seed_scale_sigma;
@@ -178,4 +182,13 @@ const float *vksift_jl_get_imas_buffer(vksift_jl_handle h)
 {
     if (!h) return NULL;
     return vksift_getImasReadbackPtr(h->instance);
+}
+
+uint32_t vksift_jl_detect_on_imas(vksift_jl_handle h,
+                                  uint32_t tilted_w, uint32_t tilted_h)
+{
+    if (!h) return 0;
+    vksift_detectFeaturesOnImas(h->instance, tilted_w, tilted_h, 0);
+    h->last_nb_features = vksift_getFeaturesNumber(h->instance, 0);
+    return h->last_nb_features;
 }

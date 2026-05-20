@@ -24,6 +24,11 @@ typedef struct vksift_SiftDetector_T
   VkCommandPool async_transfer_command_pool;
 
   VkCommandBuffer detection_command_buffer;
+  // Variant of detection_command_buffer that skips the staging→input_image
+  // upload and instead reads input_image from a device-side R32F source
+  // (mem->rotated_image, the IMAS pipeline's output) via the quantize shader.
+  // Used by vksift_detectFeaturesOnImas() — no host roundtrip.
+  VkCommandBuffer detection_command_buffer_from_imas;
   VkCommandBuffer acquire_buffer_ownership_command_buffer;
   VkCommandBuffer release_buffer_ownership_command_buffer;
 
@@ -94,6 +99,18 @@ typedef struct vksift_SiftDetector_T
   VkDescriptorSet *downsample_desc_sets;
   VkPipelineLayout downsample_pipeline_layout;
   VkPipeline downsample_pipeline;
+  // QuantizeF32ToInput set — device-side R32F (mem->rotated_image, IMAS
+  // output) → R8_UNORM (mem->input_image) copy with quantization. Replaces
+  // the host roundtrip on the on-IMAS detect path.
+  VkDescriptorSetLayout quantize_desc_set_layout;
+  VkDescriptorPool quantize_desc_pool;
+  VkDescriptorSet quantize_desc_set;
+  VkPipelineLayout quantize_pipeline_layout;
+  VkPipeline quantize_pipeline;
+  // Dims used for the quantize dispatch — set per-call before submitting
+  // detection_command_buffer_from_imas.
+  uint32_t quantize_width;
+  uint32_t quantize_height;
   // ExtractKeypoints set
   VkDescriptorSetLayout extractkpts_desc_set_layout;
   VkDescriptorPool extractkpts_desc_pool;
@@ -148,6 +165,13 @@ bool vksift_createSiftDetector(vkenv_Device device, vksift_SiftMemory memory, vk
 void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr);
 
 bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t target_buffer_idx, const bool memory_layout_updated);
+
+// Same as vksift_dispatchSiftDetection but submits the on-IMAS detection
+// command buffer (which sources its input from mem->rotated_image instead of
+// the staging buffer). Caller must have populated rotated_image with valid
+// IMAS-tilted Float32 content and set detector->quantize_width / _height to
+// the actual sub-region the IMAS pipeline wrote into.
+bool vksift_dispatchSiftDetectionFromImas(vksift_SiftDetector detector, const uint32_t target_buffer_idx, const bool memory_layout_updated);
 
 // Set the affine matrix that will be pushed to AffineWarp.comp on the next
 // detect dispatch. Marks the command buffer for re-record. Matrix layout:

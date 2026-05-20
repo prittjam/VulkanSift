@@ -81,6 +81,14 @@ extern "C"
                                     uint32_t *out_w, uint32_t *out_h);
   VKSIFT_EXPORT const float *vksift_getImasReadbackPtr(vksift_Instance instance);
 
+  // Run SIFT detection on the most-recent IMAS-tilted image (mem->rotated_image,
+  // device-side) — no host roundtrip. Caller must have run vksift_runImas first
+  // to populate rotated_image. (tilted_w, tilted_h) are the actual dims of the
+  // sub-region the IMAS pipeline wrote (= out_w, out_h from runImas).
+  VKSIFT_EXPORT void vksift_detectFeaturesOnImas(vksift_Instance instance,
+                                                 const uint32_t tilted_w, const uint32_t tilted_h,
+                                                 const uint32_t gpu_buffer_id);
+
   // For each SIFT feature in the buffer A, find the 2-nearest neighbors in the buffer B, store feature index and descriptors L2 distance
   // for the two neighbors.
   VKSIFT_EXPORT void vksift_matchFeatures(vksift_Instance instance, const uint32_t gpu_buffer_id_A, const uint32_t gpu_buffer_id_B);

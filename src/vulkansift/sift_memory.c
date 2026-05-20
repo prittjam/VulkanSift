@@ -908,7 +908,14 @@ bool vksift_createSiftMemory(vkenv_Device device, vksift_SiftMemory *memory_ptr,
   memory->use_rgba_input = config->use_rgba_input;
   memory->use_rgb_input = config->use_rgb_input;
 
-  // Define default input image width/height from configuration
+  // Define default input image width/height from configuration.
+  // NOTE: VKS allocates a SQUARE buffer of side ceil(sqrt(input_image_max_size)).
+  // Non-square inputs work fine via the dynamic-resize path in
+  // vksift_prepareSiftMemoryForDetection — on first detect with non-square
+  // dims, VKS destroys and reallocates the pyramid at the new shape. Attempts
+  // to init directly at non-square (via input_image_max_width/_height) hit a
+  // hang in the upsample path that the resize path doesn't exhibit; until
+  // that's diagnosed, stick with square ceiling.
   memory->curr_input_image_width = ceilf(sqrtf((float)memory->max_image_size));
   memory->curr_input_image_height = memory->curr_input_image_width;
   // Update max size to account for float rounding in the default width/height
@@ -1241,32 +1248,37 @@ bool vksift_prepareSiftMemoryForDetection(vksift_SiftMemory memory, const uint8_
     *memory_layout_updated = true;
   }
 
-  // Copy input image to staging buffer
-  VkMappedMemoryRange memory_range = {
-      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .pNext = NULL, .memory = memory->image_staging_buffer_memory, .offset = 0, .size = VK_WHOLE_SIZE};
-  if (vkInvalidateMappedMemoryRanges(memory->device->device, 1, &memory_range) != VK_SUCCESS)
+  // Copy input image to staging buffer — skipped when image_data == NULL
+  // (on-IMAS detect path: input_image is populated device-side by the
+  // QuantizeF32ToInput shader, the staging buffer isn't used).
+  if (image_data != NULL)
   {
-    logError(LOG_TAG, "Failed to invalidate staging mapped memory when copying new image data");
-    return false;
-  }
+    VkMappedMemoryRange memory_range = {
+        .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .pNext = NULL, .memory = memory->image_staging_buffer_memory, .offset = 0, .size = VK_WHOLE_SIZE};
+    if (vkInvalidateMappedMemoryRanges(memory->device->device, 1, &memory_range) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to invalidate staging mapped memory when copying new image data");
+      return false;
+    }
 
-  if (memory->use_rgba_input)
-  {
-    memcpy(memory->image_staging_buffer_ptr, image_data, 4 * input_width * input_height);
-  }
-  else if (memory->use_rgb_input)
-  {
-    memcpy(memory->image_staging_buffer_ptr, image_data, 3 * input_width * input_height);
-  }
-  else
-  {
-    memcpy(memory->image_staging_buffer_ptr, image_data, sizeof(uint8_t) * input_width * input_height);
-  }
+    if (memory->use_rgba_input)
+    {
+      memcpy(memory->image_staging_buffer_ptr, image_data, 4 * input_width * input_height);
+    }
+    else if (memory->use_rgb_input)
+    {
+      memcpy(memory->image_staging_buffer_ptr, image_data, 3 * input_width * input_height);
+    }
+    else
+    {
+      memcpy(memory->image_staging_buffer_ptr, image_data, sizeof(uint8_t) * input_width * input_height);
+    }
 
-  if (vkFlushMappedMemoryRanges(memory->device->device, 1, &memory_range) != VK_SUCCESS)
-  {
-    logError(LOG_TAG, "Failed to flush staging mapped memory when copying new image data");
-    return false;
+    if (vkFlushMappedMemoryRanges(memory->device->device, 1, &memory_range) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to flush staging mapped memory when copying new image data");
+      return false;
+    }
   }
 
   // Mark the buffer as not packed
