@@ -280,17 +280,21 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
 
   // Create warped input image (r32f). Output of AffineWarp.comp; consumed by
   // the first Gaussian blur as a sampler2D, so we need SAMPLED + STORAGE bits.
+  // TRANSFER_SRC_BIT is required for recScaleSpaceConstructionCmds' octave-0
+  // copy (vkCmdCopyImage when use_upsampling=false, vkCmdBlitImage when true)
+  // into octave_image_arr[0]. Without it both APIs trip
+  // VUID-vkCmd{Copy,Blit}Image-srcImage-00219 even on a graphics queue.
   res = true;
   res = res && vkenv_createImage(&memory->slots[slot_idx].warped_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT,
                                  (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
                                  VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                  mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
   if (is_init)
   {
     res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height * 4u, &memory_requirement, 0,
                                                   VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                                   mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
   }
   else if (res)

@@ -1,0 +1,65 @@
+#version 450
+//
+// Upsample2xLinear.comp — bit-equivalent replacement for vkCmdBlitImage with
+// VK_FILTER_LINEAR + CLAMP_TO_EDGE on a 2D r32f image, scaling input dims
+// (src_w, src_h) up to octave-0 dims (dst_w, dst_h). Used when
+// use_input_upsampling=true; the original blit forces a GRAPHICS queue which
+// disqualifies the async-compute pool the parallel-IMAS dispatcher uses.
+//
+// Mapping (Vulkan blit, VK_FILTER_LINEAR):
+//
+//     u = (i + 0.5) * src_w / dst_w - 0.5      (src-pixel coordinate)
+//     v = (j + 0.5) * src_h / dst_h - 0.5
+//
+// then bilinear interpolate the four src pixels surrounding (u, v) with
+// CLAMP_TO_EDGE on out-of-range integer coords. For the 2× case
+// (dst_w == 2*src_w, dst_h == 2*src_h) this collapses to
+// u = i/2 - 0.25, v = j/2 - 0.25, i.e. alternating 0.75/0.25 weights.
+//
+// Bindings: input is image2D (warped_input_image_view), output is
+// image2DArray layer dst_layer (octave_image_view_arr[0], layer 0).
+//
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(r32f, binding = 0) uniform image2D       img_input;
+layout(r32f, binding = 1) uniform image2DArray  img_output;
+
+layout(push_constant) uniform PushConst {
+    int dst_layer;
+    int dst_width;
+    int dst_height;
+    int src_width;
+    int src_height;
+} push_const;
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= push_const.dst_width || coords.y >= push_const.dst_height) return;
+
+    float ratio_x = float(push_const.src_width)  / float(push_const.dst_width);
+    float ratio_y = float(push_const.src_height) / float(push_const.dst_height);
+    float u = (float(coords.x) + 0.5) * ratio_x - 0.5;
+    float v = (float(coords.y) + 0.5) * ratio_y - 0.5;
+
+    int x0 = int(floor(u));
+    int y0 = int(floor(v));
+    float fx = u - float(x0);
+    float fy = v - float(y0);
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+
+    x0 = clamp(x0, 0, push_const.src_width  - 1);
+    x1 = clamp(x1, 0, push_const.src_width  - 1);
+    y0 = clamp(y0, 0, push_const.src_height - 1);
+    y1 = clamp(y1, 0, push_const.src_height - 1);
+
+    float v00 = imageLoad(img_input, ivec2(x0, y0)).r;
+    float v10 = imageLoad(img_input, ivec2(x1, y0)).r;
+    float v01 = imageLoad(img_input, ivec2(x0, y1)).r;
+    float v11 = imageLoad(img_input, ivec2(x1, y1)).r;
+
+    float top    = mix(v00, v10, fx);
+    float bottom = mix(v01, v11, fx);
+    float result = mix(top, bottom, fy);
+
+    imageStore(img_output, ivec3(coords, push_const.dst_layer), vec4(result, 0.0, 0.0, 1.0));
+}

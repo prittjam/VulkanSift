@@ -57,6 +57,17 @@ typedef struct vksift_SiftDetector_T
   // and descriptor sets; without this pointer the detector cannot record the
   // IMAS chain. NULL until first use of the fused path.
   struct vksift_ImasPipeline_T *imas_pipeline_ref;
+  // When true (set from VKSIFT_IMAS_BILINEAR=1 at init), the fused IMAS chain
+  // skips the FinvsplineRow + FinvsplineCol passes and uses FprojBilinearY in
+  // place of FprojCubicY — bilinear interpolation instead of cubic. Mirrors
+  // the legacy vksift_runImasWarp path's behavior under the same env var.
+  bool use_bilinear_fproj;
+  // When true (set from VKSIFT_FUSED_OCT0=1 at init), the fused IMAS chain
+  // replaces the octave-0 PreBlur1D + AffineWarp + (CopyImage|Upsample2xLinear)
+  // chain with a single SiftSeedFromInput dispatch. ALSO fixes a latent bug
+  // where the SIFT-detect AffineWarp at oct_idx=0 double-applied the IMAS
+  // rotation matrix. Feature counts shift; opt-in.
+  bool fused_oct0_enabled;
   VkCommandBuffer acquire_buffer_ownership_command_buffer;
   VkCommandBuffer release_buffer_ownership_command_buffer;
 
@@ -160,6 +171,23 @@ typedef struct vksift_SiftDetector_T
   VkDescriptorSet *downsample_desc_sets;
   VkPipelineLayout downsample_pipeline_layout;
   VkPipeline downsample_pipeline;
+  // Upsample2xLinear set (octave-0 2× linear upsample when use_upsampling=true,
+  // replaces vkCmdBlitImage so the dispatch is legal on the async-compute pool).
+  // One descriptor per slot — only the input→octave-0 transition uses it.
+  VkDescriptorSetLayout upsample_desc_set_layout;
+  VkDescriptorPool upsample_desc_pool;
+  VkDescriptorSet upsample_desc_set[VKSIFT_MAX_PYRAMID_SLOTS];
+  VkPipelineLayout upsample_pipeline_layout;
+  VkPipeline upsample_pipeline;
+  // SiftSeedFromInput set (IMAS-fused octave-0 fast path). Replaces the
+  // PreBlur1D + AffineWarp + CopyImage/Upsample2xLinear chain at oct_idx=0
+  // with a single R8→R32F dispatch that writes directly into
+  // octave_image_arr[0] layer 0 (with optional 2× upsample built in).
+  VkDescriptorSetLayout seed_from_input_desc_set_layout;
+  VkDescriptorPool seed_from_input_desc_pool;
+  VkDescriptorSet seed_from_input_desc_set[VKSIFT_MAX_PYRAMID_SLOTS];
+  VkPipelineLayout seed_from_input_pipeline_layout;
+  VkPipeline seed_from_input_pipeline;
   // QuantizeF32ToInput set — device-side R32F (slots[s].rotated_image, IMAS
   // output) → R8_UNORM (slots[s].input_image) copy with quantization. Replaces
   // the host roundtrip on the on-IMAS detect path.
@@ -238,6 +266,16 @@ typedef struct vksift_SiftDetector_T
   VkDescriptorSet rgb_convert_desc_set[VKSIFT_MAX_PYRAMID_SLOTS];
   VkPipelineLayout rgb_convert_pipeline_layout;
   VkPipeline rgb_convert_pipeline;
+
+  // Shader-region timestamp profiling (env-var-gated). One query pool per
+  // pyramid slot, sized for VKSIFT_PROFILE_NUM_TIMESTAMPS slots; the fused
+  // cmd buffer emits vkCmdWriteTimestamp at boundaries between IMAS / Quantize
+  // / ScaleSpace / DoG / ExtractKeypoints / BackProject. Always recorded
+  // (cheap on the GPU); only read+printed when profile_shaders==true.
+  VkQueryPool *shader_timestamp_pools;  // [n_pyramid_slots]
+  bool profile_shaders;                  // set from VKSIFT_PROFILE_SHADERS=1
+  uint64_t profile_shader_acc_ns[8];     // accumulators per region
+  uint32_t profile_shader_n_warps;       // # warps accumulated
 
   // Config
   bool use_hardware_interp_kernel;

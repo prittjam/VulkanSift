@@ -80,6 +80,8 @@ set(VULKANSIFT_LIB_SHADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/GaussianBlurInterpolated.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/DifferenceOfGaussian.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/Downsample2x.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/Upsample2xLinear.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/SiftSeedFromInput.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ExtractKeypoints.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ExtractKeypoints2D.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/QuantizeF32ToInput.comp

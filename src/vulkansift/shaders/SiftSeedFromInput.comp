@@ -1,0 +1,65 @@
+#version 450
+//
+// SiftSeedFromInput.comp — IMAS-fused fast-path that replaces the
+// PreBlur1D + AffineWarp + (CopyImage|Upsample2xLinear) chain at octave-0
+// with a single dispatch. Reads the R8 input_image (Quantize output) and
+// writes the R32F seed layer of octave_image_arr[0] (i.e. layer 0).
+//
+// For use_upsampling=false: dst_w == src_w, so the bilinear weights collapse
+// to nearest-center and the dispatch is a pure R8→R32F format-converting copy.
+// For use_upsampling=true: dst_w == 2·src_w; the bilinear formula below is
+// bit-equivalent to Upsample2xLinear.comp.
+//
+// PreBlur1D's σ_aa anti-alias contribution is irrelevant on the IMAS path
+// (the IMAS chain already anti-aliased during rotation, and the host
+// passes σ=0). AffineWarp's matrix is identity on the IMAS path (the
+// chain already applied the t,φ warp). CopyImage was just a format-
+// matching pass-through. All three collapse into this shader.
+//
+// Push constants mirror Upsample2xLinear's so the same handler can size
+// dispatches identically.
+//
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(r8,   binding = 0) uniform image2D       img_input;
+layout(r32f, binding = 1) uniform image2DArray  img_output;
+
+layout(push_constant) uniform PushConst {
+    int dst_layer;
+    int dst_width;
+    int dst_height;
+    int src_width;
+    int src_height;
+} push_const;
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= push_const.dst_width || coords.y >= push_const.dst_height) return;
+
+    float ratio_x = float(push_const.src_width)  / float(push_const.dst_width);
+    float ratio_y = float(push_const.src_height) / float(push_const.dst_height);
+    float u = (float(coords.x) + 0.5) * ratio_x - 0.5;
+    float v = (float(coords.y) + 0.5) * ratio_y - 0.5;
+
+    int x0 = int(floor(u));
+    int y0 = int(floor(v));
+    float fx = u - float(x0);
+    float fy = v - float(y0);
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+
+    x0 = clamp(x0, 0, push_const.src_width  - 1);
+    x1 = clamp(x1, 0, push_const.src_width  - 1);
+    y0 = clamp(y0, 0, push_const.src_height - 1);
+    y1 = clamp(y1, 0, push_const.src_height - 1);
+
+    float v00 = imageLoad(img_input, ivec2(x0, y0)).r;
+    float v10 = imageLoad(img_input, ivec2(x1, y0)).r;
+    float v01 = imageLoad(img_input, ivec2(x0, y1)).r;
+    float v11 = imageLoad(img_input, ivec2(x1, y1)).r;
+
+    float top    = mix(v00, v10, fx);
+    float bottom = mix(v01, v11, fx);
+    float result = mix(top, bottom, fy);
+
+    imageStore(img_output, ivec3(coords, push_const.dst_layer), vec4(result, 0.0, 0.0, 1.0));
+}

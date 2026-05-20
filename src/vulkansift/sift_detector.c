@@ -55,6 +55,31 @@ typedef struct
   int32_t dst_height;
 } Downsample2xPushConsts;
 
+// Push constants for Upsample2xLinear.comp: dst layer + dst/src dims (20 B).
+typedef struct
+{
+  int32_t dst_layer;
+  int32_t dst_width;
+  int32_t dst_height;
+  int32_t src_width;
+  int32_t src_height;
+} Upsample2xLinearPushConsts;
+
+// Shader-region timestamp boundaries written into the per-slot query pool by
+// recFusedImasDetectCmdsForSlot. Each is a vkCmdWriteTimestamp at the END of
+// the named region (region [i] = TS[i+1] - TS[i]).
+enum {
+  VKSIFT_TS_START         = 0,
+  VKSIFT_TS_AFTER_IMAS    = 1,  // rotate + finvspline + fproj + warp
+  VKSIFT_TS_AFTER_QUANT   = 2,  // QuantizeF32ToInput
+  VKSIFT_TS_AFTER_SCALES  = 3,  // ClearBuffer + ScaleSpace × all octaves
+  VKSIFT_TS_AFTER_DOG     = 4,  // DifferenceOfGaussian × all octaves
+  VKSIFT_TS_AFTER_EXTRACT = 5,  // ExtractKeypoints × all octaves
+  VKSIFT_TS_AFTER_ORIDESC = 6,  // Orientation + Descriptor (if !detection_only)
+  VKSIFT_TS_END           = 7,  // CopySIFTCount + BackProjectFeatures
+  VKSIFT_NUM_TS           = 8
+};
+
 static void getGPUDebugMarkerFuncs(vksift_SiftDetector detector)
 {
   detector->vkCmdDebugMarkerBeginEXT = (PFN_vkCmdDebugMarkerBeginEXT)vkGetDeviceProcAddr(detector->dev->device, "vkCmdDebugMarkerBeginEXT");
@@ -652,6 +677,102 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
   }
 
   ///////////////////////////////////////////////////
+  // Descriptors for Upsample2xLinear pipeline (octave-0 2× linear upsample when
+  // use_upsampling=true). One set per slot — binding 0 = warped_input_image
+  // (image2D r32f), binding 1 = octave_image_view_arr[0] (image2DArray r32f).
+  ///////////////////////////////////////////////////
+  {
+    VkDescriptorSetLayoutBinding us_in = {.binding = 0,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .descriptorCount = 1,
+                                          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                          .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding us_out = {.binding = 1,
+                                           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                           .descriptorCount = 1,
+                                           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                           .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding us_bindings[2] = {us_in, us_out};
+    VkDescriptorSetLayoutCreateInfo us_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = us_bindings};
+    if (vkCreateDescriptorSetLayout(detector->dev->device, &us_layout_info, NULL, &detector->upsample_desc_set_layout) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create Upsample2xLinear descriptor set layout");
+      return false;
+    }
+    VkDescriptorPoolSize us_pool_sizes[2] = {
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = N},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = N}};
+    VkDescriptorPoolCreateInfo us_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = N, .poolSizeCount = 2, .pPoolSizes = us_pool_sizes};
+    if (vkCreateDescriptorPool(detector->dev->device, &us_pool_info, NULL, &detector->upsample_desc_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create Upsample2xLinear descriptor pool");
+      return false;
+    }
+    for (uint32_t s = 0u; s < N; ++s)
+    {
+      VkDescriptorSetAllocateInfo us_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                   .descriptorPool = detector->upsample_desc_pool,
+                                                   .descriptorSetCount = 1,
+                                                   .pSetLayouts = &detector->upsample_desc_set_layout};
+      if (vkAllocateDescriptorSets(detector->dev->device, &us_alloc_info, &detector->upsample_desc_set[s]) != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "Failed to allocate Upsample2xLinear descriptor set (slot %u)", s);
+        return false;
+      }
+    }
+  }
+
+  ///////////////////////////////////////////////////
+  // Descriptors for SiftSeedFromInput pipeline (IMAS-fused fast path).
+  // binding 0 = STORAGE_IMAGE r8 (input_image), binding 1 = STORAGE_IMAGE r32f
+  // image2DArray (octave_image_view_arr[0]). One set per slot.
+  ///////////////////////////////////////////////////
+  {
+    VkDescriptorSetLayoutBinding sf_in = {.binding = 0,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .descriptorCount = 1,
+                                          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                          .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding sf_out = {.binding = 1,
+                                           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                           .descriptorCount = 1,
+                                           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                           .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding sf_bindings[2] = {sf_in, sf_out};
+    VkDescriptorSetLayoutCreateInfo sf_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = sf_bindings};
+    if (vkCreateDescriptorSetLayout(detector->dev->device, &sf_layout_info, NULL, &detector->seed_from_input_desc_set_layout) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create SiftSeedFromInput descriptor set layout");
+      return false;
+    }
+    VkDescriptorPoolSize sf_pool_sizes[2] = {
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = N},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = N}};
+    VkDescriptorPoolCreateInfo sf_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = N, .poolSizeCount = 2, .pPoolSizes = sf_pool_sizes};
+    if (vkCreateDescriptorPool(detector->dev->device, &sf_pool_info, NULL, &detector->seed_from_input_desc_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create SiftSeedFromInput descriptor pool");
+      return false;
+    }
+    for (uint32_t s = 0u; s < N; ++s)
+    {
+      VkDescriptorSetAllocateInfo sf_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                   .descriptorPool = detector->seed_from_input_desc_pool,
+                                                   .descriptorSetCount = 1,
+                                                   .pSetLayouts = &detector->seed_from_input_desc_set_layout};
+      if (vkAllocateDescriptorSets(detector->dev->device, &sf_alloc_info, &detector->seed_from_input_desc_set[s]) != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "Failed to allocate SiftSeedFromInput descriptor set (slot %u)", s);
+        return false;
+      }
+    }
+  }
+
+  ///////////////////////////////////////////////////
   // Descriptors for QuantizeF32ToInput pipeline. Single descriptor set,
   // bindings 0 = STORAGE_IMAGE r32f (rotated_image, IMAS output) and
   // 1 = STORAGE_IMAGE r8 (input_image). Used by the on-IMAS detect path
@@ -1148,6 +1269,48 @@ static bool setupComputePipelines(vksift_SiftDetector detector)
   }
 
   //////////////////////////////////////
+  // Setup Upsample2xLinear pipeline (octave-0 2× linear upsample, replaces
+  // vkCmdBlitImage so dispatchParallelIMAS can run on the async-compute pool).
+  //////////////////////////////////////
+  {
+    VkShaderModule us_shader_module;
+    if (!vkenv_createShaderModule(detector->dev->device, "shaders/Upsample2xLinear.comp.spv", &us_shader_module))
+    {
+      logError(LOG_TAG, "Failed to create Upsample2xLinear shader module");
+      return false;
+    }
+    if (!vkenv_createComputePipeline(detector->dev->device, us_shader_module, detector->upsample_desc_set_layout, sizeof(Upsample2xLinearPushConsts),
+                                     &detector->upsample_pipeline_layout, &detector->upsample_pipeline))
+    {
+      logError(LOG_TAG, "Failed to create Upsample2xLinear pipeline");
+      vkDestroyShaderModule(detector->dev->device, us_shader_module, NULL);
+      return false;
+    }
+    vkDestroyShaderModule(detector->dev->device, us_shader_module, NULL);
+  }
+
+  //////////////////////////////////////
+  // Setup SiftSeedFromInput pipeline (IMAS-fused octave-0 fast path; one
+  // dispatch in place of PreBlur1D + AffineWarp + CopyImage|Upsample2xLinear).
+  //////////////////////////////////////
+  {
+    VkShaderModule sf_shader_module;
+    if (!vkenv_createShaderModule(detector->dev->device, "shaders/SiftSeedFromInput.comp.spv", &sf_shader_module))
+    {
+      logError(LOG_TAG, "Failed to create SiftSeedFromInput shader module");
+      return false;
+    }
+    if (!vkenv_createComputePipeline(detector->dev->device, sf_shader_module, detector->seed_from_input_desc_set_layout, sizeof(Upsample2xLinearPushConsts),
+                                     &detector->seed_from_input_pipeline_layout, &detector->seed_from_input_pipeline))
+    {
+      logError(LOG_TAG, "Failed to create SiftSeedFromInput pipeline");
+      vkDestroyShaderModule(detector->dev->device, sf_shader_module, NULL);
+      return false;
+    }
+    vkDestroyShaderModule(detector->dev->device, sf_shader_module, NULL);
+  }
+
+  //////////////////////////////////////
   // Setup QuantizeF32ToInput pipeline (device-side R32F → R8 copy, replaces
   // host roundtrip on the on-IMAS detect path).
   //////////////////////////////////////
@@ -1378,6 +1541,33 @@ static bool setupSyncObjects(vksift_SiftDetector detector)
   {
     detector->end_of_detection_fence_compute = VK_NULL_HANDLE;
   }
+
+  // Per-slot shader-region timestamp query pool. Created unconditionally — the
+  // cmd buffer always emits vkCmdWriteTimestamp at region boundaries; we only
+  // pay the host-side read+log cost when VKSIFT_PROFILE_SHADERS=1 is set.
+  detector->profile_shaders = (getenv("VKSIFT_PROFILE_SHADERS") != NULL);
+  memset(detector->profile_shader_acc_ns, 0, sizeof(detector->profile_shader_acc_ns));
+  detector->profile_shader_n_warps = 0u;
+  detector->shader_timestamp_pools = (VkQueryPool *)calloc(detector->mem->nb_pyramid_slots, sizeof(VkQueryPool));
+  if (detector->shader_timestamp_pools == NULL)
+  {
+    logError(LOG_TAG, "Failed to allocate shader_timestamp_pools array");
+    return false;
+  }
+  {
+    VkQueryPoolCreateInfo qp_info = {
+        .sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType  = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = VKSIFT_NUM_TS};
+    for (uint32_t s = 0u; s < detector->mem->nb_pyramid_slots; ++s)
+    {
+      if (vkCreateQueryPool(detector->dev->device, &qp_info, NULL, &detector->shader_timestamp_pools[s]) != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "Failed to create shader timestamp query pool for slot %u", s);
+        return false;
+      }
+    }
+  }
   return true;
 }
 
@@ -1572,6 +1762,70 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
                                             .pTexelBufferView = NULL};
       vkUpdateDescriptorSets(detector->dev->device, 2, ds_writes, 0, NULL);
     }
+  }
+
+  /////////////////////////////////////////////////////
+  // Write set for Upsample2xLinear pipeline (per-slot). Binds:
+  //   0: slots[s].warped_input_image_view (R32F image2D, AffineWarp output)
+  //   1: slots[s].octave_image_view_arr[0] (R32F image2DArray, octave 0)
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    VkDescriptorImageInfo us_in_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].warped_input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo us_out_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_image_view_arr[0], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet us_writes[2];
+    us_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                          .dstSet = detector->upsample_desc_set[s],
+                                          .dstBinding = 0,
+                                          .dstArrayElement = 0,
+                                          .descriptorCount = 1,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .pImageInfo = &us_in_info,
+                                          .pBufferInfo = NULL,
+                                          .pTexelBufferView = NULL};
+    us_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                          .dstSet = detector->upsample_desc_set[s],
+                                          .dstBinding = 1,
+                                          .dstArrayElement = 0,
+                                          .descriptorCount = 1,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .pImageInfo = &us_out_info,
+                                          .pBufferInfo = NULL,
+                                          .pTexelBufferView = NULL};
+    vkUpdateDescriptorSets(detector->dev->device, 2, us_writes, 0, NULL);
+  }
+
+  /////////////////////////////////////////////////////
+  // Write set for SiftSeedFromInput pipeline (per-slot). Binds:
+  //   0: slots[s].input_image_view (R8_UNORM image2D, post-Quantize)
+  //   1: slots[s].octave_image_view_arr[0] (R32F image2DArray, octave 0)
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    VkDescriptorImageInfo sf_in_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].input_image_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo sf_out_info = {
+        .sampler = VK_NULL_HANDLE, .imageView = detector->mem->slots[s].octave_image_view_arr[0], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet sf_writes[2];
+    sf_writes[0] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                          .dstSet = detector->seed_from_input_desc_set[s],
+                                          .dstBinding = 0,
+                                          .dstArrayElement = 0,
+                                          .descriptorCount = 1,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .pImageInfo = &sf_in_info,
+                                          .pBufferInfo = NULL,
+                                          .pTexelBufferView = NULL};
+    sf_writes[1] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                          .dstSet = detector->seed_from_input_desc_set[s],
+                                          .dstBinding = 1,
+                                          .dstArrayElement = 0,
+                                          .descriptorCount = 1,
+                                          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                          .pImageInfo = &sf_out_info,
+                                          .pBufferInfo = NULL,
+                                          .pTexelBufferView = NULL};
+    vkUpdateDescriptorSets(detector->dev->device, 2, sf_writes, 0, NULL);
   }
 
   /////////////////////////////////////////////////////
@@ -2079,7 +2333,13 @@ static void recQuantizeImasToInputCmds(vksift_SiftDetector detector, VkCommandBu
   endMarkerRegion(detector, cmdbuf);
 }
 
-static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, const uint32_t oct_idx)
+// When `oct0_seed_preloaded` is true, the caller has ALREADY written into
+// octave_image_arr[slot_idx][0] layer 0 (e.g. via SiftSeedFromInput in the
+// IMAS-fused path). We then skip the PreBlur1D + AffineWarp + Copy/Upsample
+// chain at oct_idx == 0 and jump straight to the seed-scale blur. The barrier
+// going INTO the seed-scale h-blur is still emitted so the writer is visible.
+static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, const uint32_t oct_idx,
+                                          bool oct0_seed_preloaded)
 {
   /////////////////////////////////////////////////
   // Scale space construction (per-slot per-octave)
@@ -2096,7 +2356,7 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
   // pre-blur applies the Morel-Yu σ_aa filter so the warp samples from an
   // anti-aliased version of the input. At σ=0 the PreBlur1D shader degenerates
   // to a pass-through copy, keeping the original identity behavior intact.
-  if (oct_idx == 0)
+  if (oct_idx == 0 && !oct0_seed_preloaded)
   {
     beginMarkerRegion(detector, cmdbuf, "PreBlur1D + AffineWarp");
 
@@ -2150,41 +2410,148 @@ static void recScaleSpaceConstructionCmds(vksift_SiftDetector detector, VkComman
                   (uint32_t)ceilf((float)detector->mem->curr_input_image_width  / 8.f),
                   (uint32_t)ceilf((float)detector->mem->curr_input_image_height / 8.f), 1);
 
-    // Barrier: warped_input_image SHADER_WRITE → TRANSFER_READ for the BlitImage below.
+    // Barrier: warped_input_image SHADER_WRITE → (TRANSFER_READ for the
+    // vkCmdCopyImage path / SHADER_READ for the Upsample2xLinear compute path).
+    // We can't tell which path runs until we compare input dims to oct-0 dims
+    // below, but both paths execute the same stage transition (compute→compute
+    // or compute→transfer) and both are legal on the async-compute pool. To
+    // keep this simple, request the union of both access masks and target both
+    // stages — the validation layer accepts this (it's a superset barrier).
     image_barriers[0] = vkenv_genImageMemoryBarrier(
-        detector->mem->slots[slot_idx].warped_input_image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        detector->mem->slots[slot_idx].warped_input_image, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
     vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, image_barriers);
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, image_barriers);
     endMarkerRegion(detector, cmdbuf);
   }
 
   vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline);
 
-  // Handle the octave first scale (blit from input image)
-  if (oct_idx == 0)
+  // Handle the octave first scale (copy or upsample compute dispatch from
+  // warped_input_image). Two cases depending on use_upsampling:
+  //   - false: octave-0 dims == input dims, so vkCmdCopyImage is 1:1
+  //     bit-exact (and legal on every queue family that supports TRANSFER,
+  //     including async-compute).
+  //   - true:  octave-0 is 2× input — dispatch Upsample2xLinear.comp instead
+  //     of vkCmdBlitImage. The blit was graphics-only; the compute shader is
+  //     a bit-equivalent mirror of VK_FILTER_LINEAR + CLAMP_TO_EDGE and lets
+  //     the parallel-IMAS dispatcher use the async-compute pool.
+  // When `oct0_seed_preloaded`, octave_image_arr[0] layer 0 was already
+  // populated by the caller (SiftSeedFromInput in the fused IMAS path); we
+  // skip directly to the seed-scale blur — but still need a barrier so the
+  // writer's WRITE is visible to the blur's READ.
+  if (oct_idx == 0 && oct0_seed_preloaded)
   {
-    // Blit warped_input_image (output of AffineWarp; r32f) → octave_image_arr[0] layer 0,
-    // applying the input-to-octave-0 scale ratio via VK_FILTER_LINEAR.
-    VkImageBlit region = {
-        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
-        .srcOffsets = {{0, 0, 0}, {(int32_t)detector->mem->curr_input_image_width, (int32_t)detector->mem->curr_input_image_height, 1}},
-        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
-        .dstOffsets = {{0, 0, 0},
-                       {(int32_t)detector->mem->octave_resolutions[oct_idx].width, (int32_t)detector->mem->octave_resolutions[oct_idx].height, 1}}};
-    vkCmdBlitImage(cmdbuf, detector->mem->slots[slot_idx].warped_input_image, VK_IMAGE_LAYOUT_GENERAL,
-                   detector->mem->slots[slot_idx].octave_image_arr[oct_idx], VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
+    image_barriers[0] = vkenv_genImageMemoryBarrier(
+        detector->mem->slots[slot_idx].octave_image_arr[oct_idx],
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    image_barriers[1] = vkenv_genImageMemoryBarrier(
+        detector->mem->slots[slot_idx].blur_tmp_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmdbuf,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
 
-    // Setup memory access (horizontal pass read from source scale and write to temporary restul image)
+    // Horizontal blur the first scale (mirrors the path below).
+    blur_push_const.is_vertical = 0;
+    blur_push_const.array_layer = 0;
+    blur_push_const.kernel_size = detector->gaussian_kernel_sizes[0];
+    memcpy(blur_push_const.kernel, detector->gaussian_kernels, sizeof(float) * VKSIFT_DETECTOR_MAX_GAUSSIAN_KERNEL_SIZE);
+    vkCmdPushConstants(cmdbuf, detector->blur_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GaussianBlurPushConsts), &blur_push_const);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline_layout, 0, 1, &detector->blur_h_desc_sets[oct_set_idx], 0, NULL);
+    vkCmdDispatch(cmdbuf, ceilf((float)(detector->mem->octave_resolutions[oct_idx].width) / 8.f),
+                  ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), 1);
+
+    // Setup the memory access masks for vertical pass.
+    image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].blur_tmp_image_arr[oct_idx], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                                                    (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_image_arr[oct_idx], VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                                                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                                                    (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
+
+    // Vertical blur the first scale.
+    blur_push_const.is_vertical = 1;
+    vkCmdPushConstants(cmdbuf, detector->blur_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GaussianBlurPushConsts), &blur_push_const);
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline_layout, 0, 1, &detector->blur_v_desc_sets[oct_set_idx], 0, NULL);
+    vkCmdDispatch(cmdbuf, ceilf((float)(detector->mem->octave_resolutions[oct_idx].width) / 8.f),
+                  ceilf((float)(detector->mem->octave_resolutions[oct_idx].height) / 8.f), 1);
+  }
+  else if (oct_idx == 0)
+  {
+    const uint32_t in_w  = detector->mem->curr_input_image_width;
+    const uint32_t in_h  = detector->mem->curr_input_image_height;
+    const uint32_t oct_w = detector->mem->octave_resolutions[oct_idx].width;
+    const uint32_t oct_h = detector->mem->octave_resolutions[oct_idx].height;
+    const bool same_dims = (in_w == oct_w && in_h == oct_h);
+
+    if (same_dims)
+    {
+      VkImageCopy copy_region = {
+          .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+          .srcOffset = {0, 0, 0},
+          .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+          .dstOffset = {0, 0, 0},
+          .extent = {oct_w, oct_h, 1}};
+      vkCmdCopyImage(cmdbuf, detector->mem->slots[slot_idx].warped_input_image, VK_IMAGE_LAYOUT_GENERAL,
+                     detector->mem->slots[slot_idx].octave_image_arr[oct_idx], VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region);
+    }
+    else
+    {
+      // Upsample2xLinear: warped_input_image (image2D r32f) →
+      // octave_image_arr[0] layer 0. Bit-equivalent to vkCmdBlitImage with
+      // VK_FILTER_LINEAR + CLAMP_TO_EDGE.
+      //
+      // Need a 0 → SHADER_WRITE barrier on octave_image_arr[0] before the
+      // dispatch since we are about to write to it from compute.
+      image_barriers[0] = vkenv_genImageMemoryBarrier(
+          detector->mem->slots[slot_idx].octave_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT,
+          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+          VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+          (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+      vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           0, 0, NULL, 0, NULL, 1, image_barriers);
+
+      vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->upsample_pipeline);
+      vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->upsample_pipeline_layout, 0, 1,
+                              &detector->upsample_desc_set[slot_idx], 0, NULL);
+      Upsample2xLinearPushConsts us_pc = {
+          .dst_layer  = 0,
+          .dst_width  = (int32_t)oct_w,
+          .dst_height = (int32_t)oct_h,
+          .src_width  = (int32_t)in_w,
+          .src_height = (int32_t)in_h};
+      vkCmdPushConstants(cmdbuf, detector->upsample_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                         sizeof(Upsample2xLinearPushConsts), &us_pc);
+      vkCmdDispatch(cmdbuf, (uint32_t)ceilf((float)oct_w / 8.f), (uint32_t)ceilf((float)oct_h / 8.f), 1);
+    }
+
+    vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->blur_pipeline);
+
+    // octave_image_arr[0] is now written. For the copy path the previous write
+    // was TRANSFER; for the upsample path it was COMPUTE_SHADER. The combined
+    // src access mask covers both cases.
     image_barriers[0] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].blur_tmp_image_arr[oct_idx], 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_image_arr[oct_idx], 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+    image_barriers[1] = vkenv_genImageMemoryBarrier(detector->mem->slots[slot_idx].octave_image_arr[oct_idx],
+                                                    VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                                    VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
                                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                                                     (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}); // only scale 0
-    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
+    vkCmdPipelineBarrier(cmdbuf,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, image_barriers);
 
     // Horizontal blur the first scale
     blur_push_const.is_vertical = 0;
@@ -2704,6 +3071,14 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
   VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return false;
 
+  // Shader-region timestamp pool: reset to UNDEFINED then stamp ts[0] = START.
+  // Subsequent vkCmdWriteTimestamp calls at region boundaries below capture
+  // GPU pipeline wallclock for {imas, quant, scales, dog, extract, oridesc,
+  // bp+count}. Host reads them in dispatchParallelIMAS when profile_shaders.
+  vkCmdResetQueryPool(cmd, detector->shader_timestamp_pools[slot_idx], 0, VKSIFT_NUM_TS);
+  vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                      detector->shader_timestamp_pools[slot_idx], VKSIFT_TS_START);
+
   // Phase E defensive: HOST_WRITE → UNIFORM/SHADER/INDIRECT_COMMAND_READ
   // barrier at the head of every fused cmd buffer. vkQueueSubmit's implicit
   // host-write visibility should cover this, but on the async-compute queue
@@ -2816,51 +3191,54 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
                          0, 0, NULL, 0, NULL, 1, &b);
   }
 
-  // ---- 3. FinvsplineRow : in-place per-row IIR on slot.tilted_image ----
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_row_pipeline);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
-                          0, 1, &imas->finvspline_row_set[slot_idx], 0, NULL);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
-                          1, 1, &ubo_set, 0, NULL);
-  vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
-                        offsetof(SlotDispatchBuffer, finvspline_row));
+  // ---- 3-4. Finvspline{Row,Col} : in-place per-row+col IIR on tilted_image.
+  // Required when Fproj uses cubic interpolation; skipped under bilinear mode
+  // (VKSIFT_IMAS_BILINEAR=1) — bilinear samples directly from the blurred
+  // image without the spline pre-filter. Saves 2 full-image dispatches per warp.
+  if (!detector->use_bilinear_fproj)
   {
-    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(slot->tilted_image,
-        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 0, NULL, 0, NULL, 1, &b);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_row_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
+                            0, 1, &imas->finvspline_row_set[slot_idx], 0, NULL);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
+                            1, 1, &ubo_set, 0, NULL);
+    vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
+                          offsetof(SlotDispatchBuffer, finvspline_row));
+    {
+      VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(slot->tilted_image,
+          VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+          VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+          (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           0, 0, NULL, 0, NULL, 1, &b);
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_col_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
+                            0, 1, &imas->finvspline_col_set[slot_idx], 0, NULL);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
+                            1, 1, &ubo_set, 0, NULL);
+    vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
+                          offsetof(SlotDispatchBuffer, finvspline_col));
+    {
+      VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(slot->tilted_image,
+          VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+          VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+          (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           0, 0, NULL, 0, NULL, 1, &b);
+    }
   }
 
-  // ---- 4. FinvsplineCol : in-place per-col IIR on slot.tilted_image ----
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_col_pipeline);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
-                          0, 1, &imas->finvspline_col_set[slot_idx], 0, NULL);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->finvspline_pipeline_layout,
-                          1, 1, &ubo_set, 0, NULL);
-  vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
-                        offsetof(SlotDispatchBuffer, finvspline_col));
-  {
-    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(slot->tilted_image,
-        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 0, NULL, 0, NULL, 1, &b);
-  }
-
-  // ---- 5. FprojCubicY : slot.tilted_image → slot.rotated_image (sub-region) ----
-  // NOTE: Phase B-3 always uses the cubic Fproj. The bilinear variant
-  // (controlled by VKSIFT_IMAS_BILINEAR in vksift_runImasWarp) requires
-  // skipping the two Finvspline passes — that's a future optimization for the
-  // fused path, not landed here. The bilinear pipeline shares the cubic's
-  // descriptor set + pipeline layout so it would be a one-line swap.
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->fproj_pipeline);
+  // ---- 5. Fproj{Cubic|Bilinear}Y : slot.tilted_image → slot.rotated_image ----
+  VkPipeline fproj_pipe = detector->use_bilinear_fproj
+                          ? imas->fproj_bilinear_pipeline
+                          : imas->fproj_pipeline;
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fproj_pipe);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->fproj_pipeline_layout,
                           0, 1, &imas->fproj_set[slot_idx], 0, NULL);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, imas->fproj_pipeline_layout,
@@ -2868,6 +3246,10 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
   vkCmdDispatchIndirect(cmd, slot->dispatch_buffer,
                         offsetof(SlotDispatchBuffer, fproj));
   endMarkerRegion(detector, cmd);
+
+  // Timestamp: end of IMAS chain (rotate + finvspline + fproj + warp).
+  vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                      detector->shader_timestamp_pools[slot_idx], VKSIFT_TS_AFTER_IMAS);
 
   // ---- 6. Quantize : slot.rotated_image (R32F) → slot.input_image (R8) ----
   // Reuses recQuantizeImasToInputCmds's barrier sequence + indirect dispatch.
@@ -2917,6 +3299,51 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
   }
   endMarkerRegion(detector, cmd);
 
+  // Timestamp: end of Quantize.
+  vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                      detector->shader_timestamp_pools[slot_idx], VKSIFT_TS_AFTER_QUANT);
+
+  // ---- 6b. (Optional, VKSIFT_FUSED_OCT0=1) Seed-from-input fast path. ----
+  // Replaces the PreBlur1D + AffineWarp + (CopyImage|Upsample2xLinear) chain
+  // at oct_idx==0 with a single SiftSeedFromInput dispatch that writes
+  // input_image (R8) directly into octave_image_arr[0] layer 0 (R32F),
+  // with optional 2× upsample built in. Also corrects a latent bug where the
+  // OLD path's AffineWarp double-applied the IMAS rotation matrix — feature
+  // counts change vs. the default path, so this is opt-in pending validation.
+  if (detector->fused_oct0_enabled)
+  {
+    const uint32_t in_w  = detector->mem->curr_input_image_width;
+    const uint32_t in_h  = detector->mem->curr_input_image_height;
+    const uint32_t oct_w = detector->mem->octave_resolutions[0].width;
+    const uint32_t oct_h = detector->mem->octave_resolutions[0].height;
+
+    VkImageMemoryBarrier oct0_in = vkenv_genImageMemoryBarrier(
+        slot->octave_image_arr[0], 0, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &oct0_in);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->seed_from_input_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            detector->seed_from_input_pipeline_layout, 0, 1,
+                            &detector->seed_from_input_desc_set[slot_idx], 0, NULL);
+    Upsample2xLinearPushConsts sf_pc = {
+        .dst_layer  = 0,
+        .dst_width  = (int32_t)oct_w,
+        .dst_height = (int32_t)oct_h,
+        .src_width  = (int32_t)in_w,
+        .src_height = (int32_t)in_h};
+    vkCmdPushConstants(cmd, detector->seed_from_input_pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(Upsample2xLinearPushConsts), &sf_pc);
+    vkCmdDispatch(cmd,
+        (uint32_t)ceilf((float)oct_w / 8.f),
+        (uint32_t)ceilf((float)oct_h / 8.f), 1);
+  }
+
   // ---- 7. SIFT detect chain (per-slot) ----
   // Direct dispatches; canvas is curr_input_image_* which is stable across
   // warps. recExtractKeypointsCmds / recCopySIFTCountCmds use slot_idx to
@@ -2925,15 +3352,30 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
   recClearBufferDataCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
-    recScaleSpaceConstructionCmds(detector, cmd, slot_idx, i);
+    // When fused_oct0_enabled, the SiftSeedFromInput dispatch above already
+    // wrote octave_image_arr[0] layer 0, so skip the PreBlur/Warp/Copy chain.
+    recScaleSpaceConstructionCmds(detector, cmd, slot_idx, i,
+                                  /*oct0_seed_preloaded=*/(i == 0 && detector->fused_oct0_enabled));
   }
+  vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                      detector->shader_timestamp_pools[slot_idx], VKSIFT_TS_AFTER_SCALES);
+
   recDifferenceOfGaussianCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
+  vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                      detector->shader_timestamp_pools[slot_idx], VKSIFT_TS_AFTER_DOG);
+
   recExtractKeypointsCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
+  vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                      detector->shader_timestamp_pools[slot_idx], VKSIFT_TS_AFTER_EXTRACT);
+
   if (!detector->detection_only)
   {
     recComputeOrientationsCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
     recComputeDestriptorsCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
   }
+  vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                      detector->shader_timestamp_pools[slot_idx], VKSIFT_TS_AFTER_ORIDESC);
+
   recCopySIFTCountCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
 
   // ---- Phase D — GPU back-projection + boundary filter ----
@@ -2942,6 +3384,8 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkComman
   // matrix, and reject features whose K·σ·σ_max neighbourhood overlaps
   // the parallelogram edge (octave_idx = -1).
   recBackProjectFeaturesCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
+  vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                      detector->shader_timestamp_pools[slot_idx], VKSIFT_TS_END);
 
   if (detector->dev->async_transfer_available)
   {
@@ -3028,7 +3472,7 @@ static bool recordCommandBuffers(vksift_SiftDetector detector)
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
     // Construct each octave
-    recScaleSpaceConstructionCmds(detector, detector->detection_command_buffer, 0u, i);
+    recScaleSpaceConstructionCmds(detector, detector->detection_command_buffer, 0u, i, /*oct0_seed_preloaded=*/false);
   }
 
   // Compute difference of Gaussian (on full range to synchronize every octave with a single barrier)
@@ -3084,7 +3528,7 @@ static bool recordCommandBuffers(vksift_SiftDetector detector)
   recQuantizeImasToInputCmds(detector, detector->detection_command_buffer_from_imas, 0u);
   for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
   {
-    recScaleSpaceConstructionCmds(detector, detector->detection_command_buffer_from_imas, 0u, i);
+    recScaleSpaceConstructionCmds(detector, detector->detection_command_buffer_from_imas, 0u, i, /*oct0_seed_preloaded=*/false);
   }
   recDifferenceOfGaussianCmds(detector, detector->detection_command_buffer_from_imas, 0u, 0, detector->mem->curr_nb_octaves);
   recExtractKeypointsCmds(detector, detector->detection_command_buffer_from_imas, 0u, 0, detector->mem->curr_nb_octaves);
@@ -3169,6 +3613,29 @@ bool vksift_createSiftDetector(vkenv_Device device, vksift_SiftMemory memory, vk
   detector->use_rgb_input = config->use_rgb_input;
 
   detector->curr_buffer_idx = 0u; // Default target buffer is 0 (always available)
+
+  // Fused IMAS chain: bilinear Fproj is the default — skips FinvsplineRow +
+  // FinvsplineCol and uses FprojBilinearY in place of FprojCubicY. Measured
+  // ~1.9× wallclock speedup on IMAS-25 with sum_kept change <0.3% on the
+  // find_boards test image (kept-feature count is gated by NMS + boundary
+  // filter which absorb the cubic-vs-bilinear extrema-population difference).
+  // Set VKSIFT_IMAS_BILINEAR=0 to force cubic. Read once at init.
+  {
+    const char *s = getenv("VKSIFT_IMAS_BILINEAR");
+    detector->use_bilinear_fproj = (s == NULL) || (atoi(s) != 0);
+  }
+
+  // VKSIFT_FUSED_OCT0 controls the octave-0 fast path. *Default ON* — verified
+  // with a single-blob synthetic test that the OLD (off) path double-applies
+  // the IMAS rotation matrix at oct_idx=0 of the fused IMAS chain, so detected
+  // features back-project to wrong positions (~hundreds of pixels off truth)
+  // for any θ≠0 warp. Symptom: spurious "board-grid" artifacts. With this on,
+  // every IMAS-25 warp localises the blob within 1-2px (vs 261-1727px before).
+  // Set VKSIFT_FUSED_OCT0=0 to fall back to the legacy buggy path.
+  {
+    const char *s = getenv("VKSIFT_FUSED_OCT0");
+    detector->fused_oct0_enabled = (s == NULL) || (atoi(s) != 0);
+  }
 
   // PreBlur1D defaults: σ=0 means the shader degenerates to a pass-through
   // copy of input_image (no anti-alias). Direction is irrelevant when σ=0.
@@ -3392,22 +3859,30 @@ void vksift_fillFusedWarpState(vksift_SiftDetector detector,
     ubo.warp_idx       = warp_idx;
 
     // ---- Phase D — back-projection params (tilted-frame → input-frame) ----
-    // The IMAS AffineWarp rotates+tilts (a11..a23 = rotation map). The
-    // ASIFT inverse-tilt back-projection is a SEPARATE matrix:
-    //   A_inv = R(-φ) · diag(1, t) · R(φ)
-    // applied around the image center, then σ_max = max(1, t). Identity warp
-    // (t=1, φ=0 — i.e. warp_idx == 0 in the IMAS-25 schedule) skips boundary
-    // check + uses identity matrix.
+    // The IMAS forward chain is:
+    //   1. AffineWarp (frot):  input → rotated, applying R(-φ).
+    //   2. FprojCubic/Bilinear: rotated → tilted, subsampling y by t.
+    // So forward = T(1/t) · R(-φ). The inverse (tilted → input) is therefore
+    // R(φ) · T(t) — *asymmetric*:
+    //   [ cosφ   -t·sinφ ]
+    //   [ sinφ    t·cosφ ]
+    // The earlier code wrote the *symmetric* shape matrix R(-φ)·T(t)·R(φ)
+    // here, which is correct as a CPU-side σ → ellipse conversion (semi-axes
+    // 1 and t along the rotated axes) but wrong for back-projecting a
+    // *position* — it rotated the back-projected (xi, yi) by an extra φ,
+    // putting the boundary check on a curve that doesn't match the actual
+    // parallelogram edge. The fix below uses the true asymmetric inverse.
+    // σ_max = t is still the largest singular value (unchanged).
+    // Asymmetric back-projection R(+θ)·T(t). Matches imas_cpu.jl's
+    // tiltedcoor2imagecoor exactly (signs verified at lines 525-529).
     const float cf = cosf(theta_rad);
     const float sf = sinf(theta_rad);
-    ubo.bp_a11 = cf * cf + t_factor * sf * sf;
-    ubo.bp_a12 = (t_factor - 1.0f) * cf * sf;
-    ubo.bp_a21 = ubo.bp_a12;
-    ubo.bp_a22 = sf * sf + t_factor * cf * cf;
-    const float cx = ((float)W - 1.0f) * 0.5f;
-    const float cy = ((float)H - 1.0f) * 0.5f;
-    ubo.bp_a13 = cx - (ubo.bp_a11 * cx + ubo.bp_a12 * cy);
-    ubo.bp_a23 = cy - (ubo.bp_a21 * cx + ubo.bp_a22 * cy);
+    ubo.bp_a11 = cf;
+    ubo.bp_a12 = -t_factor * sf;
+    ubo.bp_a21 = sf;
+    ubo.bp_a22 =  t_factor * cf;
+    ubo.bp_a13 = cf * (float)xmin - sf * (float)ymin;
+    ubo.bp_a23 = sf * (float)xmin + cf * (float)ymin;
     ubo.bp_sigma_max  = (t_factor > 1.0f) ? t_factor : 1.0f;
     ubo.bp_boundary_K = 3.0f;
     ubo.bp_input_W    = W;
@@ -3649,6 +4124,20 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   VK_NULL_SAFE_DELETE(detector->downsample_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->downsample_desc_pool, NULL));
   VK_NULL_SAFE_DELETE(detector->downsample_desc_set_layout,
                       vkDestroyDescriptorSetLayout(detector->dev->device, detector->downsample_desc_set_layout, NULL));
+  // Upsample2xLinear (octave-0 2× linear upsample, replaces vkCmdBlitImage)
+  VK_NULL_SAFE_DELETE(detector->upsample_pipeline, vkDestroyPipeline(detector->dev->device, detector->upsample_pipeline, NULL));
+  VK_NULL_SAFE_DELETE(detector->upsample_pipeline_layout,
+                      vkDestroyPipelineLayout(detector->dev->device, detector->upsample_pipeline_layout, NULL));
+  VK_NULL_SAFE_DELETE(detector->upsample_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->upsample_desc_pool, NULL));
+  VK_NULL_SAFE_DELETE(detector->upsample_desc_set_layout,
+                      vkDestroyDescriptorSetLayout(detector->dev->device, detector->upsample_desc_set_layout, NULL));
+  // SiftSeedFromInput (IMAS-fused octave-0 fast path)
+  VK_NULL_SAFE_DELETE(detector->seed_from_input_pipeline, vkDestroyPipeline(detector->dev->device, detector->seed_from_input_pipeline, NULL));
+  VK_NULL_SAFE_DELETE(detector->seed_from_input_pipeline_layout,
+                      vkDestroyPipelineLayout(detector->dev->device, detector->seed_from_input_pipeline_layout, NULL));
+  VK_NULL_SAFE_DELETE(detector->seed_from_input_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->seed_from_input_desc_pool, NULL));
+  VK_NULL_SAFE_DELETE(detector->seed_from_input_desc_set_layout,
+                      vkDestroyDescriptorSetLayout(detector->dev->device, detector->seed_from_input_desc_set_layout, NULL));
   // Extract keypoints
   VK_NULL_SAFE_DELETE(detector->extractkpts_pipeline, vkDestroyPipeline(detector->dev->device, detector->extractkpts_pipeline, NULL));
   VK_NULL_SAFE_DELETE(detector->extractkpts_2d_pipeline, vkDestroyPipeline(detector->dev->device, detector->extractkpts_2d_pipeline, NULL));
@@ -3693,6 +4182,18 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
     VK_NULL_SAFE_DELETE(detector->rgb_convert_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->rgb_convert_desc_pool, NULL));
     VK_NULL_SAFE_DELETE(detector->rgb_convert_desc_set_layout,
                         vkDestroyDescriptorSetLayout(detector->dev->device, detector->rgb_convert_desc_set_layout, NULL));
+  }
+
+  // Per-slot shader-region timestamp query pools.
+  if (detector->shader_timestamp_pools != NULL)
+  {
+    for (uint32_t s = 0u; s < detector->mem->nb_pyramid_slots; ++s)
+    {
+      VK_NULL_SAFE_DELETE(detector->shader_timestamp_pools[s],
+                          vkDestroyQueryPool(detector->dev->device, detector->shader_timestamp_pools[s], NULL));
+    }
+    free(detector->shader_timestamp_pools);
+    detector->shader_timestamp_pools = NULL;
   }
 
   // Free descriptor arrays

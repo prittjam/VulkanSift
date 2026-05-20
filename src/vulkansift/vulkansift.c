@@ -17,6 +17,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+// Per-wave dispatch timing (enabled by env var VKSIFT_PROFILE_DISPATCH=1).
+static inline uint64_t vksift_now_ns(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static const char LOG_TAG[] = "VulkanSift";
 static bool swapchain_extensions_supported;
@@ -968,17 +977,15 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
     vksift_imasRefreshDescriptorSets(instance->imas_pipeline);
   }
 
-  // TODO(phase-c-async): async-transfer's slot-0-aliased ownership cmd buffers
-  // are wrong for parallel waves (acquire/release_buffer_ownership_command_buffer
-  // are recorded against slot 0 only — see recordCommandBuffers). For now,
-  // refuse to use the async path even if the device exposes it. Mirror the
-  // non-async branch of dispatchDetectionCmdBuffer below.
-  if (detector->dev->async_transfer_available)
-  {
-    logWarning(LOG_TAG,
-        "vksift_dispatchParallelIMAS: async-transfer available but unsupported on "
-        "the parallel path; falling back to single-queue submission for this call.");
-  }
+  // Note on async-transfer: the parallel path does NOT submit
+  // release/acquire_buffer_ownership_command_buffer (those wrap the legacy
+  // single-queue dispatchDetectionCmdBuffer + vksift_dispatchFusedImasWarpForSlot
+  // submissions). sift_buffer_arr has been CONCURRENT across (general,
+  // async-compute, async-transfer) families since the multi_queue_share_info
+  // refactor, so recBufferOwnershipTransferCmds is a no-op and the older
+  // "slot-0-aliased ownership cmd buffer" concern is moot. The parallel
+  // dispatcher synchronises across queues via semaphores on the fused cmd
+  // buffers directly.
 
   // Force a re-record on the very first wave after IMAS-pipeline lazy init or
   // a memory-layout change. Subsequent waves reuse the existing recording.
@@ -1011,6 +1018,10 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
   // Fence reuse between waves is safe because the wait+reset pair happens
   // before re-submitting. When async-compute is unavailable, wave_g == wave
   // and the dispatcher degenerates to the previous single-queue path.
+  //
+  // Octave-0 construction now uses either vkCmdCopyImage (use_upsampling=false)
+  // or the Upsample2xLinear compute dispatch (use_upsampling=true); both are
+  // legal on the async-compute pool, so the use_upsampling fallback is gone.
   const bool use_async_compute = detector->dev->async_compute_available;
 
   // Phase E: cross-queue sync for cached_input_image. The image was last
@@ -1053,22 +1064,33 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
   const VkPipelineStageFlags compute_start_wait_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
   VkSubmitInfo submits_general[VKSIFT_MAX_PYRAMID_SLOTS];
   VkSubmitInfo submits_compute[VKSIFT_MAX_PYRAMID_SLOTS];
+
+  // Per-phase timing accumulators. Enabled when VKSIFT_PROFILE_DISPATCH=1
+  // in the environment. Zero overhead when disabled (no clock_gettime calls).
+  const bool prof = (getenv("VKSIFT_PROFILE_DISPATCH") != NULL);
+  uint64_t t_ubo_ns = 0, t_submit_ns = 0, t_wait_ns = 0, t_count_ns = 0;
+  uint32_t prof_n_waves = 0u;
+  const uint64_t t_start_ns = prof ? vksift_now_ns() : 0;
+
   for (uint32_t base = 0u; base < n_warps; base += n_slots)
   {
     uint32_t remaining = n_warps - base;
     uint32_t wave = (remaining < n_slots) ? remaining : n_slots;
+    if (prof) ++prof_n_waves;
 
     // (a) Fill each slot's per-warp UBO + dispatch buffer. The warp_idx
     // stamped into the UBO comes from the caller's WarpSpec — `base + s` is
     // the index within THIS call's array, not the global schedule, so callers
     // (e.g. the JL FFI chunking by n_slots) must pre-populate warp_idx with
     // the global value before passing the schedule in.
+    const uint64_t t_ubo_start = prof ? vksift_now_ns() : 0;
     for (uint32_t s = 0u; s < wave; ++s)
     {
       vksift_fillFusedWarpState(detector, s, warps[base + s].warp_idx, W, H,
                                 warps[base + s].t_factor, warps[base + s].theta_rad,
                                 canvas_w, canvas_h);
     }
+    if (prof) t_ubo_ns += vksift_now_ns() - t_ubo_start;
 
     // (b) Split the wave between general and async-compute queues. Half-up to
     // the general queue, half-down to the compute queue — when the wave size
@@ -1111,6 +1133,7 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
     if (wave_c > 0u) compute_start_consumed = true;
 
     // Reset whichever fences we'll signal this wave (both start signaled).
+    const uint64_t t_submit_start = prof ? vksift_now_ns() : 0;
     VkFence reset_fences[2];
     uint32_t reset_count = 0u;
     if (wave_g > 0u) reset_fences[reset_count++] = detector->end_of_detection_fence;
@@ -1137,16 +1160,20 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
         return;
       }
     }
+    if (prof) t_submit_ns += vksift_now_ns() - t_submit_start;
 
     // Wait on every fence we just submitted to.
+    const uint64_t t_wait_start = prof ? vksift_now_ns() : 0;
     VkFence wait_fences[2];
     uint32_t wait_count = 0u;
     if (wave_g > 0u) wait_fences[wait_count++] = detector->end_of_detection_fence;
     if (wave_c > 0u) wait_fences[wait_count++] = detector->end_of_detection_fence_compute;
     if (wait_count > 0u) vkWaitForFences(device, wait_count, wait_fences, VK_TRUE, UINT64_MAX);
+    if (prof) t_wait_ns += vksift_now_ns() - t_wait_start;
 
     // (c) Read per-slot feature counts from sift_count_staging_buffer. These
     // remain valid until the next wave on the same slot dispatches.
+    const uint64_t t_count_start = prof ? vksift_now_ns() : 0;
     for (uint32_t s = 0u; s < wave; ++s)
     {
       uint32_t feat_count = 0u;
@@ -1158,5 +1185,65 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
       }
       out_features_per_warp[base + s] = feat_count;
     }
+    if (prof) t_count_ns += vksift_now_ns() - t_count_start;
+
+    // (d) Per-shader GPU-region timestamp readback. Always happens (recording
+    // is unconditional); we only accumulate when profile_shaders=true.
+    if (detector->profile_shaders)
+    {
+      for (uint32_t s = 0u; s < wave; ++s)
+      {
+        uint64_t ts[8] = {0};
+        if (vkGetQueryPoolResults(device, detector->shader_timestamp_pools[s], 0, 8,
+                                  sizeof(ts), ts, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
+        {
+          continue;
+        }
+        const double period = (double)detector->dev->physical_device_props.limits.timestampPeriod;
+        for (uint32_t r = 0u; r < 7u; ++r)
+        {
+          if (ts[r + 1] >= ts[r])
+          {
+            uint64_t delta = ts[r + 1] - ts[r];
+            detector->profile_shader_acc_ns[r] += (uint64_t)((double)delta * period);
+          }
+        }
+        ++detector->profile_shader_n_warps;
+      }
+    }
+  }
+
+  if (prof)
+  {
+    const uint64_t t_total_ns = vksift_now_ns() - t_start_ns;
+    const uint64_t t_other_ns = (t_total_ns > t_ubo_ns + t_submit_ns + t_wait_ns + t_count_ns)
+                                ? (t_total_ns - t_ubo_ns - t_submit_ns - t_wait_ns - t_count_ns)
+                                : 0u;
+    fprintf(stderr,
+            "[vksift-prof] dispatchParallelIMAS n_warps=%u n_slots=%u n_waves=%u "
+            "total=%.2fms ubo=%.2fms submit=%.2fms wait=%.2fms count=%.2fms other=%.2fms\n",
+            n_warps, n_slots, prof_n_waves,
+            t_total_ns / 1e6, t_ubo_ns / 1e6, t_submit_ns / 1e6,
+            t_wait_ns / 1e6, t_count_ns / 1e6, t_other_ns / 1e6);
+  }
+
+  // Per-shader region GPU timing — print and reset accumulator each call when
+  // VKSIFT_PROFILE_SHADERS=1. Per-warp averages across this dispatch call.
+  if (detector->profile_shaders && detector->profile_shader_n_warps > 0u)
+  {
+    static const char *names[7] = {"imas", "quant", "scales", "dog", "extract", "oridesc", "bp+count"};
+    double total_per_warp_us = 0.0;
+    fprintf(stderr, "[vksift-shaders] n_warps_acc=%u  per-warp avg ms:",
+            detector->profile_shader_n_warps);
+    for (uint32_t r = 0u; r < 7u; ++r)
+    {
+      double avg_ns = (double)detector->profile_shader_acc_ns[r] / (double)detector->profile_shader_n_warps;
+      fprintf(stderr, " %s=%.2f", names[r], avg_ns / 1e6);
+      total_per_warp_us += avg_ns / 1e3;
+    }
+    fprintf(stderr, "  total=%.2fms\n", total_per_warp_us / 1e3);
+    memset(detector->profile_shader_acc_ns, 0, sizeof(detector->profile_shader_acc_ns));
+    detector->profile_shader_n_warps = 0u;
   }
 }

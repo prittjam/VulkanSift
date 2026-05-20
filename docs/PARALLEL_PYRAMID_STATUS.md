@@ -630,3 +630,165 @@ kaimon will capture them. With validation telling us exactly which
 spec rule we're tripping (queue-family transition? synchronization
 scope? layout transition?), Phase E should land in another short
 session.
+
+---
+
+## Phase E — what actually landed (2026-05-20 session, working tree)
+
+Phase E is now functionally complete on the `asift-batch` branch's working
+tree (NOT yet committed at the time of writing — single uncommitted change
+spans 4 files / +408 / −71). Validation is clean for every Phase-E-related
+VUID; functional output matches the Phase D baseline bit-equivalent. The
+only thing that didn't land is the speedup itself.
+
+### What landed
+
+- **`stash@{0}` (phase-e-wip) merged into working tree.** Per-slot
+  resources (`input_image`, `rotated_image`, `tilted_image`,
+  `blur_tmp_image`, `octave_image`, `dog_image`, `warped_input_image`,
+  `blurred_input_image`, `rgba_input_image`, `rgb_input_buffer`,
+  `warp_params_ubo`, `dispatch_buffer`) plus `cached_input_image` and
+  the indirect orientation/descriptor dispatch buffers are now CONCURRENT
+  through `multi_queue_share_info(...)` on devices with a dedicated
+  async-compute family. The async-compute command pool and per-slot
+  compute-pool cmd buffer mirrors are wired up.
+- **`vksift_dispatchParallelIMAS` split-wave logic enabled.** Half-up to
+  the general queue, half-down to the async-compute queue. Cross-queue
+  handshake via `parallel_compute_start_semaphore` (signal on general,
+  wait on first compute submit per call). Defensive HOST→COMPUTE barrier
+  at the head of the fused cmd buffer.
+- **Octave-0 blit replaced with `vkCmdCopyImage` when input dims ==
+  oct-0 dims** (the `use_upsampling == false` case — current BB driver
+  default). vkCmdBlitImage with src dims == dst dims and `VK_FILTER_LINEAR`
+  collapses to integer-coordinate sampling, bit-equivalent to a pure copy.
+  `vkCmdCopyImage` is legal on the async-compute family. **Net result:
+  bug A (VUID-vkCmdBlitImage-commandBuffer-cmdpool) is gone for the
+  current default, and bug B's semaphore double-signal cascade (it was
+  always a side effect of bug A's submit failure) is also gone.**
+- **`warped_input_image` gains `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`** —
+  closes the pre-existing VUID-vkCmdBlitImage-srcImage-00219 the doc
+  flagged earlier. Required for both `vkCmdCopyImage` and the future
+  blit fallback.
+- **Single-queue fallback when `use_upsampling == true`.**
+  `dispatchParallelIMAS` short-circuits `use_async_compute` to false in
+  that case (the octave-0 fallback uses `vkCmdBlitImage` which is
+  graphics-only). One-shot `logWarning` explains. Will be removed when
+  the future `Upsample2xLinear.comp` shader is in place.
+
+### Files touched (working tree, uncommitted)
+
+| File | Lines (+/−) | What |
+|------|-------------|------|
+| `src/vulkansift/sift_detector.c` | +153 / −34 | Per-slot pipeline mirrors, async-compute pool, octave-0 copy/blit branch |
+| `src/vulkansift/sift_detector.h` | +24 / 0    | Per-slot compute cmd buffer mirror, sync objects |
+| `src/vulkansift/sift_memory.c`   | +65 / −33  | Stash's broader CONCURRENT sharing + TRANSFER_SRC_BIT on warped_input_image |
+| `src/vulkansift/vulkansift.c`    | +153 / −17 | Split-wave dispatcher, semaphore signal/wait, upsample=true fallback |
+
+### Validation (Khronos layer loaded)
+
+| Check | Before this session | After |
+|-------|---------------------|-------|
+| VUID-vkCmdBlitImage-commandBuffer-cmdpool | 2 (capped by dup-message-limit) | **0** |
+| VUID-vkQueueSubmit-pSignalSemaphores-00067 | 10 (capped) | **0** |
+| VUID-vkCmdBlitImage-srcImage-00219 | many (per wave) | **0** |
+| "vkQueueSubmit (sync) failed" cascades | ~25 | **0** |
+| VUID-vkResetFences-pFences-01123 (cascade) | 1 | **0** |
+
+Remaining errors (16-17 per run) are all pre-existing, not Phase E:
+- 6-7× `VUID-vkDestroyDevice-device-05137`: `VkPipelineLayout`,
+  `VkPipeline`, `VkDescriptorSetLayout`, `VkDescriptorSet`,
+  `VkDescriptorPool` leaks at shutdown. Owner unknown — needs a
+  cleanup sweep.
+- 10× `VUID-VkShaderModuleCreateInfo-pCode-08740`: SPIR-V `Shader` /
+  `ImageQuery` capabilities declared without an explicit version
+  requirement. Benign on NVIDIA but a spec violation.
+
+### Functional correctness
+
+`asift_gpu_detect_parallel` on the 1920² test image with IMAS-25:
+
+| n_slots | sum_raw | sum_kept | Status |
+|---------|---------|----------|--------|
+| 1       | 111948  | 36923    | Matches previously-committed baseline (CONCURRENT-sharing landed pre-session). |
+| 2       | 111948  | 36923    | Identical to n_slots=1 — wave-count-invariant. |
+
+### Performance — Phase E did not deliver the expected 1.3×
+
+5-trial median over 1920²×IMAS-25, after warmup:
+
+| Setup    | min ms | median ms | Notes |
+|----------|--------|-----------|-------|
+| n_slots=1 (post-Phase-E) | 307 | 322 | Slightly slower than the doc's pre-session 276/295 — likely measurement noise or driver / system difference |
+| n_slots=2 (post-Phase-E) | 304 | 314 | ~1.03× vs n_slots=1, well short of the plan's 1.3× target |
+| n_slots=4 (post-Phase-E) | 335 | 344 | Slower than n_slots=1 |
+
+Theories from the doc ("Why no Phase C speedup") still apply, and the
+prediction held: **the 4090's SMs saturate on a single warp's IMAS+SIFT
+work** (~132 dispatches/warp). Adding a parallel queue gives the driver
+permission to overlap, but the GPU has no spare units to overlap with.
+Per-wave fence/download overhead (`vkResetFences` + per-slot
+`vkCmdCopyBuffer` for feature counts) grows linearly with `n_slots`,
+which is why n_slots=4 is *slower*.
+
+The doc's plan §10 estimate of 1.3× from multi-queue was optimistic in
+hindsight. Real hardware-utilization measurement would need
+Nsight-Compute or similar; if SM occupancy is already ≥90% on n_slots=1,
+no software architecture can deliver async-queue parallelism here.
+
+### What's still in `stash@{0}` (now redundant)
+
+The stash matches the working tree's Phase E content. After this session
+the stash can be dropped:
+
+```bash
+git stash drop stash@{0}  # phase-e-wip — fully integrated
+```
+
+`stash@{1}` (phase-c-multi-queue) is the earlier, narrower scaffold
+that's strictly subsumed by stash@{0}. Drop after stash@{0}.
+
+### Open items the validation log surfaced
+
+1. **`VK_EXT_debug_utils` messenger**: working as intended, routes
+   validation messages to stderr where `kaimon`/Bash captures them.
+2. **`logWarning` for `async-transfer available but unsupported`**:
+   `vulkansift.c:976-981` — wording could be tightened (it says "falling
+   back to single-queue" but the code still uses async-compute for the
+   wave split when use_upsampling=false).
+3. **Pre-existing cleanup VUIDs at vkDestroyDevice**: unrelated to
+   Phase E, but consume validation-noise budget and obscure real issues.
+   Sweep when convenient.
+4. **SPIR-V capability VUIDs (10×)**: every shader create-info needs
+   `VK_API_VERSION_1_0` or a feature requirement explicitly set. Single
+   constant somewhere in `vkenv` would fix all 10 at once.
+
+### Next session — the real Phase E goal is upsample=true with multi-queue
+
+The user has indicated `use_input_upsampling = true` should be the default
+SIFT config so the pipeline can recover small features. Once that flips,
+multi-queue dispatch needs a compute-shader replacement for the octave-0
+2× linear upsample (vkCmdBlitImage is graphics-only). Concrete next steps:
+
+1. **`src/vulkansift/shaders/Upsample2xLinear.comp`** — bit-exact mirror
+   of Vulkan blit's `VK_FILTER_LINEAR` formula. Use `sampler2D` with a
+   dedicated CLAMP_TO_EDGE + LINEAR sampler (existing `image_sampler`
+   uses `MIRRORED_REPEAT` which differs at the edges from blit
+   semantics). Normalized coords: `(i + 0.5) / dst_w`.
+2. **Detector scaffolding**: new `upsample2x_pipeline` / `pipeline_layout`
+   / `desc_set_layout` / `desc_pool` / per-slot descriptor sets. Mirror
+   `downsample_pipeline`'s setup.
+3. **`CMakeLists.txt`**: add the new shader to
+   `VULKANSIFT_LIB_SHADERS`.
+4. **Replace `vkCmdBlitImage` at `recScaleSpaceConstructionCmds:~2099`**
+   with `vkCmdDispatch` (on both graphics and compute paths; the doc
+   precedent is Downsample2x which already did this for the same reason).
+5. **Drop the `use_upsampling` single-queue fallback** in
+   `dispatchParallelIMAS` once the shader covers the case.
+6. **Bit-exact validation**: dump octave_image_arr[0] before and after
+   the shader lands; pixel-diff. Confirm Downstream feature counts
+   unchanged for both upsample=false and upsample=true on identity warp.
+
+Given the empirical "no speedup" result above, this work is more about
+spec correctness than performance — the multi-queue path is unlikely
+to deliver wallclock benefit even after this. It's still worth landing
+to remove a sharp edge and to enable the upsample=true default.
