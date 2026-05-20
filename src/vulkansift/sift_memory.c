@@ -188,6 +188,17 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
   VkMemoryRequirements memory_requirement;
   uint32_t memory_type_idx;
 
+  // Phase E: every per-slot resource is touched by the parallel-IMAS
+  // dispatcher from both detector->general_queue AND
+  // async_compute_queues[0], so they must be CONCURRENT on devices that
+  // have a dedicated compute queue family. On other devices the helper
+  // returns EXCLUSIVE and the dispatcher uses the single-queue path.
+  uint32_t mq_queue_families[3];
+  VkSharingMode mq_mode;
+  uint32_t mq_count;
+  const uint32_t *mq_indices;
+  multi_queue_share_info(memory->device, &mq_mode, &mq_count, &mq_indices, mq_queue_families);
+
   // Create input image and image view.
   // SAMPLED_BIT added so AffineWarp.comp can read it via sampler2D when the
   // ASIFT batch detect path is active (Phase 2b+). Doesn't affect existing
@@ -197,7 +208,7 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
                                  (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
                                  VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                 mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
 
   if (is_init)
   {
@@ -205,7 +216,7 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
                                                   VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                                       VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                                  mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
   }
   else if (res)
   {
@@ -237,13 +248,13 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
                                  (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
                                  VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                 mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
   if (is_init)
   {
     res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height * 4u, &memory_requirement, 0,
                                                   VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                                  mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
   }
   else if (res)
   {
@@ -274,13 +285,13 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
                                  (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
                                  VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                 mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
   if (is_init)
   {
     res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height * 4u, &memory_requirement, 0,
                                                   VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                                  mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
   }
   else if (res)
   {
@@ -326,13 +337,13 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
                                    (VkExtent3D){.width = rot_max, .height = rot_max, .depth = 1}, 1, 1,
                                    VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                   VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                   mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     if (is_init)
     {
       res = res && estimateHighestMemoryRequirement(memory, rot_max * rot_max * 4u, &memory_requirement, 0,
                                                     VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                                    mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     }
     else if (res)
     {
@@ -371,14 +382,14 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
                                    VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                   VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                   mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     if (is_init)
     {
       res = res && estimateHighestMemoryRequirement(memory, tilt_max * tilt_max * 4u, &memory_requirement, 0,
                                                     VK_IMAGE_TYPE_2D, VK_FORMAT_R32_SFLOAT, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                                    mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     }
     else if (res)
     {
@@ -410,15 +421,15 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
     res = res && vkenv_createImage(&memory->slots[slot_idx].rgba_input_image, memory->device, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
                                    (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
                                    VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE,
-                                   0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
 
     if (is_init)
     {
       res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height, &memory_requirement, 0,
                                                     VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                                    mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     }
     else if (res)
     {
@@ -458,7 +469,7 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
       res = true;
       res = res && vkenv_createBuffer(&memory->slots[slot_idx].rgb_input_buffer, memory->device, 0, rgb_buf_size,
                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                       VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+                                       mq_mode, mq_count, mq_indices);
       if (res)
       {
         vkGetBufferMemoryRequirements(memory->device->device, memory->slots[slot_idx].rgb_input_buffer, &memory_requirement);
@@ -487,14 +498,14 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
           vkenv_createImage(&memory->slots[slot_idx].blur_tmp_image_arr[oct_idx], memory->device, 0, VK_IMAGE_TYPE_2D, pyramid_format,
                             (VkExtent3D){.width = width, .height = height, .depth = 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                            mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     if (is_init)
     {
       res = res && estimateHighestMemoryRequirement(memory, width * height, &memory_requirement, 0, VK_IMAGE_TYPE_2D, pyramid_format, 1, 1,
                                                     VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                                         VK_IMAGE_USAGE_SAMPLED_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                                    mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     }
     else if (res)
     {
@@ -532,14 +543,14 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
                             (VkExtent3D){.width = width, .height = height, .depth = 1}, 1, memory->nb_scales_per_octave + 3, VK_SAMPLE_COUNT_1_BIT,
                             VK_IMAGE_TILING_OPTIMAL,
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                            mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     if (is_init)
     {
       res = res && estimateHighestMemoryRequirement(memory, width * height, &memory_requirement, 0, VK_IMAGE_TYPE_2D, pyramid_format, 1,
                                                     memory->nb_scales_per_octave + 3, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                                         VK_IMAGE_USAGE_SAMPLED_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                                    mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     }
     else if (res)
     {
@@ -576,14 +587,14 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
                             (VkExtent3D){.width = width, .height = height, .depth = 1}, 1, memory->nb_scales_per_octave + 2, VK_SAMPLE_COUNT_1_BIT,
                             VK_IMAGE_TILING_OPTIMAL,
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                            mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     if (is_init)
     {
       res = res && estimateHighestMemoryRequirement(memory, width * height, &memory_requirement, 0, VK_IMAGE_TYPE_2D, pyramid_format, 1,
                                                     memory->nb_scales_per_octave + 2, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                                         VK_IMAGE_USAGE_SAMPLED_BIT,
-                                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                                    mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
     }
     else if (res)
     {
@@ -619,7 +630,7 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
     res = vkenv_createBuffer(&memory->slots[slot_idx].warp_params_ubo, memory->device, 0,
                              VKSIFT_WARP_PARAMS_UBO_SIZE,
                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                             VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+                             mq_mode, mq_count, mq_indices);
     if (res)
     {
       vkGetBufferMemoryRequirements(memory->device->device, memory->slots[slot_idx].warp_params_ubo, &memory_requirement);
@@ -649,7 +660,7 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
     res = vkenv_createBuffer(&memory->slots[slot_idx].dispatch_buffer, memory->device, 0,
                              VKSIFT_SLOT_DISPATCH_BUFFER_SIZE,
                              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                             VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+                             mq_mode, mq_count, mq_indices);
     if (res)
     {
       vkGetBufferMemoryRequirements(memory->device->device, memory->slots[slot_idx].dispatch_buffer, &memory_requirement);
@@ -694,6 +705,17 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
   VkMemoryRequirements memory_requirement;
   uint32_t memory_type_idx;
 
+  // Phase E: cached_input_image is read by the parallel-IMAS dispatcher on
+  // BOTH detector->general_queue AND async_compute_queues[0] (different
+  // slots in a single wave can land on different queues), so it needs
+  // CONCURRENT on devices that expose a dedicated compute queue family.
+  // multi_queue_share_info returns EXCLUSIVE on devices without.
+  uint32_t mq_queue_families[3];
+  VkSharingMode mq_mode;
+  uint32_t mq_count;
+  const uint32_t *mq_indices;
+  multi_queue_share_info(memory->device, &mq_mode, &mq_count, &mq_indices, mq_queue_families);
+
   // Create cached_input_image — same R8 format and dims as input_image. The
   // IMAS pipeline samples from this image (rather than input_image) so the
   // on-IMAS detect path can overwrite input_image with quantized tilted
@@ -705,13 +727,13 @@ bool setupDynamicObjectsAndMemory(vksift_SiftMemory memory, bool is_init)
                                  (VkExtent3D){.width = memory->curr_input_image_width, .height = memory->curr_input_image_height, .depth = 1}, 1, 1,
                                  VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                 mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
   if (is_init)
   {
     res = res && estimateHighestMemoryRequirement(memory, memory->curr_input_image_width * memory->curr_input_image_height, &memory_requirement, 0,
                                                   VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UNORM, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED);
+                                                  mq_mode, mq_count, mq_indices, VK_IMAGE_LAYOUT_UNDEFINED);
   }
   else if (res)
   {
@@ -799,15 +821,13 @@ bool setupStaticObjectsAndMemory(vksift_SiftMemory memory)
   VkMemoryRequirements memory_requirement;
   uint32_t memory_type_idx;
 
-  // sift_buffer_arr is written by the general queue (detection compute
-  // shaders) and read by the async-transfer queue (download via
-  // vkCmdCopyBuffer in vksift_Memory_copyBufferFeaturesFromGPU). When the
-  // device exposes an async-compute queue family, parallel-IMAS multi-queue
-  // dispatch will also write it. Mark CONCURRENT on those families so
-  // cross-family access is legal without an ownership-transfer barrier
-  // (those would otherwise hit VUID-VkBufferMemoryBarrier-None-09050 on
-  // a CONCURRENT buffer). sift_count_staging_buffer_arr + match_output_buffer
-  // get the same treatment for the same reason.
+  // Phase E: per-buffer SIFT output buffers + count staging are written by
+  // the parallel-IMAS dispatcher from BOTH detector->general_queue and
+  // async_compute_queues[0]. CONCURRENT on devices that expose a
+  // dedicated compute queue family, EXCLUSIVE otherwise. The indirect
+  // dispatch buffers (orientation/descriptor) are written by
+  // ExtractKeypoints which also runs in the parallel cmd buffer, so they
+  // get the same treatment for forward-compat with `detection_only=false`.
   uint32_t mq_queue_families[3];
   VkSharingMode mq_mode;
   uint32_t mq_count;
@@ -997,7 +1017,7 @@ bool setupStaticObjectsAndMemory(vksift_SiftMemory memory)
   res = res && vkenv_createBuffer(&memory->indirect_orientation_dispatch_buffer, memory->device, 0, indirect_orientation_dispatch_buffer_size,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+                                  mq_mode, mq_count, mq_indices);
   if (res)
   {
     vkGetBufferMemoryRequirements(memory->device->device, memory->indirect_orientation_dispatch_buffer, &memory_requirement);
@@ -1020,7 +1040,7 @@ bool setupStaticObjectsAndMemory(vksift_SiftMemory memory)
   res = res && vkenv_createBuffer(&memory->indirect_descriptor_dispatch_buffer, memory->device, 0, indirect_descriptor_dispatch_buffer_size,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                  VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+                                  mq_mode, mq_count, mq_indices);
   if (res)
   {
     vkGetBufferMemoryRequirements(memory->device->device, memory->indirect_descriptor_dispatch_buffer, &memory_requirement);

@@ -196,6 +196,22 @@ static bool setupCommandPools(vksift_SiftDetector detector)
     }
   }
 
+  // Phase C-async: pool for cmd buffers submitted on the dedicated compute
+  // queue (parallel-IMAS multi-queue dispatch). On devices without a separate
+  // compute queue family this stays NULL and the dispatcher falls back to the
+  // single-queue path.
+  if (detector->dev->async_compute_available)
+  {
+    VkCommandPoolCreateInfo compute_pool_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                                 .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                                                 .queueFamilyIndex = detector->dev->async_compute_queues_family_idx};
+    if (vkCreateCommandPool(detector->dev->device, &compute_pool_info, NULL, &detector->async_compute_command_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create the asynchronous compute command pool");
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -226,6 +242,36 @@ static bool allocateCommandBuffers(vksift_SiftDetector detector)
     {
       logError(LOG_TAG, "Failed to allocate the fused IMAS+detect command buffer (slot %u)", s);
       return false;
+    }
+  }
+
+  // Phase C-async: mirror per-slot fused cmd buffers on the async-compute pool
+  // so the parallel-IMAS dispatcher can submit half of every wave to
+  // async_compute_queues[0]. Same recording content (filled in by
+  // recordCommandBuffers); we just need a cmd buffer bound to the right
+  // queue family to submit on that queue.
+  if (detector->dev->async_compute_available)
+  {
+    VkCommandBufferAllocateInfo compute_allocate_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                                         .pNext = NULL,
+                                                         .commandPool = detector->async_compute_command_pool,
+                                                         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                                         .commandBufferCount = 1};
+    for (uint32_t s = 0u; s < VKSIFT_MAX_PYRAMID_SLOTS; ++s)
+    {
+      if (vkAllocateCommandBuffers(detector->dev->device, &compute_allocate_info,
+                                   &detector->fused_imas_detect_command_buffer_compute[s]) != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "Failed to allocate the fused IMAS+detect command buffer on async-compute pool (slot %u)", s);
+        return false;
+      }
+    }
+  }
+  else
+  {
+    for (uint32_t s = 0u; s < VKSIFT_MAX_PYRAMID_SLOTS; ++s)
+    {
+      detector->fused_imas_detect_command_buffer_compute[s] = VK_NULL_HANDLE;
     }
   }
 
@@ -1294,11 +1340,43 @@ static bool setupSyncObjects(vksift_SiftDetector detector)
     }
   }
 
+  // Phase E: graphics→compute sync semaphore. Created unsignaled; the
+  // parallel-IMAS dispatcher signals it once per call via an empty graphics
+  // submit, and the first compute-queue wave consumes it. Only meaningful on
+  // devices with a dedicated async-compute queue family.
+  if (detector->dev->async_compute_available)
+  {
+    if (vkCreateSemaphore(detector->dev->device, &semaphore_create_info, NULL, &detector->parallel_compute_start_semaphore) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create parallel-compute-start Vulkan semaphore");
+      return false;
+    }
+  }
+  else
+  {
+    detector->parallel_compute_start_semaphore = VK_NULL_HANDLE;
+  }
+
   VkFenceCreateInfo fence_create_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = NULL, .flags = VK_FENCE_CREATE_SIGNALED_BIT};
   if (vkCreateFence(detector->dev->device, &fence_create_info, NULL, &detector->end_of_detection_fence) != VK_SUCCESS)
   {
     logError(LOG_TAG, "Failed to create a Vulkan fence");
     return false;
+  }
+  // Phase C-async: second fence dedicated to the async-compute-queue half of
+  // each parallel-IMAS wave. Created signaled so the very first wave-reset
+  // works without a wait. NULL when the device has no dedicated compute queue.
+  if (detector->dev->async_compute_available)
+  {
+    if (vkCreateFence(detector->dev->device, &fence_create_info, NULL, &detector->end_of_detection_fence_compute) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create a Vulkan fence for async-compute parallel-IMAS dispatch");
+      return false;
+    }
+  }
+  else
+  {
+    detector->end_of_detection_fence_compute = VK_NULL_HANDLE;
   }
   return true;
 }
@@ -2600,14 +2678,20 @@ static void recBufferOwnershipTransferCmds(vksift_SiftDetector detector, VkComma
 // dispatches stay direct — their canvas is curr_input_image_* which is stable
 // across warps. The SIFT detect descriptor sets bind slots[0]'s image views
 // (Phase A holdover); slot_idx > 0 is allocated but not yet exercised here.
-static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t slot_idx)
+// Phase C-async: the `cmd` parameter selects which command buffer the
+// recording lands in — the general-pool buffer
+// (detector->fused_imas_detect_command_buffer[slot_idx]) is used by the
+// single-queue and general-queue-half of the parallel path, the async-compute
+// pool mirror (fused_imas_detect_command_buffer_compute[slot_idx]) is used by
+// the compute-queue-half of the parallel path. The recorded content is
+// identical for the same slot; only the owning queue family differs.
+static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, VkCommandBuffer cmd, uint32_t slot_idx)
 {
   // No-op until the IMAS pipeline has been lazily created by the first
   // fused-dispatch call. The cmd buffer stays empty (but valid — we still
   // begin/end it so it's safe to leave allocated).
   if (detector->imas_pipeline_ref == NULL)
   {
-    VkCommandBuffer cmd = detector->fused_imas_detect_command_buffer[slot_idx];
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return false;
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
@@ -2615,11 +2699,28 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t
   }
 
   struct vksift_ImasPipeline_T *imas = detector->imas_pipeline_ref;
-  VkCommandBuffer cmd = detector->fused_imas_detect_command_buffer[slot_idx];
   vksift_SiftPyramidSlot *slot = &detector->mem->slots[slot_idx];
 
   VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return false;
+
+  // Phase E defensive: HOST_WRITE → UNIFORM/SHADER/INDIRECT_COMMAND_READ
+  // barrier at the head of every fused cmd buffer. vkQueueSubmit's implicit
+  // host-write visibility should cover this, but on the async-compute queue
+  // we've observed per-slot UBO + indirect dispatch_buffer reads behaving as
+  // if the host's per-wave update isn't visible — adding an explicit barrier
+  // is cheap belt-and-suspenders and matches the IMAS chain on the general
+  // pool's contract.
+  {
+    VkMemoryBarrier host_to_compute = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+        0, 1, &host_to_compute, 0, NULL, 0, NULL);
+  }
 
   // ---- Acquire SIFT buffer ownership if async transfer is enabled ----
   if (detector->dev->async_transfer_available)
@@ -3014,7 +3115,19 @@ static bool recordCommandBuffers(vksift_SiftDetector detector)
   /////////////////////////////////////////////////////
   for (uint32_t s = 0u; s < detector->mem->nb_pyramid_slots; ++s)
   {
-    if (!recFusedImasDetectCmdsForSlot(detector, s)) return false;
+    if (!recFusedImasDetectCmdsForSlot(detector, detector->fused_imas_detect_command_buffer[s], s)) return false;
+  }
+
+  // Phase C-async: also record the same content into the async-compute-pool
+  // mirror so the parallel-IMAS dispatcher can submit half of every wave on
+  // async_compute_queues[0]. The shader pipelines + descriptor bindings are
+  // identical; only the command buffer's owning queue family differs.
+  if (detector->dev->async_compute_available)
+  {
+    for (uint32_t s = 0u; s < detector->mem->nb_pyramid_slots; ++s)
+    {
+      if (!recFusedImasDetectCmdsForSlot(detector, detector->fused_imas_detect_command_buffer_compute[s], s)) return false;
+    }
   }
 
   return true;
@@ -3475,6 +3588,12 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   // Destroy sync objects
   VK_NULL_SAFE_DELETE(detector->end_of_detection_semaphore, vkDestroySemaphore(detector->dev->device, detector->end_of_detection_semaphore, NULL));
   VK_NULL_SAFE_DELETE(detector->end_of_detection_fence, vkDestroyFence(detector->dev->device, detector->end_of_detection_fence, NULL));
+  // Phase C-async: optional second fence (compute-queue half of parallel-IMAS).
+  VK_NULL_SAFE_DELETE(detector->end_of_detection_fence_compute,
+                      vkDestroyFence(detector->dev->device, detector->end_of_detection_fence_compute, NULL));
+  // Phase E: optional graphics→compute sync semaphore.
+  VK_NULL_SAFE_DELETE(detector->parallel_compute_start_semaphore,
+                      vkDestroySemaphore(detector->dev->device, detector->parallel_compute_start_semaphore, NULL));
   if (detector->dev->async_transfer_available)
   {
     VK_NULL_SAFE_DELETE(detector->buffer_ownership_released_by_transfer_semaphore,
@@ -3486,6 +3605,13 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   if (detector->dev->async_transfer_available)
   {
     VK_NULL_SAFE_DELETE(detector->async_transfer_command_pool, vkDestroyCommandPool(detector->dev->device, detector->async_transfer_command_pool, NULL));
+  }
+  // Phase C-async: optional async-compute pool (NULL if no dedicated compute queue).
+  // Destroying the pool frees the per-slot cmd buffers in
+  // fused_imas_detect_command_buffer_compute[] implicitly.
+  if (detector->dev->async_compute_available)
+  {
+    VK_NULL_SAFE_DELETE(detector->async_compute_command_pool, vkDestroyCommandPool(detector->dev->device, detector->async_compute_command_pool, NULL));
   }
 
   // Destroy pipelines and resource bindings

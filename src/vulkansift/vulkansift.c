@@ -14,6 +14,7 @@
 #include "vulkansift/sift_memory.h"
 
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -211,7 +212,12 @@ vksift_Result vksift_createInstance(vksift_Instance *instance_ptr, const vksift_
   vkenv_DeviceConfig gpu_config = {.device_extension_count = 0,
                                    .device_extensions = NULL,
                                    .nb_general_queues = 1,
-                                   .nb_async_compute_queues = 0,
+                                   // Phase C-async: request one async compute queue so we can split
+                                   // each parallel-IMAS wave across general_queue + async_compute_queues[0].
+                                   // On a discrete GPU with a dedicated compute engine this exposes a
+                                   // second queue family; on integrated devices async_compute_available
+                                   // will stay false and dispatchParallelIMAS falls back to single-queue.
+                                   .nb_async_compute_queues = 1,
                                    .nb_async_transfer_queues = 2,
                                    .target_device_idx = config->gpu_device_index};
 
@@ -897,9 +903,17 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
 
   // Wait on the prior detect/match fences so any previous dispatch (single-
   // warp or wave) has fully retired before we reuse end_of_detection_fence.
-  VkFence prior_fences[2] = {detector->end_of_detection_fence,
-                             instance->sift_matcher->end_of_matching_fence};
-  vkWaitForFences(device, 2, prior_fences, VK_TRUE, UINT64_MAX);
+  // Phase C-async: also wait on the compute-queue fence if it exists, since
+  // the previous parallel-IMAS call may have left it signaled-by-compute.
+  VkFence prior_fences[3];
+  uint32_t prior_count = 0u;
+  prior_fences[prior_count++] = detector->end_of_detection_fence;
+  prior_fences[prior_count++] = instance->sift_matcher->end_of_matching_fence;
+  if (detector->end_of_detection_fence_compute != VK_NULL_HANDLE)
+  {
+    prior_fences[prior_count++] = detector->end_of_detection_fence_compute;
+  }
+  vkWaitForFences(device, prior_count, prior_fences, VK_TRUE, UINT64_MAX);
 
   // Lazy-create the IMAS pipeline on first call (same pattern as
   // vksift_detectFeaturesFusedImas). The fused cmd buffer recording needs
@@ -986,11 +1000,59 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
     memory->sift_buffers_info[s].is_packed = false;
   }
 
-  // Process warps in waves of min(n_slots, remaining). One vkQueueSubmit per
-  // wave (single batched VkSubmitInfo array), one fence per wave. Reuses the
-  // detector's end_of_detection_fence between waves — safe because we wait
-  // before each reset.
-  VkSubmitInfo submits[VKSIFT_MAX_PYRAMID_SLOTS];
+  // Process warps in waves of min(n_slots, remaining). Each wave is SPLIT
+  // across two queues when the device exposes a dedicated compute queue
+  // (Phase C-async): slots [0, wave_g) go to general_queue using the
+  // general-pool fused cmd buffers + end_of_detection_fence, slots
+  // [wave_g, wave) go to async_compute_queues[0] using the compute-pool
+  // mirrors + end_of_detection_fence_compute. The host waits on BOTH fences
+  // before reading per-slot feature counts.
+  //
+  // Fence reuse between waves is safe because the wait+reset pair happens
+  // before re-submitting. When async-compute is unavailable, wave_g == wave
+  // and the dispatcher degenerates to the previous single-queue path.
+  const bool use_async_compute = detector->dev->async_compute_available;
+
+  // Phase E: cross-queue sync for cached_input_image. The image was last
+  // written by the GRAPHICS queue (vks_detect / dispatchDetectionCmdBuffer)
+  // before our vkWaitForFences above; that wait gives the host visibility
+  // but does NOT establish graphics→compute GPU-side memory dependency,
+  // even with CONCURRENT sharing on the image. Queue an empty signal-only
+  // submit on general_queue so the first compute-queue wave can wait on
+  // the resulting semaphore — that's the cross-queue handshake.
+  //
+  // Only signal when this call is actually going to dispatch on the
+  // compute queue (n_warps >= 2 AND n_slots >= 2 — otherwise wave_c stays
+  // 0 for every wave and the binary semaphore would leak signaled into
+  // the next call, where re-signaling it is undefined behavior).
+  const bool dispatch_uses_compute = use_async_compute && (n_warps >= 2u) && (n_slots >= 2u);
+  if (dispatch_uses_compute)
+  {
+    VkSubmitInfo sync_submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = NULL,
+        .waitSemaphoreCount = 0,
+        .pWaitSemaphores = NULL,
+        .pWaitDstStageMask = NULL,
+        .commandBufferCount = 0,
+        .pCommandBuffers = NULL,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &detector->parallel_compute_start_semaphore};
+    if (vkQueueSubmit(detector->general_queue, 1, &sync_submit, VK_NULL_HANDLE) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "vksift_dispatchParallelIMAS() error: vkQueueSubmit (graphics→compute sync) failed");
+      instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+      return;
+    }
+  }
+  // Tracks whether the first compute-queue wave has consumed the start
+  // semaphore (binary, single-use per call). Subsequent compute waves
+  // pick up cached_input_image visibility transitively through queue
+  // submission order.
+  bool compute_start_consumed = false;
+  const VkPipelineStageFlags compute_start_wait_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+  VkSubmitInfo submits_general[VKSIFT_MAX_PYRAMID_SLOTS];
+  VkSubmitInfo submits_compute[VKSIFT_MAX_PYRAMID_SLOTS];
   for (uint32_t base = 0u; base < n_warps; base += n_slots)
   {
     uint32_t remaining = n_warps - base;
@@ -1008,10 +1070,15 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
                                 canvas_w, canvas_h);
     }
 
-    // (b) Build wave VkSubmitInfo entries — one per slot's fused cmd buffer.
-    for (uint32_t s = 0u; s < wave; ++s)
+    // (b) Split the wave between general and async-compute queues. Half-up to
+    // the general queue, half-down to the compute queue — when the wave size
+    // is odd the general queue gets the extra slot.
+    const uint32_t wave_g = use_async_compute ? ((wave + 1u) / 2u) : wave;
+    const uint32_t wave_c = wave - wave_g;
+
+    for (uint32_t s = 0u; s < wave_g; ++s)
     {
-      submits[s] = (VkSubmitInfo){
+      submits_general[s] = (VkSubmitInfo){
           .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
           .pNext = NULL,
           .waitSemaphoreCount = 0,
@@ -1022,16 +1089,61 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
           .signalSemaphoreCount = 0,
           .pSignalSemaphores = NULL};
     }
-
-    vkResetFences(device, 1, &detector->end_of_detection_fence);
-    if (vkQueueSubmit(detector->general_queue, wave, submits,
-                      detector->end_of_detection_fence) != VK_SUCCESS)
+    for (uint32_t k = 0u; k < wave_c; ++k)
     {
-      logError(LOG_TAG, "vksift_dispatchParallelIMAS() error: vkQueueSubmit failed for wave starting at warp %u", base);
-      instance->error_cb_func(VKSIFT_VULKAN_ERROR);
-      return;
+      uint32_t s = wave_g + k;
+      // First compute submission in the call consumes the graphics→compute
+      // sync semaphore (only k == 0 of the first wave that has any compute
+      // work needs it; subsequent compute submissions on this queue see the
+      // cached_input_image content transitively via submission order).
+      const bool consume_start = (wave_c > 0u && k == 0u && !compute_start_consumed);
+      submits_compute[k] = (VkSubmitInfo){
+          .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+          .pNext = NULL,
+          .waitSemaphoreCount = consume_start ? 1u : 0u,
+          .pWaitSemaphores = consume_start ? &detector->parallel_compute_start_semaphore : NULL,
+          .pWaitDstStageMask = consume_start ? &compute_start_wait_stage : NULL,
+          .commandBufferCount = 1,
+          .pCommandBuffers = &detector->fused_imas_detect_command_buffer_compute[s],
+          .signalSemaphoreCount = 0,
+          .pSignalSemaphores = NULL};
     }
-    vkWaitForFences(device, 1, &detector->end_of_detection_fence, VK_TRUE, UINT64_MAX);
+    if (wave_c > 0u) compute_start_consumed = true;
+
+    // Reset whichever fences we'll signal this wave (both start signaled).
+    VkFence reset_fences[2];
+    uint32_t reset_count = 0u;
+    if (wave_g > 0u) reset_fences[reset_count++] = detector->end_of_detection_fence;
+    if (wave_c > 0u) reset_fences[reset_count++] = detector->end_of_detection_fence_compute;
+    if (reset_count > 0u) vkResetFences(device, reset_count, reset_fences);
+
+    if (wave_g > 0u)
+    {
+      if (vkQueueSubmit(detector->general_queue, wave_g, submits_general,
+                        detector->end_of_detection_fence) != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "vksift_dispatchParallelIMAS() error: vkQueueSubmit (general) failed for wave starting at warp %u", base);
+        instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+        return;
+      }
+    }
+    if (wave_c > 0u)
+    {
+      if (vkQueueSubmit(detector->dev->async_compute_queues[0], wave_c, submits_compute,
+                        detector->end_of_detection_fence_compute) != VK_SUCCESS)
+      {
+        logError(LOG_TAG, "vksift_dispatchParallelIMAS() error: vkQueueSubmit (async-compute) failed for wave starting at warp %u", base);
+        instance->error_cb_func(VKSIFT_VULKAN_ERROR);
+        return;
+      }
+    }
+
+    // Wait on every fence we just submitted to.
+    VkFence wait_fences[2];
+    uint32_t wait_count = 0u;
+    if (wave_g > 0u) wait_fences[wait_count++] = detector->end_of_detection_fence;
+    if (wave_c > 0u) wait_fences[wait_count++] = detector->end_of_detection_fence_compute;
+    if (wait_count > 0u) vkWaitForFences(device, wait_count, wait_fences, VK_TRUE, UINT64_MAX);
 
     // (c) Read per-slot feature counts from sift_count_staging_buffer. These
     // remain valid until the next wave on the same slot dispatches.

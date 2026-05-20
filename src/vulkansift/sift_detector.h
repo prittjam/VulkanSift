@@ -23,6 +23,11 @@ typedef struct vksift_SiftDetector_T
 
   VkCommandPool general_command_pool;
   VkCommandPool async_transfer_command_pool;
+  // Phase C-async: command pool allocated against the device's async compute
+  // queue family (device->async_compute_queues_family_idx). NULL when
+  // device->async_compute_available == false; in that case the parallel-IMAS
+  // dispatcher uses the single-queue submission path only.
+  VkCommandPool async_compute_command_pool;
 
   VkCommandBuffer detection_command_buffer;
   // Variant of detection_command_buffer that skips the staging→input_image
@@ -39,6 +44,12 @@ typedef struct vksift_SiftDetector_T
   // matrix + canvas dims come from mem->slots[s].warp_params_ubo. Host updates
   // both buffers before each submission and reuses the recording.
   VkCommandBuffer fused_imas_detect_command_buffer[VKSIFT_MAX_PYRAMID_SLOTS];
+  // Phase C-async: mirror of fused_imas_detect_command_buffer[] allocated from
+  // async_compute_command_pool so it can be submitted on async_compute_queues[0].
+  // Records the SAME content as the general-pool variant for the same slot; the
+  // parallel-IMAS dispatcher splits each wave's slots across the two queues.
+  // Left as VK_NULL_HANDLE entries when device->async_compute_available == false.
+  VkCommandBuffer fused_imas_detect_command_buffer_compute[VKSIFT_MAX_PYRAMID_SLOTS];
 
   // Phase B-3: external reference to the lazy-created IMAS pipeline (owned by
   // vksift_Instance_T, set by vulkansift.c when the pipeline first comes up).
@@ -53,6 +64,19 @@ typedef struct vksift_SiftDetector_T
 
   // Sync objects
   VkFence end_of_detection_fence;
+  // Phase C-async: separate fence signaled by the async-compute-queue half of
+  // each parallel-IMAS wave. Created signaled (so the first reset is harmless).
+  // VK_NULL_HANDLE when device->async_compute_available == false.
+  VkFence end_of_detection_fence_compute;
+  // Phase E: binary semaphore that gates the COMPUTE-queue half of every
+  // parallel-IMAS wave on the GRAPHICS-queue's prior work having made
+  // cached_input_image (written by vks_detect / dispatchDetectionCmdBuffer)
+  // visible. CONCURRENT sharing on the image isn't enough on its own —
+  // graphics→compute visibility still needs a semaphore. Signaled once per
+  // vksift_dispatchParallelIMAS call by a no-op submit on general_queue, then
+  // consumed by the first compute-queue wave. VK_NULL_HANDLE when
+  // async_compute_available == false.
+  VkSemaphore parallel_compute_start_semaphore;
   VkSemaphore end_of_detection_semaphore;
   VkSemaphore buffer_ownership_released_by_transfer_semaphore;
 
