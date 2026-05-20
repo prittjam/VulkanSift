@@ -176,6 +176,26 @@ typedef struct vksift_SiftDetector_T
   VkPipelineLayout descriptor_pipeline_layout;
   VkPipeline descriptor_pipeline;
 
+  // Phase D — BackProjectFeatures compute pipeline. Reads each feature in a
+  // slot's sift_buffer octave section, applies the K·σ·σ_max parallelogram
+  // boundary check, back-projects (x, y) from tilted-frame → input-frame.
+  // Rejected features get octave_idx = -1 (Julia driver filters on read).
+  //
+  // Binding model: set = 0 is the per-(slot, octave) SIFT_buffer section
+  // (descriptor created with `.offset = octave_section_offset_arr[oct]` so
+  // the shader sees the section header at `nb_elem` + features at data[0..]).
+  // set = 1 is the slot's WarpParamsUBO (read-only). Dispatch is one
+  // workgroup per (slot, octave) with local_size_x = 64 stride-looping over
+  // the section.
+  //
+  // backproject_desc_sets is a flat [slot*max_nb_octaves + oct] array indexed
+  // via slot_oct_idx(detector, slot, oct), matching extractkpts_desc_sets.
+  VkDescriptorSetLayout backproject_desc_set_layout;
+  VkDescriptorPool backproject_desc_pool;
+  VkDescriptorSet *backproject_desc_sets;
+  VkPipelineLayout backproject_pipeline_layout;
+  VkPipeline backproject_pipeline;
+
   // RGBA→Gray conversion set (only when use_rgba_input=true). Per-slot —
   // slot s binds mem->slots[s].rgba_input_image_view (in) +
   // mem->slots[s].input_image_view (out).

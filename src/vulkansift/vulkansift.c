@@ -996,10 +996,14 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
     uint32_t remaining = n_warps - base;
     uint32_t wave = (remaining < n_slots) ? remaining : n_slots;
 
-    // (a) Fill each slot's per-warp UBO + dispatch buffer.
+    // (a) Fill each slot's per-warp UBO + dispatch buffer. The warp_idx
+    // stamped into the UBO comes from the caller's WarpSpec — `base + s` is
+    // the index within THIS call's array, not the global schedule, so callers
+    // (e.g. the JL FFI chunking by n_slots) must pre-populate warp_idx with
+    // the global value before passing the schedule in.
     for (uint32_t s = 0u; s < wave; ++s)
     {
-      vksift_fillFusedWarpState(detector, s, base + s, W, H,
+      vksift_fillFusedWarpState(detector, s, warps[base + s].warp_idx, W, H,
                                 warps[base + s].t_factor, warps[base + s].theta_rad,
                                 canvas_w, canvas_h);
     }
@@ -1018,6 +1022,7 @@ void vksift_dispatchParallelIMAS(vksift_Instance instance,
           .signalSemaphoreCount = 0,
           .pSignalSemaphores = NULL};
     }
+
     vkResetFences(device, 1, &detector->end_of_detection_fence);
     if (vkQueueSubmit(detector->general_queue, wave, submits,
                       detector->end_of_detection_fence) != VK_SUCCESS)

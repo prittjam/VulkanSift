@@ -1,0 +1,151 @@
+#version 450
+//
+// BackProjectFeatures.comp — Phase D GPU back-projection + boundary filter.
+//
+// Replaces the host-side per-feature trigonometry that previously ran in the
+// Julia driver after each warp's feature download. For each feature emitted
+// by ExtractKeypoints into the slot's sift_buffer section (one section per
+// octave), this shader:
+//
+//   1. Boundary check (skipped for the identity warp where bp_is_identity=1):
+//      reject features whose K·σ·σ_max neighbourhood overlaps the
+//      parallelogram edge. The parallelogram in the tilted frame is the
+//      inverse-image of the input rectangle, so equivalently we require the
+//      back-projected position to be pad = K·σ·σ_max clear of [0, W-1] ×
+//      [0, H-1] in the input frame.
+//
+//   2. Back-projection: tilted (x, y) → input (x, y) via the 2×3 affine
+//      [bp_a11 bp_a12 bp_a13; bp_a21 bp_a22 bp_a23] (= A_inv · tilted_xy +
+//      (c − A_inv · c) where A_inv = R(-φ)·diag(1,t)·R(φ) and c is the
+//      image centre). σ is unchanged (still the warped-frame scale).
+//
+// Rejected features get `octave_idx = -1`; the Julia driver skips them on
+// the read side. Successful features get their `x` / `y` overwritten with
+// input-frame coords, ready for downstream consumption.
+//
+// Binding model (one descriptor set per (slot, octave) section, matching
+// the ExtractKeypoints / Orientation / Descriptor pattern in sift_detector.c):
+//
+//   set = 0, binding = 0: SIFT_buffer for ONE octave section. The descriptor
+//                          is created with `.offset = octave_section_offset_arr[oct]`
+//                          + `.range = octave_section_size_arr[oct]`, so
+//                          inside the shader the section header lives at
+//                          `nb_elem` / `max_nb_feat` and the features at
+//                          `data[0 .. nb_elem-1]`.
+//   set = 1, binding = 0: the slot's WarpParamsUBO.
+//
+// Dispatch: one workgroup per (slot, octave), local_size_x = 64. The shader
+// loops over feature indices in stride-64 increments so a single workgroup
+// covers an arbitrarily large section (typical max ~30K features/octave →
+// 470 loop iters, completely bandwidth-bound).
+//
+
+#define NB_HIST 4
+#define NB_ORI 8
+
+struct SIFT_Feat {
+  float x;
+  float y;
+  float scale_x;
+  float scale_y;
+  uint  scale_idx;
+  int   octave_idx;
+  float sigma;
+  float orientation;
+  float intensity;
+  uint  descriptor[(NB_HIST*NB_HIST*NB_ORI)/4];
+};
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) buffer SIFT_buffer {
+  uint nb_elem;
+  uint max_nb_feat;
+  SIFT_Feat data[];
+};
+
+// Bind the slot's WarpParamsUBO as a UBO (set=1 binding=0, std140). Same
+// descriptor set the IMAS-chain shaders consume. (Earlier Phase D attempts
+// routed this through an SSBO to dodge a supposed NVIDIA UBO cache freeze
+// that turned out not to exist; the symptom was the dispatcher passing
+// warp_idx=0 for every wave, which made bp_is_identity=1 universally.)
+layout(std140, set = 1, binding = 0) uniform WarpParamsBlock {
+  // ----- IMAS AffineWarp matrix + OOB fills (32 B) -----
+  float a11, a12, a13;
+  float a21, a22, a23;
+  float fill_value;
+  float fproj_bg_value;
+  // ----- Dimension fields (32 B) -----
+  uint  W_rot;
+  uint  H_rot;
+  uint  H_sub;
+  uint  canvas_w;
+  uint  canvas_h;
+  uint  valid_w;
+  uint  valid_h;
+  uint  warp_idx;
+  // ----- Float scalars (32 B) -----
+  float sigma_aa;
+  float t_factor;
+  float quantize_fill;
+  float gauss_dir_x;
+  float gauss_dir_y;
+  float _pad1;
+  float _pad2;
+  float _pad3;
+  // ----- Phase D back-projection params (48 B) -----
+  float bp_a11, bp_a12, bp_a13;
+  float bp_a21, bp_a22, bp_a23;
+  float bp_sigma_max;
+  float bp_boundary_K;
+  uint  bp_input_W;
+  uint  bp_input_H;
+  uint  bp_is_identity;
+  uint  bp_nb_octaves;
+} ubo;
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint n   = nb_elem;
+  if (n > max_nb_feat) n = max_nb_feat;
+
+  const float W_minus_1 = float(ubo.bp_input_W) - 1.0;
+  const float H_minus_1 = float(ubo.bp_input_H) - 1.0;
+  const bool  is_identity = (ubo.bp_is_identity != 0u);
+
+  // Stride-loop across the section so one workgroup covers any feature count.
+  for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
+    float fx = data[i].x;
+    float fy = data[i].y;
+    float sigma = data[i].sigma;
+
+    // Back-project tilted-frame (fx, fy) → input-frame (xi, yi).
+    float xi = ubo.bp_a11 * fx + ubo.bp_a12 * fy + ubo.bp_a13;
+    float yi = ubo.bp_a21 * fx + ubo.bp_a22 * fy + ubo.bp_a23;
+
+    bool keep;
+    if (is_identity) {
+      // Identity warp: no parallelogram to check, no back-projection
+      // shift (the matrix is the identity to within Float32 noise). Trust
+      // the extractor's bounds.
+      keep = true;
+    } else {
+      // K·σ·σ_max boundary pad — reject if the back-projected position is
+      // within `pad` of the input rectangle [0, W-1] × [0, H-1].
+      float pad = ubo.bp_boundary_K * sigma * ubo.bp_sigma_max;
+      keep = (xi > pad) && (xi < W_minus_1 - pad)
+          && (yi > pad) && (yi < H_minus_1 - pad);
+    }
+
+    if (keep) {
+      // Overwrite tilted-frame (x, y) with input-frame (xi, yi). σ stays
+      // in warped units — the Julia side multiplies by A_inv to build the
+      // 2×2 input-frame shape matrix.
+      data[i].x = xi;
+      data[i].y = yi;
+    } else {
+      // Mark feature as rejected. The host reads octave_idx < 0 and skips.
+      data[i].octave_idx = -1;
+    }
+  }
+}

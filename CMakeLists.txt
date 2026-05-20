@@ -83,6 +83,7 @@ set(VULKANSIFT_LIB_SHADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ExtractKeypoints.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ExtractKeypoints2D.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/QuantizeF32ToInput.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/BackProjectFeatures.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/RGBAtoGray.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/RGBtoGray.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/ComputeOrientation.comp

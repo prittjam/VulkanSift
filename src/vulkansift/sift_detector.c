@@ -718,6 +718,55 @@ static bool prepareDescriptorSets(vksift_SiftDetector detector)
   }
 
   ///////////////////////////////////////////////////
+  // Phase D — BackProjectFeatures descriptor sets (per-slot per-octave).
+  // Layout has a single binding (the SIFT_buffer section); the WarpParamsUBO
+  // is bound via set = 1 using the shared detector->warp_ubo_desc_sets[slot].
+  // Slot s's per-octave sets bind slot_sift_buffer_idx(s)'s sift_buffer with
+  // the octave's offset/range baked into the descriptor write.
+  ///////////////////////////////////////////////////
+  {
+    VkDescriptorSetLayoutBinding bp_sift_buffer_binding = {.binding = 0,
+                                                            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                            .descriptorCount = 1,
+                                                            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                                            .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutCreateInfo bp_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &bp_sift_buffer_binding};
+    if (vkCreateDescriptorSetLayout(detector->dev->device, &bp_layout_info, NULL,
+                                    &detector->backproject_desc_set_layout) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create BackProjectFeatures descriptor set layout");
+      return false;
+    }
+    VkDescriptorPoolSize bp_pool_sizes[1] = {
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = max_oct * N}};
+    VkDescriptorPoolCreateInfo bp_pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                                .maxSets = max_oct * N,
+                                                .poolSizeCount = 1,
+                                                .pPoolSizes = bp_pool_sizes};
+    if (vkCreateDescriptorPool(detector->dev->device, &bp_pool_info, NULL,
+                               &detector->backproject_desc_pool) != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to create BackProjectFeatures descriptor pool");
+      return false;
+    }
+    VkDescriptorSetLayout *bp_layouts = allocMultLayoutCopy(detector->backproject_desc_set_layout, max_oct * N);
+    detector->backproject_desc_sets = (VkDescriptorSet *)malloc(sizeof(VkDescriptorSet) * max_oct * N);
+    VkDescriptorSetAllocateInfo bp_alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                  .descriptorPool = detector->backproject_desc_pool,
+                                                  .descriptorSetCount = max_oct * N,
+                                                  .pSetLayouts = bp_layouts};
+    alloc_res = vkAllocateDescriptorSets(detector->dev->device, &bp_alloc_info, detector->backproject_desc_sets);
+    free(bp_layouts);
+    if (alloc_res != VK_SUCCESS)
+    {
+      logError(LOG_TAG, "Failed to allocate BackProjectFeatures descriptor sets");
+      return false;
+    }
+  }
+
+  ///////////////////////////////////////////////////
   // Descriptors for ComputeOrientation pipeline
   ///////////////////////////////////////////////////
   VkDescriptorSetLayoutBinding orientation_octave_image_layout_binding = {.binding = 0,
@@ -1115,6 +1164,33 @@ static bool setupComputePipelines(vksift_SiftDetector detector)
   vkDestroyShaderModule(detector->dev->device, extractkpts_2d_shader_module, NULL);
 
   //////////////////////////////////////
+  // Setup BackProjectFeatures pipeline (Phase D — GPU back-projection +
+  // K·σ·σ_max parallelogram boundary filter, appended to fused IMAS+detect
+  // cmd buffer). set = 0 binds the per-(slot, octave) SIFT_buffer section;
+  // set = 1 binds the slot's WarpParamsUBO. No push constants.
+  //////////////////////////////////////
+  {
+    VkShaderModule bp_shader_module;
+    if (!vkenv_createShaderModule(detector->dev->device, "shaders/BackProjectFeatures.comp.spv", &bp_shader_module))
+    {
+      logError(LOG_TAG, "Failed to create BackProjectFeatures shader module");
+      return false;
+    }
+    if (!vkenv_createComputePipeline2(detector->dev->device, bp_shader_module,
+                                      detector->backproject_desc_set_layout,
+                                      detector->warp_ubo_desc_set_layout,
+                                      0u,
+                                      &detector->backproject_pipeline_layout,
+                                      &detector->backproject_pipeline))
+    {
+      logError(LOG_TAG, "Failed to create BackProjectFeatures pipeline");
+      vkDestroyShaderModule(detector->dev->device, bp_shader_module, NULL);
+      return false;
+    }
+    vkDestroyShaderModule(detector->dev->device, bp_shader_module, NULL);
+  }
+
+  //////////////////////////////////////
   // Setup ComputeOrientation pipeline
   //////////////////////////////////////
 
@@ -1500,6 +1576,35 @@ static bool writeDescriptorSets(vksift_SiftDetector detector)
                                                     .pBufferInfo = &indispatch_buffer_info,
                                                     .pTexelBufferView = NULL};
       vkUpdateDescriptorSets(detector->dev->device, 3, descriptor_writes, 0, NULL);
+    }
+  }
+
+  /////////////////////////////////////////////////////
+  // Phase D — Write sets for BackProjectFeatures (per-slot per-octave).
+  // Each (slot, octave) set's binding 0 points at the same sift_buffer
+  // section that the ExtractKeypoints set above writes into, so the
+  // back-projection shader reads `nb_elem` + features that ExtractKeypoints
+  // just emitted. Same offset / size as ExtractKeypoints binding 1.
+  for (uint32_t s = 0u; s < N; ++s)
+  {
+    const uint32_t buf_idx = slot_sift_buffer_idx(detector, s);
+    for (uint32_t i = 0; i < detector->mem->curr_nb_octaves; i++)
+    {
+      const uint32_t idx = slot_oct_idx(detector, s, i);
+      VkDescriptorBufferInfo sift_section_info = {
+          .buffer = detector->mem->sift_buffer_arr[buf_idx],
+          .offset = detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[i],
+          .range  = detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[i]};
+      VkWriteDescriptorSet bp_write = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                       .dstSet = detector->backproject_desc_sets[idx],
+                                       .dstBinding = 0,
+                                       .dstArrayElement = 0,
+                                       .descriptorCount = 1,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                       .pImageInfo = NULL,
+                                       .pBufferInfo = &sift_section_info,
+                                       .pTexelBufferView = NULL};
+      vkUpdateDescriptorSets(detector->dev->device, 1, &bp_write, 0, NULL);
     }
   }
 
@@ -2380,6 +2485,87 @@ static void recCopySIFTCountCmds(vksift_SiftDetector detector, VkCommandBuffer c
   free(buffer_barriers);
 }
 
+// Phase D — record GPU back-projection + boundary filter dispatches into the
+// fused command buffer. One dispatch per octave: each section has its own
+// per-(slot, octave) descriptor set (`backproject_desc_sets[slot_oct_idx]`)
+// that bakes the section offset/range. Workgroup count = (1, 1, 1) with
+// local_size_x = 64; the shader stride-loops over feature indices so any
+// reasonable section size is handled by a single workgroup.
+//
+// MUST run AFTER recCopySIFTCountCmds — the count copy reads the original
+// nb_elem header from each section, which back-projection doesn't touch
+// (only `data[i].x`, `.y`, and possibly `.octave_idx` get rewritten). Order
+// is enforced by recCopySIFTCountCmds' TRANSFER_BIT → SHADER_READ_BIT
+// barrier sequence plus an additional explicit barrier here.
+static void recBackProjectFeaturesCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx,
+                                       const uint32_t oct_begin, const uint32_t oct_count)
+{
+  const uint32_t buf_idx = slot_sift_buffer_idx(detector, slot_idx);
+  VkBuffer sift_buffer = detector->mem->sift_buffer_arr[buf_idx];
+
+  beginMarkerRegion(detector, cmdbuf, "BackProjectFeatures");
+
+  // Wait for ExtractKeypoints' writes (and the subsequent count-copy reads)
+  // to land before we rewrite x/y/octave_idx in the same section. The count
+  // copy uses TRANSFER_READ_BIT; back-projection's shader writes need to
+  // sync against both that and any previous SHADER_WRITE_BIT.
+  VkBufferMemoryBarrier *pre_barriers = (VkBufferMemoryBarrier *)malloc(sizeof(VkBufferMemoryBarrier) * oct_count);
+  for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
+  {
+    pre_barriers[oct_idx - oct_begin] = vkenv_genBufferMemoryBarrier(
+        sift_buffer,
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[oct_idx],
+        detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[oct_idx]);
+  }
+  vkCmdPipelineBarrier(cmdbuf,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0, 0, NULL, oct_count, pre_barriers, 0, NULL);
+  free(pre_barriers);
+
+  vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, detector->backproject_pipeline);
+  // set = 1 is the shared per-slot warp_params_ubo, same descriptor set used by
+  // every IMAS-chain shader. Bound once for all octaves of this slot.
+  vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          detector->backproject_pipeline_layout, 1, 1,
+                          &detector->warp_ubo_desc_sets[slot_idx], 0, NULL);
+
+  for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
+  {
+    vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            detector->backproject_pipeline_layout, 0, 1,
+                            &detector->backproject_desc_sets[slot_oct_idx(detector, slot_idx, oct_idx)],
+                            0, NULL);
+    // local_size_x=64 + a stride-loop inside the shader → one workgroup per
+    // section regardless of feature count. ~30K features/octave × 64-thread
+    // workgroup = 470 loop iters, fully bandwidth-bound (no contention).
+    vkCmdDispatch(cmdbuf, 1u, 1u, 1u);
+  }
+
+  // Make x/y/octave_idx writes visible to the host transfer reads that
+  // come next (the JL driver downloads the buffer after the fence).
+  VkBufferMemoryBarrier *post_barriers = (VkBufferMemoryBarrier *)malloc(sizeof(VkBufferMemoryBarrier) * oct_count);
+  for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
+  {
+    post_barriers[oct_idx - oct_begin] = vkenv_genBufferMemoryBarrier(
+        sift_buffer, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[oct_idx],
+        detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[oct_idx]);
+  }
+  vkCmdPipelineBarrier(cmdbuf,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+      0, 0, NULL, oct_count, post_barriers, 0, NULL);
+  free(post_barriers);
+
+  endMarkerRegion(detector, cmdbuf);
+}
+
 static void recBufferOwnershipTransferCmds(vksift_SiftDetector detector, VkCommandBuffer cmdbuf, uint32_t slot_idx, const uint32_t oct_begin, const uint32_t oct_count,
                                            const uint32_t src_queue_family_idx, const uint32_t dst_queue_family_idx, VkPipelineStageFlags src_stage,
                                            VkPipelineStageFlags dst_stage)
@@ -2651,6 +2837,13 @@ static bool recFusedImasDetectCmdsForSlot(vksift_SiftDetector detector, uint32_t
     recComputeDestriptorsCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
   }
   recCopySIFTCountCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
+
+  // ---- Phase D — GPU back-projection + boundary filter ----
+  // After ExtractKeypoints + count-copy, rewrite each emitted feature's
+  // (x, y) from tilted-frame → input-frame via the WarpParamsUBO's bp_*
+  // matrix, and reject features whose K·σ·σ_max neighbourhood overlaps
+  // the parallelogram edge (octave_idx = -1).
+  recBackProjectFeaturesCmds(detector, cmd, slot_idx, 0, detector->mem->curr_nb_octaves);
 
   if (detector->dev->async_transfer_available)
   {
@@ -3087,6 +3280,37 @@ void vksift_fillFusedWarpState(vksift_SiftDetector detector,
     ubo.gauss_dir_x    = 0.0f;
     ubo.gauss_dir_y    = 1.0f;  // IMAS vertical σ_aa blur
     ubo.warp_idx       = warp_idx;
+
+    // ---- Phase D — back-projection params (tilted-frame → input-frame) ----
+    // The IMAS AffineWarp rotates+tilts (a11..a23 = rotation map). The
+    // ASIFT inverse-tilt back-projection is a SEPARATE matrix:
+    //   A_inv = R(-φ) · diag(1, t) · R(φ)
+    // applied around the image center, then σ_max = max(1, t). Identity warp
+    // (t=1, φ=0 — i.e. warp_idx == 0 in the IMAS-25 schedule) skips boundary
+    // check + uses identity matrix.
+    const float cf = cosf(theta_rad);
+    const float sf = sinf(theta_rad);
+    ubo.bp_a11 = cf * cf + t_factor * sf * sf;
+    ubo.bp_a12 = (t_factor - 1.0f) * cf * sf;
+    ubo.bp_a21 = ubo.bp_a12;
+    ubo.bp_a22 = sf * sf + t_factor * cf * cf;
+    const float cx = ((float)W - 1.0f) * 0.5f;
+    const float cy = ((float)H - 1.0f) * 0.5f;
+    ubo.bp_a13 = cx - (ubo.bp_a11 * cx + ubo.bp_a12 * cy);
+    ubo.bp_a23 = cy - (ubo.bp_a21 * cx + ubo.bp_a22 * cy);
+    ubo.bp_sigma_max  = (t_factor > 1.0f) ? t_factor : 1.0f;
+    ubo.bp_boundary_K = 3.0f;
+    ubo.bp_input_W    = W;
+    ubo.bp_input_H    = H;
+    // Derive identity intrinsically from the warp transform, not from
+    // warp_idx. Serial callers (vksift_dispatchFusedImasWarpForSlot)
+    // pass slot_idx as warp_idx, and parallel callers might pass any
+    // permutation of the schedule — making identity depend on warp_idx
+    // would silently mis-classify identity for slot>0 in the serial
+    // path. The transform itself is unambiguous: t=1, φ=0 is identity.
+    ubo.bp_is_identity = ((t_factor == 1.0f) && (theta_rad == 0.0f)) ? 1u : 0u;
+    ubo.bp_nb_octaves  = detector->mem->curr_nb_octaves;
+
     memcpy(detector->mem->slots[slot_idx].warp_params_ubo_ptr, &ubo, sizeof(WarpParamsUBO));
   }
 
@@ -3309,6 +3533,12 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   VK_NULL_SAFE_DELETE(detector->extractkpts_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->extractkpts_desc_pool, NULL));
   VK_NULL_SAFE_DELETE(detector->extractkpts_desc_set_layout,
                       vkDestroyDescriptorSetLayout(detector->dev->device, detector->extractkpts_desc_set_layout, NULL));
+  // Phase D — BackProjectFeatures pipeline + descriptor sets
+  VK_NULL_SAFE_DELETE(detector->backproject_pipeline, vkDestroyPipeline(detector->dev->device, detector->backproject_pipeline, NULL));
+  VK_NULL_SAFE_DELETE(detector->backproject_pipeline_layout, vkDestroyPipelineLayout(detector->dev->device, detector->backproject_pipeline_layout, NULL));
+  VK_NULL_SAFE_DELETE(detector->backproject_desc_pool, vkDestroyDescriptorPool(detector->dev->device, detector->backproject_desc_pool, NULL));
+  VK_NULL_SAFE_DELETE(detector->backproject_desc_set_layout,
+                      vkDestroyDescriptorSetLayout(detector->dev->device, detector->backproject_desc_set_layout, NULL));
   // Compute orientation
   VK_NULL_SAFE_DELETE(detector->orientation_pipeline, vkDestroyPipeline(detector->dev->device, detector->orientation_pipeline, NULL));
   VK_NULL_SAFE_DELETE(detector->orientation_pipeline_layout, vkDestroyPipelineLayout(detector->dev->device, detector->orientation_pipeline_layout, NULL));
@@ -3349,6 +3579,7 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
   VK_NULL_SAFE_DELETE(detector->dog_desc_sets, free(detector->dog_desc_sets));
   VK_NULL_SAFE_DELETE(detector->downsample_desc_sets, free(detector->downsample_desc_sets));
   VK_NULL_SAFE_DELETE(detector->extractkpts_desc_sets, free(detector->extractkpts_desc_sets));
+  VK_NULL_SAFE_DELETE(detector->backproject_desc_sets, free(detector->backproject_desc_sets));
   VK_NULL_SAFE_DELETE(detector->orientation_desc_sets, free(detector->orientation_desc_sets));
   VK_NULL_SAFE_DELETE(detector->descriptor_desc_sets, free(detector->descriptor_desc_sets));
 

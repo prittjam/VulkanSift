@@ -314,6 +314,12 @@ void vksift_jl_dispatch_parallel_imas(
         for (uint32_t s = 0u; s < wave; ++s) {
             wave_specs[s].t_factor  = t_factors[base + s];
             wave_specs[s].theta_rad = theta_rads[base + s];
+            // Global IMAS schedule index — vksift_dispatchParallelIMAS stamps
+            // this into the WarpParamsUBO so the back-project shader knows
+            // which warp is the identity (warp_idx == 0) and skips the
+            // boundary check there. Without it the dispatcher's local
+            // (base + s) within each chunked call collapses to 0 for n_slots=1.
+            wave_specs[s].warp_idx  = base + s;
             wave_counts[s] = 0u;
         }
         // The C-level dispatch will internally chunk to min(n_slots, wave).

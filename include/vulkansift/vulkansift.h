@@ -136,6 +136,13 @@ extern "C"
   typedef struct {
     float t_factor;
     float theta_rad;
+    // Global warp index in the caller's IMAS schedule. Stamped into the
+    // WarpParamsUBO so BackProjectFeatures.comp can recognise the identity
+    // warp (warp_idx == 0) and skip the K·σ·σ_max boundary check. The
+    // dispatcher otherwise can't recover this — it loops wave by wave with
+    // a local base offset, so without an explicit field every wave's UBO
+    // would receive warp_idx == 0.
+    uint32_t warp_idx;
   } vksift_WarpSpec;
 
   VKSIFT_EXPORT void vksift_dispatchParallelIMAS(

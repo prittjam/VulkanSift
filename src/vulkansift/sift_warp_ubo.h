@@ -91,6 +91,28 @@ typedef struct
   float _pad1;
   float _pad2;
   float _pad3;
+
+  // [bytes 96..143] — Phase D back-projection params (48 B).
+  // Host-filled per warp by vksift_fillFusedWarpState; consumed by
+  // BackProjectFeatures.comp to (a) reject features whose K·σ·σ_max boundary
+  // pad overlaps the parallelogram edge and (b) back-project tilted-frame
+  // (x, y) → input-frame (x, y) via the 2×3 affine [bp_a11 bp_a12 bp_a13;
+  // bp_a21 bp_a22 bp_a23].
+  //   A_inv = R(-φ) · diag(1, t) · R(φ)      (2×2 symmetric)
+  //   bp_a11 = cφ² + t·sφ²,   bp_a12 = bp_a21 = (t-1)·cφ·sφ
+  //   bp_a22 = sφ² + t·cφ²
+  // Center offset (so input_xy = A_inv · tilted_xy + (c - A_inv · c)):
+  //   bp_a13 = cx − (bp_a11·cx + bp_a12·cy)
+  //   bp_a23 = cy − (bp_a21·cx + bp_a22·cy)
+  // where c = ((W-1)/2, (H-1)/2). σ_max of A_inv is max(1, t) = t for t ≥ 1.
+  float    bp_a11, bp_a12, bp_a13;
+  float    bp_a21, bp_a22, bp_a23;
+  float    bp_sigma_max;        // σ_max of A_inv (= max(1, t))
+  float    bp_boundary_K;       // K in K·σ·σ_max boundary pad (default 3.0)
+  uint32_t bp_input_W;          // original input image width  (for rect bounds)
+  uint32_t bp_input_H;          // original input image height
+  uint32_t bp_is_identity;      // 1 for the t=1, φ=0 warp (skip boundary check)
+  uint32_t bp_nb_octaves;       // mem->curr_nb_octaves — shader walks this many sections
 } WarpParamsUBO;
 
 #endif // VKSIFT_WARP_UBO_H
