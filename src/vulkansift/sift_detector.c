@@ -2570,21 +2570,18 @@ static void recBufferOwnershipTransferCmds(vksift_SiftDetector detector, VkComma
                                            const uint32_t src_queue_family_idx, const uint32_t dst_queue_family_idx, VkPipelineStageFlags src_stage,
                                            VkPipelineStageFlags dst_stage)
 {
-  beginMarkerRegion(detector, cmdbuf, "BufferOwnershipTransfer");
-
-  const uint32_t buf_idx = slot_sift_buffer_idx(detector, slot_idx);
-  VkBufferMemoryBarrier *ownership_barriers = (VkBufferMemoryBarrier *)malloc(sizeof(VkBufferMemoryBarrier) * oct_count);
-  for (uint32_t oct_idx = oct_begin; oct_idx < (oct_begin + oct_count); oct_idx++)
-  {
-    ownership_barriers[oct_idx - oct_begin] =
-        vkenv_genBufferMemoryBarrier(detector->mem->sift_buffer_arr[buf_idx], 0, 0, src_queue_family_idx, dst_queue_family_idx,
-                                     detector->mem->sift_buffers_info[buf_idx].octave_section_offset_arr[oct_idx],
-                                     detector->mem->sift_buffers_info[buf_idx].octave_section_size_arr[oct_idx]);
-  }
-  vkCmdPipelineBarrier(cmdbuf, src_stage, dst_stage, 0, 0, NULL, oct_count, ownership_barriers, 0, NULL);
-  free(ownership_barriers);
-
-  endMarkerRegion(detector, cmdbuf);
+  // No-op. sift_buffer_arr is now created CONCURRENT across (general,
+  // async-compute, async-transfer) by multi_queue_share_info — see
+  // sift_memory.c. Ownership-transfer barriers are unnecessary on CONCURRENT
+  // resources and are prohibited by VUID-VkBufferMemoryBarrier-None-09050
+  // (src/dst queue family indices must be VK_QUEUE_FAMILY_IGNORED).
+  // Cross-queue memory + execution dependency on the legacy single-queue
+  // detection path still holds because vkQueueSubmit's semaphore signal/wait
+  // establishes both per the Vulkan synchronization spec.
+  (void)detector; (void)cmdbuf; (void)slot_idx;
+  (void)oct_begin; (void)oct_count;
+  (void)src_queue_family_idx; (void)dst_queue_family_idx;
+  (void)src_stage; (void)dst_stage;
 }
 
 // =============================================================================

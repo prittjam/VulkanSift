@@ -369,10 +369,133 @@ examples/asift_gpu/driver.jl  added vks_init `n_pyramid_slots` kwarg
 
 ---
 
-## Phase E attempt (stashed)
+## Phase E status — partial commit + remaining stash
 
-Phase E was attempted on top of Phase D, hit a wall, and got stashed at
-`stash@{0}: phase-e-wip` (numbering may shift — check `git stash list`).
+A short session re-attempted Phase E with the Khronos validation layer
+loaded (`~/.local/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json`
+installed with an absolute `library_path`, so no `VK_ADD_LAYER_PATH`
+env-dance needed for future runs). Validation immediately surfaced the
+primary blocker as **VUID-VkBufferMemoryBarrier-None-09050** — the
+legacy `recBufferOwnershipTransferCmds` barriers had non-IGNORED
+queue-family indices on what was (intended to be) a CONCURRENT SIFT
+buffer. That problem is now fixed and committed on `asift-batch`; the
+remaining Phase E machinery (multi-queue dispatch logic, async-compute
+cmd pool, cross-queue semaphore) is still stashed.
+
+### What landed in this session (committed)
+
+- `multi_queue_share_info(...)` helper in `sift_memory.c`. Returns
+  CONCURRENT across whichever of (general, async-compute, async-transfer)
+  the device exposes, EXCLUSIVE if only general is available.
+- `sift_buffer_arr`, `sift_count_staging_buffer_arr`, and
+  `match_output_buffer` switched to CONCURRENT via the helper.
+- `recBufferOwnershipTransferCmds` in **both** `sift_detector.c` and
+  `sift_matcher.c` neutralized to no-ops. With the SIFT buffer
+  CONCURRENT, ownership transfers are unnecessary AND illegal per
+  VUID-VkBufferMemoryBarrier-None-09050. Cross-queue execution + memory
+  dependency on the legacy single-queue path still holds because
+  `vkQueueSubmit`'s semaphore signal/wait establishes both per the
+  Vulkan synchronization spec.
+
+Validation on the n_slots=1 parallel path is now clean (the remaining
+VUID-vkCmdBlitImage-srcImage-00219 + VUID-vkDestroyDevice-device-05137
+violations are pre-existing, not Phase E). Functional regression check:
+`sum_raw=111948 sum_kept=36923` at 1920² × IMAS-25, matching the
+Phase D baseline of 111950/36924 to within rounding-level drift.
+
+### Pre-existing bugs that validation also surfaced (not fixed)
+
+- `warped_input_image` (output of AffineWarp) is created with
+  `SAMPLED | STORAGE | TRANSFER_DST` but missing `TRANSFER_SRC_BIT`.
+  `recScaleSpaceConstructionCmds` blits FROM it at octave 0 →
+  VUID-vkCmdBlitImage-srcImage-00219 fires 20+ times per detection.
+  Harmless on NVIDIA (the blit still works) but a spec violation —
+  add `TRANSFER_SRC_BIT` to the create flags in `sift_memory.c`.
+- Multiple `VkPipelineLayout`/`VkPipeline`/`VkDescriptorSet*` leaks at
+  `vkDestroyDevice` (object-tracking VUID-vkDestroyDevice-device-05137).
+  Some pipeline created during init isn't destroyed in the matching
+  cleanup path. Worth a sweep when convenient.
+
+### What's still in `stash@{0}` (phase-e-wip — numbering may shift)
+
+Everything Phase E-specific that doesn't make sense without the rest
+of Phase E being functional:
+
+1. **Per-slot resources beyond the SIFT buffer made CONCURRENT.** The
+   committed change covers `sift_buffer_arr` /
+   `sift_count_staging_buffer_arr` / `match_output_buffer` (the buffers
+   that actually triggered the validation error). The stash extends
+   CONCURRENT to per-slot images (`input_image`, `rotated_image`,
+   `tilted_image`, `blur_tmp_image`, `octave_image`, `dog_image`,
+   `warped_input_image`, `blurred_input_image`, `rgba_input_image`),
+   per-slot `warp_params_ubo` / `dispatch_buffer`, `cached_input_image`,
+   `indirect_orientation_dispatch_buffer`,
+   `indirect_descriptor_dispatch_buffer`, and the per-slot RGB input
+   buffer. None of those are touched by the compute queue at HEAD —
+   they only matter when the multi-queue dispatcher lands.
+
+2. **Async-compute command pool + per-slot cmd buffer mirror.**
+   `detector->async_compute_command_pool` allocated against
+   `async_compute_queues_family_idx`, plus
+   `fused_imas_detect_command_buffer_compute[VKSIFT_MAX_PYRAMID_SLOTS]`
+   allocated from it. `recordCommandBuffers` records the same content
+   into both the general-pool and compute-pool cmd buffers so the
+   dispatcher can submit half of every wave on each queue.
+
+3. **Phase E dispatcher logic in `vksift_dispatchParallelIMAS`.** Wave
+   split (`wave_g = (wave+1)/2`, `wave_c = wave - wave_g`), two-fence
+   reset/submit/wait, `parallel_compute_start_semaphore` cross-queue
+   handshake, defensive `HOST→COMPUTE` barrier at the head of the
+   fused cmd buffer.
+
+4. **Sync objects + destructor cleanup for the above.**
+   `end_of_detection_fence_compute`, `parallel_compute_start_semaphore`,
+   and corresponding `VK_NULL_SAFE_DELETE` calls in
+   `vksift_destroySiftDetector`.
+
+### Two bugs the validation session found in the stashed code (still TODO)
+
+After landing the CONCURRENT-sharing + barrier-removal cleanup, replaying
+the stash + the validation layer surfaced two further Phase E bugs that
+need fixing before multi-queue can actually work:
+
+1. **`vkCmdBlitImage` on the compute-queue cmd buffer.**
+   `recScaleSpaceConstructionCmds` emits a `vkCmdBlitImage` at octave 0
+   (`warped_input_image` → `octave_image_arr[0]` with `VK_FILTER_LINEAR`).
+   Blits require the GRAPHICS queue-family capability bit; the
+   async-compute family on RTX 4090 (family index 2) lacks it
+   (`VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT | VK_QUEUE_SPARSE_BINDING_BIT`).
+   VUID-vkCmdBlitImage-commandBuffer-cmdpool fires when the compute-pool
+   mirror cmd buffer is recorded.
+   **Fix paths:**
+   - Replace with `vkCmdCopyImage` when octave 0 dims == input dims
+     (the common case — `upsample=false`), with a compute-shader
+     downsample path for the upsample case.
+   - OR write a compute-shader linear-resample that runs on either queue.
+
+2. **`parallel_compute_start_semaphore` double-signal**
+   (VUID-vkQueueSubmit-pSignalSemaphores-00067). Each
+   `vksift_dispatchParallelIMAS` call signals once at the top and the
+   first compute submit waits once — on paper balanced — but validation
+   sees the semaphore signaled twice without an intervening wait.
+   The cause was not pinned down in the validation session. Likely
+   suspects: the FFI's `wave_size = n_slots` chunking means the
+   "last chunk" may have `n_warps == 1` which sets
+   `dispatch_uses_compute = false` (no signal), but other chunks with
+   `n_warps == n_slots == 2` always signal — and somewhere the wait
+   isn't crediting the signal. Could also be cross-queue tracking in
+   the validation layer.
+   **Fix path:** instrument with `Gate.stash` / a print of which
+   submits actually signal vs wait per call, OR replace the binary
+   semaphore with a timeline semaphore (multi-signal-safe by spec).
+
+Replay path for the next session: `git stash apply stash@{0}` (verify
+slot number with `git stash list` — the cleanup above didn't touch the
+stash, but stash numbering shifts as you make new ones), then tackle
+those two bugs.
+
+### Original stash notes (pre-cleanup)
+
 The diff includes the original `stash@{1}: phase-c-multi-queue` scaffold
 (async-compute pool + per-slot compute-pool cmd buffers + dedicated
 fence + wave-splitting in `vksift_dispatchParallelIMAS`) plus three

@@ -281,18 +281,15 @@ static void recMatchingCmds(vksift_SiftMatcher matcher, VkCommandBuffer cmdbuf)
 static void recBufferOwnershipTransferCmds(vksift_SiftMatcher matcher, VkCommandBuffer cmdbuf, const uint32_t src_queue_family_idx,
                                            const uint32_t dst_queue_family_idx, VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage)
 {
-  beginMarkerRegion(matcher, cmdbuf, "BufferOwnershipTransfer");
-
-  VkBufferMemoryBarrier ownership_barriers[3];
-  ownership_barriers[0] = vkenv_genBufferMemoryBarrier(matcher->mem->sift_buffer_arr[matcher->curr_buffer_A_idx], 0, 0, src_queue_family_idx,
-                                                       dst_queue_family_idx, 0, VK_WHOLE_SIZE);
-  ownership_barriers[1] = vkenv_genBufferMemoryBarrier(matcher->mem->sift_buffer_arr[matcher->curr_buffer_B_idx], 0, 0, src_queue_family_idx,
-                                                       dst_queue_family_idx, 0, VK_WHOLE_SIZE);
-  ownership_barriers[2] =
-      vkenv_genBufferMemoryBarrier(matcher->mem->match_output_buffer, 0, 0, src_queue_family_idx, dst_queue_family_idx, 0, VK_WHOLE_SIZE);
-  vkCmdPipelineBarrier(cmdbuf, src_stage, dst_stage, 0, 0, NULL, 3, ownership_barriers, 0, NULL);
-
-  endMarkerRegion(matcher, cmdbuf);
+  // No-op (mirror of the detector-side helper). sift_buffer_arr and
+  // match_output_buffer are now CONCURRENT — see sift_memory.c
+  // multi_queue_share_info. Ownership-transfer barriers are unnecessary on
+  // CONCURRENT resources and would trip VUID-VkBufferMemoryBarrier-None-09050.
+  // Cross-queue memory + execution dependency still holds via vkQueueSubmit
+  // semaphores.
+  (void)matcher; (void)cmdbuf;
+  (void)src_queue_family_idx; (void)dst_queue_family_idx;
+  (void)src_stage; (void)dst_stage;
 }
 
 static bool recordCommandBuffers(vksift_SiftMatcher matcher)

@@ -12,6 +12,51 @@
 
 static const char LOG_TAG[] = "SiftMemory";
 
+// Fill (sharing_mode, queue_family_count, queue_family_indices) for resources
+// that may be touched by more than one queue family during the SIFT lifecycle:
+//   - general queue: detection / IMAS dispatches (always),
+//   - async-compute queue: future parallel-IMAS multi-queue dispatch (when
+//     the device exposes a dedicated compute family),
+//   - async-transfer queue: SIFT buffer download via vkCmdCopyBuffer (when
+//     the device exposes a dedicated transfer family).
+// Returns CONCURRENT(N families) when at least two are available, EXCLUSIVE
+// otherwise. Caller owns `scratch` (length-3 uint32_t array); `*out_indices`
+// aliases into it.
+//
+// Using CONCURRENT here lets us drop the legacy
+// recBufferOwnershipTransferCmds barriers on the SIFT buffer (which are
+// illegal on CONCURRENT resources per VUID-VkBufferMemoryBarrier-None-09050)
+// and rely on vkQueueSubmit's semaphore signal/wait for cross-queue execution
+// and memory dependency.
+static inline void multi_queue_share_info(
+    vkenv_Device device, VkSharingMode *out_mode,
+    uint32_t *out_count, const uint32_t **out_indices,
+    uint32_t scratch[3])
+{
+  uint32_t n = 0u;
+  scratch[n++] = device->general_queues_family_idx;
+  if (device->async_compute_available)
+  {
+    scratch[n++] = device->async_compute_queues_family_idx;
+  }
+  if (device->async_transfer_available)
+  {
+    scratch[n++] = device->async_transfer_queues_family_idx;
+  }
+  if (n >= 2u)
+  {
+    *out_mode = VK_SHARING_MODE_CONCURRENT;
+    *out_count = n;
+    *out_indices = scratch;
+  }
+  else
+  {
+    *out_mode = VK_SHARING_MODE_EXCLUSIVE;
+    *out_count = 0u;
+    *out_indices = NULL;
+  }
+}
+
 void updateScaleSpaceInfo(vksift_SiftMemory memory)
 {
   // Update current number of octave
@@ -753,6 +798,21 @@ bool setupStaticObjectsAndMemory(vksift_SiftMemory memory)
   bool res;
   VkMemoryRequirements memory_requirement;
   uint32_t memory_type_idx;
+
+  // sift_buffer_arr is written by the general queue (detection compute
+  // shaders) and read by the async-transfer queue (download via
+  // vkCmdCopyBuffer in vksift_Memory_copyBufferFeaturesFromGPU). When the
+  // device exposes an async-compute queue family, parallel-IMAS multi-queue
+  // dispatch will also write it. Mark CONCURRENT on those families so
+  // cross-family access is legal without an ownership-transfer barrier
+  // (those would otherwise hit VUID-VkBufferMemoryBarrier-None-09050 on
+  // a CONCURRENT buffer). sift_count_staging_buffer_arr + match_output_buffer
+  // get the same treatment for the same reason.
+  uint32_t mq_queue_families[3];
+  VkSharingMode mq_mode;
+  uint32_t mq_count;
+  const uint32_t *mq_indices;
+  multi_queue_share_info(memory->device, &mq_mode, &mq_count, &mq_indices, mq_queue_families);
   //////////////////////////////////////////////////////////////////////
   // Setup input image staging buffer and output image (they don't depend on the input resolution)
   //////////////////////////////////////////////////////////////////////
@@ -832,7 +892,7 @@ bool setupStaticObjectsAndMemory(vksift_SiftMemory memory)
     buffer_size += memory->max_nb_octaves * buffer_offset_alignment;
     res = res && vkenv_createBuffer(&memory->sift_buffer_arr[buff_idx], memory->device, 0, buffer_size,
                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+                                    mq_mode, mq_count, mq_indices);
     if (res)
     {
       vkGetBufferMemoryRequirements(memory->device->device, memory->sift_buffer_arr[buff_idx], &memory_requirement);
@@ -853,7 +913,7 @@ bool setupStaticObjectsAndMemory(vksift_SiftMemory memory)
   {
     VkDeviceSize info_buffer_size = sizeof(uint32_t) * memory->max_nb_octaves;
     res = res && vkenv_createBuffer(&memory->sift_count_staging_buffer_arr[buff_idx], memory->device, 0, info_buffer_size,
-                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, mq_mode, mq_count, mq_indices);
     if (res)
     {
       vkGetBufferMemoryRequirements(memory->device->device, memory->sift_count_staging_buffer_arr[buff_idx], &memory_requirement);
@@ -895,7 +955,7 @@ bool setupStaticObjectsAndMemory(vksift_SiftMemory memory)
   // Create the match buffer
   res = true;
   res = res && vkenv_createBuffer(&memory->match_output_buffer, memory->device, 0, memory->max_nb_sift_per_buffer * sizeof(vksift_Match_2NN),
-                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, mq_mode, mq_count, mq_indices);
   if (res)
   {
     vkGetBufferMemoryRequirements(memory->device->device, memory->match_output_buffer, &memory_requirement);
