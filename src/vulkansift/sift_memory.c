@@ -557,6 +557,67 @@ static bool setupOneSlot(vksift_SiftMemory memory, uint32_t slot_idx, bool is_in
     return false;
   }
 
+  // Per-slot WarpParamsUBO (host-visible coherent, persistently mapped).
+  // Sized at VKSIFT_WARP_PARAMS_UBO_SIZE so future shader params have room
+  // without forcing a resize. Allocated once per slot at init; survives
+  // pyramid resizes (no need to re-allocate on input-resolution change).
+  if (is_init && memory->slots[slot_idx].warp_params_ubo == VK_NULL_HANDLE)
+  {
+    res = vkenv_createBuffer(&memory->slots[slot_idx].warp_params_ubo, memory->device, 0,
+                             VKSIFT_WARP_PARAMS_UBO_SIZE,
+                             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+    if (res)
+    {
+      vkGetBufferMemoryRequirements(memory->device->device, memory->slots[slot_idx].warp_params_ubo, &memory_requirement);
+    }
+    res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                           &memory_type_idx);
+    res = res && vkenv_allocateMemory(&memory->slots[slot_idx].warp_params_ubo_memory, memory->device,
+                                      memory_requirement.size, memory_type_idx);
+    res = res && vkenv_bindBufferMemory(memory->device, memory->slots[slot_idx].warp_params_ubo,
+                                        memory->slots[slot_idx].warp_params_ubo_memory, 0u);
+    res = res && (vkMapMemory(memory->device->device, memory->slots[slot_idx].warp_params_ubo_memory,
+                              0, VK_WHOLE_SIZE, 0, &memory->slots[slot_idx].warp_params_ubo_ptr) == VK_SUCCESS);
+    if (!res)
+    {
+      logError(LOG_TAG, "Failed to set up the WarpParams UBO (slot %u)", slot_idx);
+      return false;
+    }
+    memset(memory->slots[slot_idx].warp_params_ubo_ptr, 0, VKSIFT_WARP_PARAMS_UBO_SIZE);
+  }
+
+  // Per-slot indirect-dispatch buffer (host-visible coherent, persistently
+  // mapped). Holds VkDispatchIndirectCommand entries that vkCmdDispatchIndirect
+  // reads at submission time. Allocated once per slot at init.
+  if (is_init && memory->slots[slot_idx].dispatch_buffer == VK_NULL_HANDLE)
+  {
+    res = vkenv_createBuffer(&memory->slots[slot_idx].dispatch_buffer, memory->device, 0,
+                             VKSIFT_SLOT_DISPATCH_BUFFER_SIZE,
+                             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             VK_SHARING_MODE_EXCLUSIVE, 0, NULL);
+    if (res)
+    {
+      vkGetBufferMemoryRequirements(memory->device->device, memory->slots[slot_idx].dispatch_buffer, &memory_requirement);
+    }
+    res = res && vkenv_findValidMemoryType(memory->device->physical_device, memory_requirement,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                           &memory_type_idx);
+    res = res && vkenv_allocateMemory(&memory->slots[slot_idx].dispatch_buffer_memory, memory->device,
+                                      memory_requirement.size, memory_type_idx);
+    res = res && vkenv_bindBufferMemory(memory->device, memory->slots[slot_idx].dispatch_buffer,
+                                        memory->slots[slot_idx].dispatch_buffer_memory, 0u);
+    res = res && (vkMapMemory(memory->device->device, memory->slots[slot_idx].dispatch_buffer_memory,
+                              0, VK_WHOLE_SIZE, 0, &memory->slots[slot_idx].dispatch_buffer_ptr) == VK_SUCCESS);
+    if (!res)
+    {
+      logError(LOG_TAG, "Failed to set up the indirect dispatch buffer (slot %u)", slot_idx);
+      return false;
+    }
+    memset(memory->slots[slot_idx].dispatch_buffer_ptr, 0, VKSIFT_SLOT_DISPATCH_BUFFER_SIZE);
+  }
+
   return true;
 }
 
@@ -1240,6 +1301,22 @@ void vksift_destroySiftMemory(vksift_SiftMemory *memory_ptr)
       VK_NULL_SAFE_DELETE(slot->rgb_input_buffer_memory, vkFreeMemory(memory->device->device, slot->rgb_input_buffer_memory, NULL));
     }
     VK_NULL_SAFE_DELETE(slot->input_image_memory, vkFreeMemory(memory->device->device, slot->input_image_memory, NULL));
+
+    // Per-slot WarpParamsUBO + indirect-dispatch buffer (host-mapped).
+    if (slot->warp_params_ubo_memory != VK_NULL_HANDLE)
+    {
+      vkUnmapMemory(memory->device->device, slot->warp_params_ubo_memory);
+      slot->warp_params_ubo_ptr = NULL;
+    }
+    VK_NULL_SAFE_DELETE(slot->warp_params_ubo, vkDestroyBuffer(memory->device->device, slot->warp_params_ubo, NULL));
+    VK_NULL_SAFE_DELETE(slot->warp_params_ubo_memory, vkFreeMemory(memory->device->device, slot->warp_params_ubo_memory, NULL));
+    if (slot->dispatch_buffer_memory != VK_NULL_HANDLE)
+    {
+      vkUnmapMemory(memory->device->device, slot->dispatch_buffer_memory);
+      slot->dispatch_buffer_ptr = NULL;
+    }
+    VK_NULL_SAFE_DELETE(slot->dispatch_buffer, vkDestroyBuffer(memory->device->device, slot->dispatch_buffer, NULL));
+    VK_NULL_SAFE_DELETE(slot->dispatch_buffer_memory, vkFreeMemory(memory->device->device, slot->dispatch_buffer_memory, NULL));
   }
 
   // Single-instance cached IMAS-source image + output image (shared across slots).

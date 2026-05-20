@@ -118,7 +118,38 @@ typedef struct
   VkImageView *octave_DoG_image_view_arr;
   VkDeviceMemory *octave_DoG_image_memory_arr;
   VkDeviceSize *octave_DoG_image_memory_size_arr;
+
+  // Per-slot WarpParamsUBO (host-mapped, persistently coherent). The parallel
+  // IMAS+detect pipeline binds this to descriptor set 1 binding 0 in every
+  // IMAS shader so all warp-dependent parameters (affine matrix, canvas
+  // dims, σ_aa, t_factor, quantize valid sub-region, ...) come from one
+  // place. Host updates the contents before each warp submission; the
+  // pre-recorded fused command buffer reads them on dispatch.
+  // Size: VKSIFT_WARP_PARAMS_UBO_SIZE (defined below) — generous overhead
+  // so future shader params don't force a resize.
+  VkBuffer warp_params_ubo;
+  VkDeviceMemory warp_params_ubo_memory;
+  void *warp_params_ubo_ptr;
+
+  // Per-slot indirect-dispatch buffer. Holds an array of
+  // VkDispatchIndirectCommand (uint32 x, y, z) triples that the fused IMAS
+  // chain dispatches against via vkCmdDispatchIndirect. Host updates the
+  // group counts before each warp submission. Sized at
+  // VKSIFT_SLOT_DISPATCH_BUFFER_SIZE — room for the worst case ~7 IMAS-chain
+  // dispatches plus future additions.
+  VkBuffer dispatch_buffer;
+  VkDeviceMemory dispatch_buffer_memory;
+  void *dispatch_buffer_ptr;
 } vksift_SiftPyramidSlot;
+
+// Size (bytes) of each slot's WarpParamsUBO. 256 B leaves ~64 floats of
+// headroom past the current ~24 fields. Vulkan UBO max alignment is 256
+// on most GPUs so this is a natural pick.
+#define VKSIFT_WARP_PARAMS_UBO_SIZE      256u
+// Size (bytes) of each slot's indirect-dispatch buffer. 256 B holds ~21
+// VkDispatchIndirectCommand entries (12 B each) — plenty for the IMAS
+// chain + Quantize + future GPU back-projection dispatch.
+#define VKSIFT_SLOT_DISPATCH_BUFFER_SIZE 256u
 
 typedef struct vksift_SiftMemory_T
 {
