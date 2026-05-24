@@ -1,0 +1,104 @@
+#version 450
+//
+// BrownConradyUndistort.comp — undistort an image under the OpenCV 8-coef
+// Brown-Conrady model (k1, k2, k3, k4, k5, k6, p1, p2) using a per-pixel
+// forward-distortion lookup with bilinear sampling.
+//
+// For each output pixel (x_out, y_out), compute the source (distorted)
+// coordinate via:
+//
+//   p_norm = K_inv · (x_out + 0.5, y_out + 0.5, 1)^T          // normalized
+//   r2     = ||p_norm||^2
+//   radial = (1 + k1·r2 + k2·r4 + k3·r6) /
+//            (1 + k4·r2 + k5·r4 + k6·r6)
+//   p_dist = radial · p_norm + 2·p[1,2]·(tangential)          // OpenCV order
+//   p_src  = K · (p_dist, 1)^T - 0.5                          // back to pixel
+//
+// then bilinearly sample img_input at p_src.
+//
+// Coordinate convention: 0-indexed COLMAP (pixel center at integer + 0.5)
+// to match the rest of VulkanSift's per-pixel math (sift_detector.c).
+//
+// Parameters (set=1, binding=0 UndistortParamsUBO):
+//   K row 0 + row 1 (upper 2×3): k11..k23
+//   K_inv row 0 + row 1 (upper 2×3): ki11..ki23
+//   Brown-Conrady: k1..k6, p1, p2
+//   W_out, H_out: output image dimensions
+//   fill_value: returned for samples outside the source image
+//
+// Input: bound as sampler2D (r32f, bilinear, clamp-to-edge — same setup as
+//        AffineWarp.comp so we can reuse the same descriptor layout).
+// Output: bound as r32f image2D.
+//
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D img_input;
+layout(set = 0, binding = 1, r32f) uniform image2D img_output;
+
+layout(set = 1, binding = 0, std140) uniform UndistortParamsBlock {
+    // K upper 2×3 (forward intrinsics: normalized → pixel)
+    float k11, k12, k13;
+    float k21, k22, k23;
+    // K_inv upper 2×3 (inverse intrinsics: pixel → normalized)
+    float ki11, ki12, ki13;
+    float ki21, ki22, ki23;
+    // Brown-Conrady coefficients (OpenCV order)
+    float bc_k1, bc_k2, bc_k3, bc_k4, bc_k5, bc_k6;
+    float bc_p1, bc_p2;
+    // Output extent + out-of-bounds fill
+    uint  W_out, H_out;
+    float fill_value;
+    float _pad0;            // align to vec4 boundary
+} ubo;
+
+void main() {
+    ivec2 coords_out = ivec2(gl_GlobalInvocationID.xy);
+    if (uint(coords_out.x) >= ubo.W_out ||
+        uint(coords_out.y) >= ubo.H_out) {
+        return;
+    }
+
+    // Output pixel → COLMAP coordinates (pixel center at integer + 0.5)
+    float x_out = float(coords_out.x) + 0.5;
+    float y_out = float(coords_out.y) + 0.5;
+
+    // K_inv · [x_out, y_out, 1] → normalized image-plane coords
+    float xn = ubo.ki11 * x_out + ubo.ki12 * y_out + ubo.ki13;
+    float yn = ubo.ki21 * x_out + ubo.ki22 * y_out + ubo.ki23;
+
+    // Brown-Conrady forward distortion (OpenCV 8-coef + 2 tangential)
+    float r2 = xn * xn + yn * yn;
+    float r4 = r2 * r2;
+    float r6 = r2 * r4;
+
+    float num = 1.0 + ubo.bc_k1 * r2 + ubo.bc_k2 * r4 + ubo.bc_k3 * r6;
+    float den = 1.0 + ubo.bc_k4 * r2 + ubo.bc_k5 * r4 + ubo.bc_k6 * r6;
+    float radial = num / den;
+
+    float xd = radial * xn
+             + 2.0 * ubo.bc_p1 * xn * yn
+             + ubo.bc_p2 * (r2 + 2.0 * xn * xn);
+    float yd = radial * yn
+             + 2.0 * ubo.bc_p2 * xn * yn
+             + ubo.bc_p1 * (r2 + 2.0 * yn * yn);
+
+    // K · [xd, yd, 1] → source pixel in COLMAP coords
+    float x_src = ubo.k11 * xd + ubo.k12 * yd + ubo.k13;
+    float y_src = ubo.k21 * xd + ubo.k22 * yd + ubo.k23;
+
+    // Normalized texture coordinates (pixel center → (n + 0.5)/size, but
+    // x_src/y_src are already at pixel-center convention, so just /size).
+    vec2 in_size = vec2(textureSize(img_input, 0));
+    vec2 tex_coords = vec2(x_src / in_size.x, y_src / in_size.y);
+
+    // Out-of-bounds → fill_value (don't trust sampler border color).
+    float val;
+    if (tex_coords.x < 0.0 || tex_coords.x > 1.0 ||
+        tex_coords.y < 0.0 || tex_coords.y > 1.0) {
+        val = ubo.fill_value;
+    } else {
+        val = textureLod(img_input, tex_coords, 0.0).r;
+    }
+
+    imageStore(img_output, coords_out, vec4(val, 0.0, 0.0, 1.0));
+}

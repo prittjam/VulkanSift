@@ -68,6 +68,7 @@ endif()
 set(VULKANSIFT_LIB_SHADERS
     # SIFT detector algorithm shaders
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/AffineWarp.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/BrownConradyUndistort.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/PreBlur1D.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/CrossWarpSplat.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkansift/shaders/CrossWarpNms.comp
