@@ -3785,6 +3785,327 @@ bool vksift_dispatchSiftDetectionFromImas(vksift_SiftDetector detector, const ui
                                     &detector->detection_command_buffer_from_imas);
 }
 
+// =============================================================================
+// Cross-warp ellipse-NMS (Plan A) — host-roundtrip GPU NMS over an arbitrary
+// in-memory feature pool.
+//
+// Caller writes the SSBO header (u32 nb_in, u32 max_nb_in) + n_in features
+// directly into the mapped detector->cw_in_buffer_ptr region.  After
+// vksift_runCrossWarpNms returns, the symmetric region at cw_out_buffer_ptr
+// holds the SSBO header + survivor features compactly.
+//
+// The shaders are CrossWarpSplat.comp (ellipse-bbox rasterization with
+// Mahalanobis interior test, imageAtomicMax into r32ui) and CrossWarpNms.comp
+// (each feature walks its own footprint and survives iff no covered pixel
+// shows a stronger packed value).  Together they implement ellipse-overlap
+// NMS at the K=3σ contour with ties broken by feature index.
+//
+// Push constant: intensity_scale.  We pick 65535/0.5 ≈ 131000 to map the
+// typical |intensity| range [0, 0.5] across the full 16-bit fixed-point.
+// Features above 0.5 are clipped (still survive, just lose precision).
+// =============================================================================
+
+static void destroyCrossWarpResources(vksift_SiftDetector detector)
+{
+  VkDevice dev = detector->dev->device;
+  VK_NULL_SAFE_DELETE(detector->cw_nms_pipeline, vkDestroyPipeline(dev, detector->cw_nms_pipeline, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_nms_pipeline_layout, vkDestroyPipelineLayout(dev, detector->cw_nms_pipeline_layout, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_splat_pipeline, vkDestroyPipeline(dev, detector->cw_splat_pipeline, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_splat_pipeline_layout, vkDestroyPipelineLayout(dev, detector->cw_splat_pipeline_layout, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_desc_pool, vkDestroyDescriptorPool(dev, detector->cw_desc_pool, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_nms_desc_set_layout, vkDestroyDescriptorSetLayout(dev, detector->cw_nms_desc_set_layout, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_splat_desc_set_layout, vkDestroyDescriptorSetLayout(dev, detector->cw_splat_desc_set_layout, NULL));
+  if (detector->cw_in_buffer_ptr) { vkUnmapMemory(dev, detector->cw_in_buffer_memory); detector->cw_in_buffer_ptr = NULL; }
+  if (detector->cw_out_buffer_ptr) { vkUnmapMemory(dev, detector->cw_out_buffer_memory); detector->cw_out_buffer_ptr = NULL; }
+  VK_NULL_SAFE_DELETE(detector->cw_in_buffer, vkDestroyBuffer(dev, detector->cw_in_buffer, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_in_buffer_memory, vkFreeMemory(dev, detector->cw_in_buffer_memory, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_out_buffer, vkDestroyBuffer(dev, detector->cw_out_buffer, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_out_buffer_memory, vkFreeMemory(dev, detector->cw_out_buffer_memory, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_splat_image_view, vkDestroyImageView(dev, detector->cw_splat_image_view, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_splat_image, vkDestroyImage(dev, detector->cw_splat_image, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_splat_image_memory, vkFreeMemory(dev, detector->cw_splat_image_memory, NULL));
+  VK_NULL_SAFE_DELETE(detector->cw_fence, vkDestroyFence(dev, detector->cw_fence, NULL));
+  if (detector->cw_cmd_buffer != VK_NULL_HANDLE)
+  {
+    vkFreeCommandBuffers(dev, detector->general_command_pool, 1, &detector->cw_cmd_buffer);
+    detector->cw_cmd_buffer = VK_NULL_HANDLE;
+  }
+  detector->cw_initialized = false;
+  detector->cw_max_features = 0;
+  detector->cw_image_w = 0;
+  detector->cw_image_h = 0;
+}
+
+static bool setupCrossWarpResources(vksift_SiftDetector detector,
+                                    uint32_t canvas_w, uint32_t canvas_h,
+                                    uint32_t max_features)
+{
+  VkDevice dev = detector->dev->device;
+  const uint32_t qf = detector->dev->general_queues_family_idx;
+  // 8-byte SSBO header (nb, max_nb) + max_features × sizeof(vksift_Feature).
+  const VkDeviceSize buffer_size = 8u + (VkDeviceSize)max_features * sizeof(vksift_Feature);
+
+  // ---- Splat image (r32ui, canvas_w × canvas_h) ----
+  if (!vkenv_createImage(&detector->cw_splat_image, detector->dev, 0, VK_IMAGE_TYPE_2D,
+        VK_FORMAT_R32_UINT, (VkExtent3D){canvas_w, canvas_h, 1}, 1, 1,
+        VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED)) return false;
+  VkMemoryRequirements imreq;
+  vkGetImageMemoryRequirements(dev, detector->cw_splat_image, &imreq);
+  uint32_t mt_idx;
+  if (!vkenv_findValidMemoryType(detector->dev->physical_device, imreq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mt_idx)) return false;
+  if (!vkenv_allocateMemory(&detector->cw_splat_image_memory, detector->dev, imreq.size, mt_idx)) return false;
+  if (!vkenv_bindImageMemory(detector->dev, detector->cw_splat_image, detector->cw_splat_image_memory, 0)) return false;
+  if (!vkenv_createImageView(&detector->cw_splat_image_view, detector->dev, 0, detector->cw_splat_image,
+        VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R32_UINT, VKENV_DEFAULT_COMPONENT_MAPPING,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1})) return false;
+
+  // ---- In/out feature buffers (host-visible + coherent for upload/readback) ----
+  for (int io = 0; io < 2; ++io)
+  {
+    VkBuffer       *buf  = (io == 0) ? &detector->cw_in_buffer        : &detector->cw_out_buffer;
+    VkDeviceMemory *mem  = (io == 0) ? &detector->cw_in_buffer_memory : &detector->cw_out_buffer_memory;
+    void          **ptr  = (io == 0) ? &detector->cw_in_buffer_ptr    : &detector->cw_out_buffer_ptr;
+    if (!vkenv_createBuffer(buf, detector->dev, 0, buffer_size,
+          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL)) return false;
+    VkMemoryRequirements br;
+    vkGetBufferMemoryRequirements(dev, *buf, &br);
+    if (!vkenv_findValidMemoryType(detector->dev->physical_device, br,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &mt_idx)) return false;
+    if (!vkenv_allocateMemory(mem, detector->dev, br.size, mt_idx)) return false;
+    if (!vkenv_bindBufferMemory(detector->dev, *buf, *mem, 0)) return false;
+    if (vkMapMemory(dev, *mem, 0, VK_WHOLE_SIZE, 0, ptr) != VK_SUCCESS) return false;
+  }
+
+  // ---- Descriptor set layouts: splat (2 SSBO/STORAGE_IMAGE) + nms (3) ----
+  {
+    VkDescriptorSetLayoutBinding b_splat[2] = {
+      {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+      {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+    };
+    VkDescriptorSetLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                          .bindingCount = 2, .pBindings = b_splat};
+    if (vkCreateDescriptorSetLayout(dev, &ci, NULL, &detector->cw_splat_desc_set_layout) != VK_SUCCESS) return false;
+  }
+  {
+    VkDescriptorSetLayoutBinding b_nms[3] = {
+      {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+      {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+      {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+    };
+    VkDescriptorSetLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                          .bindingCount = 3, .pBindings = b_nms};
+    if (vkCreateDescriptorSetLayout(dev, &ci, NULL, &detector->cw_nms_desc_set_layout) != VK_SUCCESS) return false;
+  }
+
+  // ---- Descriptor pool + sets ----
+  {
+    VkDescriptorPoolSize sizes[2] = {
+      {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 3},
+      {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  .descriptorCount = 2}
+    };
+    VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                     .maxSets = 2, .poolSizeCount = 2, .pPoolSizes = sizes};
+    if (vkCreateDescriptorPool(dev, &ci, NULL, &detector->cw_desc_pool) != VK_SUCCESS) return false;
+  }
+  {
+    VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                      .descriptorPool = detector->cw_desc_pool,
+                                      .descriptorSetCount = 1, .pSetLayouts = &detector->cw_splat_desc_set_layout};
+    if (vkAllocateDescriptorSets(dev, &ai, &detector->cw_splat_desc_set) != VK_SUCCESS) return false;
+    ai.pSetLayouts = &detector->cw_nms_desc_set_layout;
+    if (vkAllocateDescriptorSets(dev, &ai, &detector->cw_nms_desc_set) != VK_SUCCESS) return false;
+  }
+  // Write descriptors
+  {
+    VkDescriptorBufferInfo bi_in  = {.buffer = detector->cw_in_buffer,  .offset = 0, .range = VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bi_out = {.buffer = detector->cw_out_buffer, .offset = 0, .range = VK_WHOLE_SIZE};
+    VkDescriptorImageInfo  ii     = {.sampler = VK_NULL_HANDLE, .imageView = detector->cw_splat_image_view,
+                                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet writes[5] = {
+      {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet=detector->cw_splat_desc_set, .dstBinding=0, .descriptorCount=1,
+       .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo=&bi_in},
+      {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet=detector->cw_splat_desc_set, .dstBinding=1, .descriptorCount=1,
+       .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo=&ii},
+      {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet=detector->cw_nms_desc_set, .dstBinding=0, .descriptorCount=1,
+       .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo=&bi_in},
+      {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet=detector->cw_nms_desc_set, .dstBinding=1, .descriptorCount=1,
+       .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo=&ii},
+      {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet=detector->cw_nms_desc_set, .dstBinding=2, .descriptorCount=1,
+       .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo=&bi_out}
+    };
+    vkUpdateDescriptorSets(dev, 5, writes, 0, NULL);
+  }
+
+  // ---- Pipelines ----
+  {
+    VkShaderModule sm;
+    if (!vkenv_createShaderModule(dev, "shaders/CrossWarpSplat.comp.spv", &sm)) return false;
+    if (!vkenv_createComputePipeline(dev, sm, detector->cw_splat_desc_set_layout, 4 * sizeof(float),
+          &detector->cw_splat_pipeline_layout, &detector->cw_splat_pipeline))
+    { vkDestroyShaderModule(dev, sm, NULL); return false; }
+    vkDestroyShaderModule(dev, sm, NULL);
+  }
+  {
+    VkShaderModule sm;
+    if (!vkenv_createShaderModule(dev, "shaders/CrossWarpNms.comp.spv", &sm)) return false;
+    if (!vkenv_createComputePipeline(dev, sm, detector->cw_nms_desc_set_layout, 4 * sizeof(float),
+          &detector->cw_nms_pipeline_layout, &detector->cw_nms_pipeline))
+    { vkDestroyShaderModule(dev, sm, NULL); return false; }
+    vkDestroyShaderModule(dev, sm, NULL);
+  }
+
+  // ---- Cmd buffer + fence ----
+  {
+    VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                      .commandPool = detector->general_command_pool,
+                                      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    if (vkAllocateCommandBuffers(dev, &ai, &detector->cw_cmd_buffer) != VK_SUCCESS) return false;
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(dev, &fci, NULL, &detector->cw_fence) != VK_SUCCESS) return false;
+  }
+
+  detector->cw_initialized = true;
+  detector->cw_max_features = max_features;
+  detector->cw_image_w = canvas_w;
+  detector->cw_image_h = canvas_h;
+  (void)qf;
+  return true;
+}
+
+bool vksift_runCrossWarpNms(vksift_SiftDetector detector,
+                            uint32_t canvas_w, uint32_t canvas_h,
+                            uint32_t n_in, uint32_t *n_out,
+                            int32_t window_half, int32_t mode, float k_cutoff)
+{
+  if (!detector || !n_out) return false;
+  // Cap n_in to avoid 16-bit index overflow in the packed (response, idx)
+  // representation used by the splat shader.  Caller is expected to keep
+  // the input pool within this bound; if the IMAS schedule produces more,
+  // they get silently dropped here.
+  if (n_in > 65535u) n_in = 65535u;
+  // Pick a capacity for buffers — at least n_in, room for growth.
+  uint32_t want_cap = n_in < 8192u ? 8192u : n_in;
+  if (!detector->cw_initialized ||
+      canvas_w  > detector->cw_image_w  ||
+      canvas_h  > detector->cw_image_h  ||
+      want_cap  > detector->cw_max_features)
+  {
+    if (detector->cw_initialized) destroyCrossWarpResources(detector);
+    if (!setupCrossWarpResources(detector, canvas_w, canvas_h, want_cap))
+    {
+      logError(LOG_TAG, "vksift_runCrossWarpNms: failed to allocate cross-warp resources");
+      destroyCrossWarpResources(detector);
+      return false;
+    }
+  }
+
+  // Caller has already written features into cw_in_buffer_ptr in the SSBO
+  // layout (u32 nb, u32 max_nb, then feature[]).  Zero the output header so
+  // CrossWarpNms's atomicAdd starts from 0; set max_nb_out to capacity.
+  {
+    uint32_t *out_hdr = (uint32_t *)detector->cw_out_buffer_ptr;
+    out_hdr[0] = 0u;                       // nb_out
+    out_hdr[1] = detector->cw_max_features; // max_nb_out
+  }
+
+  // Record the cmd buffer fresh each call (avoids stale push_const / image
+  // size dependencies if the caller ever changes dims).
+  VkCommandBuffer cmd = detector->cw_cmd_buffer;
+  VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                 .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+  if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return false;
+
+  // Layout transition for the splat image: UNDEFINED → GENERAL,
+  // then clear to 0.
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(detector->cw_splat_image,
+        0, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+  }
+  {
+    VkClearColorValue clr = {0};
+    VkImageSubresourceRange rng = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd, detector->cw_splat_image, VK_IMAGE_LAYOUT_GENERAL, &clr, 1, &rng);
+  }
+  // TRANSFER_WRITE → SHADER_READ_WRITE for the splat shader.
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(detector->cw_splat_image,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    // Also flush host writes to the in_buffer (we wrote it with memcpy
+    // before this call) so the shader sees the updated content.
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                          .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+                          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &mb, 0, NULL, 1, &b);
+  }
+
+  // PushConst layout (must match shader):
+  //   { float intensity_scale; float k_cutoff; int32_t window_half; int32_t mode; }
+  // mode == 0 → M×M centroid+window (uses window_half).  Default.
+  // mode == 1 → Mahalanobis ellipse footprint (uses k_cutoff + per-feature S).
+  if (window_half < 0) window_half = 3;
+  if (window_half > 31) window_half = 31;
+  if (!(k_cutoff > 0.0f)) k_cutoff = 3.0f;
+  if (mode != 0 && mode != 1) mode = 0;
+  struct __attribute__((packed)) {
+      float intensity_scale;
+      float k_cutoff;
+      int32_t window_half;
+      int32_t mode;
+  } push_const = { 65535.0f / 0.5f, k_cutoff, window_half, mode };
+
+  // Splat
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->cw_splat_pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->cw_splat_pipeline_layout,
+                          0, 1, &detector->cw_splat_desc_set, 0, NULL);
+  vkCmdPushConstants(cmd, detector->cw_splat_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                     0, sizeof(push_const), &push_const);
+  const uint32_t splat_groups = (n_in + 63u) / 64u;
+  if (splat_groups > 0u) vkCmdDispatch(cmd, splat_groups, 1, 1);
+
+  // Splat writes → NMS reads
+  {
+    VkImageMemoryBarrier b = vkenv_genImageMemoryBarrier(detector->cw_splat_image,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+  }
+
+  // NMS
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->cw_nms_pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, detector->cw_nms_pipeline_layout,
+                          0, 1, &detector->cw_nms_desc_set, 0, NULL);
+  vkCmdPushConstants(cmd, detector->cw_nms_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                     0, sizeof(push_const), &push_const);
+  if (splat_groups > 0u) vkCmdDispatch(cmd, splat_groups, 1, 1);
+
+  if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+
+  vkResetFences(detector->dev->device, 1, &detector->cw_fence);
+  VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+  if (vkQueueSubmit(detector->general_queue, 1, &si, detector->cw_fence) != VK_SUCCESS) return false;
+  if (vkWaitForFences(detector->dev->device, 1, &detector->cw_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+
+  uint32_t *out_hdr = (uint32_t *)detector->cw_out_buffer_ptr;
+  *n_out = out_hdr[0] < detector->cw_max_features ? out_hdr[0] : detector->cw_max_features;
+  return true;
+}
+
 // Phase C-3 helper: fill slot's WarpParamsUBO + SlotDispatchBuffer with the
 // per-warp host-side params. No GPU submission; pure host work. Used by both
 // the serial entry point (vksift_dispatchFusedImasWarpForSlot) and the
@@ -4067,6 +4388,9 @@ void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr)
     VK_NULL_SAFE_DELETE(detector->buffer_ownership_released_by_transfer_semaphore,
                         vkDestroySemaphore(detector->dev->device, detector->buffer_ownership_released_by_transfer_semaphore, NULL));
   }
+
+  // Cross-warp NMS resources (use general_command_pool, must be torn down before it)
+  if (detector->cw_initialized) destroyCrossWarpResources(detector);
 
   // Destroy command pools
   VK_NULL_SAFE_DELETE(detector->general_command_pool, vkDestroyCommandPool(detector->dev->device, detector->general_command_pool, NULL));

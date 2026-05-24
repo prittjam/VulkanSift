@@ -191,6 +191,54 @@ void vksift_jl_get_features_for_warp(
     vksift_jl_handle h, uint32_t warp_idx,
     vksift_jl_feature *out, uint32_t n);
 
+// Cross-warp ellipse-NMS over an aggregated pool of features (e.g. the
+// concatenation of every warp's surviving features from a single
+// vksift_jl_dispatch_parallel_imas call).  Runs the GPU Splat+NMS shaders
+// (CrossWarpSplat.comp + CrossWarpNms.comp) — each feature splats its 3σ
+// ellipse footprint into a packed-response r32ui scratch image, then
+// survives iff no covered pixel shows a stronger feature.
+//
+// Caller passes the input features in `in` (n_in elements).  On return,
+// `out` holds up to `out_capacity` survivors compactly; `*n_out_ptr` is
+// the survivor count.  Returns 0 on failure (Vulkan setup / submit error).
+//
+// `canvas_w` and `canvas_h` must be the input-frame dims the features
+// were back-projected to (typically the original image W × H — the
+// splat image is sized to this).
+//
+// Hard cap: n_in is internally clamped to 65535 due to the 16-bit
+// feature-index packing in the shader.  Caller should pre-cap via
+// |response| if more features arrive.
+// mode: 0 = M×M centroid+window NMS, 1 = Mahalanobis ellipse-footprint NMS.
+uint32_t vksift_jl_cross_warp_nms(
+    vksift_jl_handle h,
+    const vksift_jl_feature *in, uint32_t n_in,
+    vksift_jl_feature *out, uint32_t out_capacity,
+    uint32_t canvas_w, uint32_t canvas_h,
+    int32_t window_half, int32_t mode, float k_cutoff);
+
+// Fused "dispatch + NMS" path: reads features that already sit in the
+// handle's per-warp cache from vksift_jl_dispatch_parallel_imas, filters
+// octave_idx<0 sentinels, packs into the cross-warp SSBO C-side, and runs
+// CrossWarpSplat + CrossWarpNms.  Returns the survivor count (≤ out_capacity).
+// Caller never sees the un-NMSed pool — no JL-side aggregation buffer.
+//
+// Pre-conditions:
+//   * vksift_jl_dispatch_parallel_imas must have been called on `h`.
+//   * `canvas_w`/`canvas_h` should be the input-frame dims (typically W × H).
+//
+// Returns 0 when the per-warp cache is empty or the GPU pass fails.
+// polarity_sign: 0 → keep both polarities, +1 → dark blobs only (intensity > 0),
+//                -1 → light blobs only (intensity < 0).  Filters host-side
+// before the splat so polarity-mismatched features can't kill same-polarity
+// winners.
+uint32_t vksift_jl_aggregate_and_cross_warp_nms(
+    vksift_jl_handle h,
+    vksift_jl_feature *out, uint32_t out_capacity,
+    uint32_t canvas_w, uint32_t canvas_h,
+    int32_t window_half, int32_t polarity_sign,
+    int32_t mode, float k_cutoff);
+
 #ifdef __cplusplus
 }
 #endif

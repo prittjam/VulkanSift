@@ -248,6 +248,40 @@ typedef struct vksift_SiftDetector_T
   VkPipelineLayout backproject_pipeline_layout;
   VkPipeline backproject_pipeline;
 
+  // Cross-warp ellipse-NMS resources (Plan A, host-roundtrip).  Caller
+  // memcpys aggregated features into the mapped cw_in_buffer, calls the
+  // dispatcher; the cmd buffer clears the splat image, splats each
+  // feature's 3σ ellipse footprint into r32ui via imageAtomicMax,
+  // then runs CrossWarpNms.comp which appends survivors to cw_out_buffer
+  // (host-mapped) compactly.  See vksift_jl_cross_warp_nms in
+  // vksift_jl.c.  Resources allocated lazily on first call so that
+  // detectors that never use the cross-warp path don't pay the
+  // ~50 MB splat image up front.
+  bool             cw_initialized;
+  uint32_t         cw_max_features;     // capacity of in/out buffers
+  uint32_t         cw_image_w;
+  uint32_t         cw_image_h;
+  VkImage          cw_splat_image;
+  VkDeviceMemory   cw_splat_image_memory;
+  VkImageView      cw_splat_image_view;
+  VkBuffer         cw_in_buffer;
+  VkDeviceMemory   cw_in_buffer_memory;
+  void            *cw_in_buffer_ptr;     // host-mapped
+  VkBuffer         cw_out_buffer;
+  VkDeviceMemory   cw_out_buffer_memory;
+  void            *cw_out_buffer_ptr;    // host-mapped
+  VkDescriptorSetLayout cw_splat_desc_set_layout;
+  VkDescriptorSetLayout cw_nms_desc_set_layout;
+  VkDescriptorPool      cw_desc_pool;
+  VkDescriptorSet       cw_splat_desc_set;
+  VkDescriptorSet       cw_nms_desc_set;
+  VkPipelineLayout      cw_splat_pipeline_layout;
+  VkPipeline            cw_splat_pipeline;
+  VkPipelineLayout      cw_nms_pipeline_layout;
+  VkPipeline            cw_nms_pipeline;
+  VkCommandBuffer       cw_cmd_buffer;
+  VkFence               cw_fence;
+
   // RGBA→Gray conversion set (only when use_rgba_input=true). Per-slot —
   // slot s binds mem->slots[s].rgba_input_image_view (in) +
   // mem->slots[s].input_image_view (out).
@@ -296,6 +330,24 @@ bool vksift_createSiftDetector(vkenv_Device device, vksift_SiftMemory memory, vk
 void vksift_destroySiftDetector(vksift_SiftDetector *detector_ptr);
 
 bool vksift_dispatchSiftDetection(vksift_SiftDetector detector, const uint32_t target_buffer_idx, const bool memory_layout_updated);
+
+// Cross-warp ellipse-footprint NMS.  Lazily allocates the splat image, in/out
+// buffers, descriptor sets, and pipelines on first call (sized for max_features
+// in features and the canvas dims passed here).  Subsequent calls reuse the
+// resources; if a larger capacity or canvas is requested, the resources are
+// reallocated.
+//
+// Caller writes `n_in` vksift_Feature records into the host-mapped buffer at
+// `detector->cw_in_buffer_ptr` (with the SSBO header: u32 nb_in, u32 max_in,
+// then feature[]; the helper API below handles that).  After this returns,
+// the host-mapped `cw_out_buffer_ptr` contains the survivors compactly with
+// the same header layout.  `*n_out` is set to the survivor count.
+//
+// Returns false if Vulkan setup or dispatch fails.
+bool vksift_runCrossWarpNms(vksift_SiftDetector detector,
+                            uint32_t canvas_w, uint32_t canvas_h,
+                            uint32_t n_in, uint32_t *n_out,
+                            int32_t window_half, int32_t mode, float k_cutoff);
 
 // Same as vksift_dispatchSiftDetection but submits the on-IMAS detection
 // command buffer (which sources its input from mem->rotated_image instead of

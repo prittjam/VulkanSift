@@ -1,22 +1,22 @@
 #version 450
 //
-// CrossWarpNms.comp — 8-neighbor 2D NMS on a packed-response splat image.
+// CrossWarpNms.comp — non-maximum-suppression on the cross-warp splat image.
+// Two modes selected via push constant (must match the splat pass's mode):
 //
-// One thread per input feature. Reads the splat image at the feature's
-// rounded (x, y) and at its 8 neighbors. A feature survives iff:
-//   1. The center pixel's stored feature_idx == this thread's idx (it won
-//      the atomic-max splat at its own pixel).
-//   2. No neighbor pixel has a higher packed value (i.e., stronger
-//      |response|, with tie-break by larger idx).
+//   mode == 0  →  Scan a (2·window_half + 1)² window around the feature's
+//                  centroid pixel.  Suppress if any cell holds a stronger
+//                  packed value.
 //
-// Surviving features are appended to the output buffer via atomicAdd.
+//   mode == 1  →  Scan the Mahalanobis interior of the feature's K-σ ellipse
+//                  (using S = σ·A_inv from BackProjectFeatures.comp).
+//                  Suppress if any interior pixel holds a stronger packed value.
 //
-// Same packing as CrossWarpSplat: high 16 bits = |response| in fixed point,
-// low 16 bits = feature index.
+// Packing matches CrossWarpSplat.comp.
 //
 
 #define NB_HIST 4
 #define NB_ORI 8
+#define MAX_BBOX_HALF 64
 
 struct SIFT_Feat {
   float x;
@@ -28,7 +28,7 @@ struct SIFT_Feat {
   float sigma;
   float orientation;
   float intensity;
-  float s_xx, s_xy, s_yy;  // Input-frame ellipse shape S = sigma * A_inv (symmetric, populated by BackProjectFeatures for ASIFT-warp features; zero otherwise)
+  float s_xx, s_xy, s_yy;
   uint descriptor[(NB_HIST*NB_HIST*NB_ORI)/4];
 };
 
@@ -44,37 +44,73 @@ layout(std430, binding = 2) buffer OutFeatures {
     uint max_nb_out;
     SIFT_Feat features_out[];
 };
+layout(push_constant) uniform PushConst {
+    float intensity_scale;
+    float k_cutoff;
+    int   window_half;
+    int   mode;
+} push_const;
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= nb_in) return;
     SIFT_Feat f = features_in[i];
+    if (f.octave_idx < 0) return;
 
-    int x = int(round(f.x));
-    int y = int(round(f.y));
+    int cx = int(round(f.x));
+    int cy = int(round(f.y));
     ivec2 sz = imageSize(splat_image);
-    if (x < 0 || x >= sz.x || y < 0 || y >= sz.y) return;
 
-    uint me = imageLoad(splat_image, ivec2(x, y)).r;
-    // Did I win my own pixel? (feature_idx == low 16 bits)
-    if ((me & 0xFFFFu) != (i & 0xFFFFu)) return;
+    uint q  = uint(clamp(abs(f.intensity) * push_const.intensity_scale, 0.0, 65535.0)) << 16;
+    uint id = i & 0xFFFFu;
+    uint me = q | id;
 
-    // Compare against 8 neighbors. The full 32-bit packed value lets us
-    // compare in one shot — strictly greater on any neighbor suppresses us.
-    // (Equal-value tie at a neighbor is treated as "not strictly greater",
-    // so the smaller-idx feature loses to the larger by definition of the
-    // packing — handled implicitly.)
-    for (int dx = -1; dx <= 1; ++dx) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            if (dx == 0 && dy == 0) continue;
-            int nx = x + dx, ny = y + dy;
-            if (nx < 0 || nx >= sz.x || ny < 0 || ny >= sz.y) continue;
-            uint nb = imageLoad(splat_image, ivec2(nx, ny)).r;
-            if (nb > me) return;   // beaten by a stronger neighbor
+    if (push_const.mode == 0) {
+        // M×M-neighborhood scan around centroid.
+        int r = push_const.window_half;
+        for (int dy = -r; dy <= r; ++dy) {
+            int y = cy + dy;
+            if (y < 0 || y >= sz.y) continue;
+            for (int dx = -r; dx <= r; ++dx) {
+                int x = cx + dx;
+                if (x < 0 || x >= sz.x) continue;
+                uint nb = imageLoad(splat_image, ivec2(x, y)).r;
+                if (nb > me) return;
+            }
+        }
+    } else {
+        // Mahalanobis ellipse-interior scan.
+        mat2 S = mat2(f.s_xx, f.s_xy,
+                      f.s_xy, f.s_yy);
+        float det = S[0][0] * S[1][1] - S[0][1] * S[1][0];
+        if (det <= 0.0) return;
+        mat2 Sinv = mat2( S[1][1] / det, -S[0][1] / det,
+                         -S[1][0] / det,  S[0][0] / det);
+
+        float K  = push_const.k_cutoff;
+        float K2 = K * K;
+        int rx = int(ceil(K * sqrt(max(S[0][0], 1e-6))));
+        int ry = int(ceil(K * sqrt(max(S[1][1], 1e-6))));
+        rx = min(rx, MAX_BBOX_HALF);
+        ry = min(ry, MAX_BBOX_HALF);
+
+        for (int dy = -ry; dy <= ry; ++dy) {
+            int y = cy + dy;
+            if (y < 0 || y >= sz.y) continue;
+            for (int dx = -rx; dx <= rx; ++dx) {
+                int x = cx + dx;
+                if (x < 0 || x >= sz.x) continue;
+                vec2 d = vec2(float(dx), float(dy));
+                float md2 = Sinv[0][0]*d.x*d.x
+                          + 2.0 * Sinv[0][1]*d.x*d.y
+                          + Sinv[1][1]*d.y*d.y;
+                if (md2 > K2) continue;
+                uint nb = imageLoad(splat_image, ivec2(x, y)).r;
+                if (nb > me) return;
+            }
         }
     }
 
-    // Survived — append to the output buffer.
     uint out_idx = atomicAdd(nb_out, 1);
     if (out_idx < max_nb_out) {
         features_out[out_idx] = f;

@@ -740,6 +740,34 @@ const float *vksift_getImasReadbackPtr(vksift_Instance instance)
   return (const float *)instance->imas_pipeline->readback_ptr;
 }
 
+bool vksift_runCrossWarpNmsInstance(vksift_Instance instance,
+                                    uint32_t canvas_w, uint32_t canvas_h,
+                                    uint32_t n_in, uint32_t *n_out,
+                                    int32_t window_half, int32_t mode, float k_cutoff)
+{
+  if (instance == NULL || n_out == NULL) return false;
+  return vksift_runCrossWarpNms(instance->sift_detector, canvas_w, canvas_h, n_in, n_out,
+                                window_half, mode, k_cutoff);
+}
+
+void *vksift_getCrossWarpInPtr(vksift_Instance instance)
+{
+  if (instance == NULL || !instance->sift_detector->cw_initialized) return NULL;
+  return instance->sift_detector->cw_in_buffer_ptr;
+}
+
+void *vksift_getCrossWarpOutPtr(vksift_Instance instance)
+{
+  if (instance == NULL || !instance->sift_detector->cw_initialized) return NULL;
+  return instance->sift_detector->cw_out_buffer_ptr;
+}
+
+uint32_t vksift_getCrossWarpCapacity(vksift_Instance instance)
+{
+  if (instance == NULL || !instance->sift_detector->cw_initialized) return 0u;
+  return instance->sift_detector->cw_max_features;
+}
+
 // Run SIFT detection on the tilted image produced by the IMAS pipeline,
 // reading mem->rotated_image device-side (no host roundtrip).
 //

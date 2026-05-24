@@ -1,22 +1,27 @@
 #version 450
 //
-// CrossWarpSplat.comp — splat each ASIFT feature onto a 2D scratch image,
-// keeping the strongest |response| per pixel via imageAtomicMax.
+// CrossWarpSplat.comp — splat each feature's packed (response, idx) value
+// onto the cross-warp splat image.  Two modes selected via push constant:
 //
-// One thread per feature. The feature's rounded (x, y) in input-frame pixel
-// coords is the splat position. We pack the response magnitude into the
-// HIGH 16 bits and the feature index into the LOW 16 bits of a 32-bit uint
-// so that imageAtomicMax compares by response first, then breaks ties by
-// feature index — ensuring atomic, deterministic winner selection per pixel.
+//   mode == 0  →  M×M-neighborhood (centroid-only splat).  Writes the packed
+//                  value into the single centroid pixel of each feature.
+//                  CrossWarpNms.comp then scans a (2·window_half + 1)² window
+//                  around its own centroid.
 //
+//   mode == 1  →  Ellipse footprint (Mahalanobis interior splat).  For each
+//                  feature, walks its K-σ ellipse bbox using S and writes the
+//                  packed value into every pixel inside the Mahalanobis
+//                  interior `(p − c)ᵀ S⁻¹ (p − c) ≤ K²`.  CrossWarpNms.comp
+//                  scans the same interior.
+//
+// Packed layout (32 bits):  high 16 = |intensity| × scale (clamp to 65535),
+//                            low  16 = feature_idx mod 65535.
 // CALLER must clear `splat_image` to 0 before this pass.
-//
-// Pipeline:
-//     CrossWarpSplatClear -> CrossWarpSplat -> CrossWarpNms -> compact
 //
 
 #define NB_HIST 4
 #define NB_ORI 8
+#define MAX_BBOX_HALF 64   // safety cap for ellipse mode
 
 struct SIFT_Feat {
   float x;
@@ -28,7 +33,7 @@ struct SIFT_Feat {
   float sigma;
   float orientation;
   float intensity;
-  float s_xx, s_xy, s_yy;  // Input-frame ellipse shape S = sigma * A_inv (symmetric, populated by BackProjectFeatures for ASIFT-warp features; zero otherwise)
+  float s_xx, s_xy, s_yy;
   uint descriptor[(NB_HIST*NB_HIST*NB_ORI)/4];
 };
 
@@ -41,28 +46,61 @@ layout(std430, binding = 0) readonly buffer InFeatures {
 layout(r32ui, binding = 1) uniform uimage2D splat_image;
 
 layout(push_constant) uniform PushConst {
-    // Multiplier converting |intensity| → 16-bit fixed-point. With
-    // intensities typically in [0, 0.1], 65535/0.5 ≈ 131000 maps the
-    // expected range to the full 16-bit grid while leaving slack for
-    // outliers up to ~0.5.
     float intensity_scale;
+    float k_cutoff;          // Mahalanobis cutoff K (used only when mode == 1)
+    int   window_half;       // used only by CrossWarpNms.comp in mode 0
+    int   mode;              // 0 = M×M centroid splat, 1 = ellipse footprint splat
 } push_const;
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= nb_in) return;
     SIFT_Feat f = features[i];
+    if (f.octave_idx < 0) return;
 
-    int x = int(round(f.x));
-    int y = int(round(f.y));
     ivec2 sz = imageSize(splat_image);
-    if (x < 0 || x >= sz.x || y < 0 || y >= sz.y) return;
 
-    // Pack: high 16 = |intensity| × scale clamped to 0xFFFF; low 16 = idx.
-    // Lower-index features lose ties to higher-index features for the same
-    // |intensity|. We tolerate this — at most 65k features (2^16 - 1).
-    uint q = uint(clamp(abs(f.intensity) * push_const.intensity_scale, 0.0, 65535.0)) << 16;
-    uint idx16 = i & 0xFFFFu;
-    uint packed = q | idx16;
-    imageAtomicMax(splat_image, ivec2(x, y), packed);
+    uint q  = uint(clamp(abs(f.intensity) * push_const.intensity_scale, 0.0, 65535.0)) << 16;
+    uint id = i & 0xFFFFu;
+    uint packed = q | id;
+
+    int cx = int(round(f.x));
+    int cy = int(round(f.y));
+
+    if (push_const.mode == 0) {
+        // Centroid-only splat.
+        if (cx < 0 || cx >= sz.x || cy < 0 || cy >= sz.y) return;
+        imageAtomicMax(splat_image, ivec2(cx, cy), packed);
+        return;
+    }
+
+    // mode == 1: Mahalanobis ellipse footprint splat.
+    mat2 S    = mat2(f.s_xx, f.s_xy,
+                     f.s_xy, f.s_yy);
+    float det = S[0][0] * S[1][1] - S[0][1] * S[1][0];
+    if (det <= 0.0) return;
+    mat2 Sinv = mat2( S[1][1] / det, -S[0][1] / det,
+                     -S[1][0] / det,  S[0][0] / det);
+
+    float K  = push_const.k_cutoff;
+    float K2 = K * K;
+    int rx = int(ceil(K * sqrt(max(S[0][0], 1e-6))));
+    int ry = int(ceil(K * sqrt(max(S[1][1], 1e-6))));
+    rx = min(rx, MAX_BBOX_HALF);
+    ry = min(ry, MAX_BBOX_HALF);
+
+    for (int dy = -ry; dy <= ry; ++dy) {
+        int y = cy + dy;
+        if (y < 0 || y >= sz.y) continue;
+        for (int dx = -rx; dx <= rx; ++dx) {
+            int x = cx + dx;
+            if (x < 0 || x >= sz.x) continue;
+            vec2 d = vec2(float(dx), float(dy));
+            float md2 = Sinv[0][0]*d.x*d.x
+                      + 2.0 * Sinv[0][1]*d.x*d.y
+                      + Sinv[1][1]*d.y*d.y;
+            if (md2 > K2) continue;
+            imageAtomicMax(splat_image, ivec2(x, y), packed);
+        }
+    }
 }

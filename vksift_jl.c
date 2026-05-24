@@ -384,3 +384,202 @@ void vksift_jl_get_features_for_warp(
     uint32_t copy_n = (n < avail) ? n : avail;
     memcpy(out, src, sizeof(vksift_jl_feature) * copy_n);
 }
+
+// Cross-warp ellipse-NMS FFI: upload features into the detector's host-mapped
+// in_buffer (formatting the SSBO header), run Splat + NMS via
+// vksift_runCrossWarpNmsInstance, then memcpy survivors back into `out`.
+// vksift_Feature on the C side carries 12 extra bytes per feature (s_xx/xy/yy
+// + the legacy descriptor[128] field).  The shaders read & write
+// vksift_Feature directly via the SSBO, so the buffer layout is just the
+// SSBO header followed by vksift_Feature[].
+//
+// JL's vksift_jl_feature is a slim subset (no scale_x/y/orientation/descriptor).
+// We expand vksift_jl_feature → vksift_Feature when filling the in_buffer
+// (zeroing the fields the shaders don't need) and contract on the way back.
+uint32_t vksift_jl_cross_warp_nms(
+    vksift_jl_handle h,
+    const vksift_jl_feature *in, uint32_t n_in,
+    vksift_jl_feature *out, uint32_t out_capacity,
+    uint32_t canvas_w, uint32_t canvas_h,
+    int32_t window_half, int32_t mode, float k_cutoff)
+{
+    if (!h || !in || !out || n_in == 0u) return 0u;
+    if (n_in > 65535u) n_in = 65535u;  // matches the shader-side clamp
+
+    // Force resource allocation if not done yet (calls the lazy setup path).
+    uint32_t dummy_n_out = 0u;
+    if (!vksift_runCrossWarpNmsInstance(h->instance, canvas_w, canvas_h, 0u, &dummy_n_out,
+                                         window_half, mode, k_cutoff))
+    {
+        return 0u;
+    }
+    void *in_ptr  = vksift_getCrossWarpInPtr(h->instance);
+    uint32_t cap  = vksift_getCrossWarpCapacity(h->instance);
+    if (!in_ptr || cap == 0u) return 0u;
+    if (n_in > cap) n_in = cap;
+
+    // Layout: u32 nb_in, u32 max_nb_in, then vksift_Feature[].
+    uint32_t *hdr = (uint32_t *)in_ptr;
+    hdr[0] = n_in;
+    hdr[1] = cap;
+    vksift_Feature *features = (vksift_Feature *)((uint8_t *)in_ptr + 8u);
+    memset(features, 0, sizeof(vksift_Feature) * n_in);
+    for (uint32_t i = 0u; i < n_in; ++i)
+    {
+        features[i].x          = in[i].x;
+        features[i].y          = in[i].y;
+        features[i].sigma      = in[i].sigma;
+        features[i].octave_idx = in[i].octave_idx;
+        features[i].scale_idx  = in[i].scale_idx;
+        features[i].intensity  = in[i].intensity;
+        features[i].s_xx       = in[i].s_xx;
+        features[i].s_xy       = in[i].s_xy;
+        features[i].s_yy       = in[i].s_yy;
+    }
+
+    uint32_t n_out_gpu = 0u;
+    if (!vksift_runCrossWarpNmsInstance(h->instance, canvas_w, canvas_h, n_in, &n_out_gpu,
+                                         window_half, mode, k_cutoff))
+    {
+        return 0u;
+    }
+    void *out_ptr = vksift_getCrossWarpOutPtr(h->instance);
+    if (!out_ptr) return 0u;
+
+    vksift_Feature *out_features = (vksift_Feature *)((uint8_t *)out_ptr + 8u);
+    uint32_t copy_n = n_out_gpu < out_capacity ? n_out_gpu : out_capacity;
+    for (uint32_t i = 0u; i < copy_n; ++i)
+    {
+        out[i].x          = out_features[i].x;
+        out[i].y          = out_features[i].y;
+        out[i].sigma      = out_features[i].sigma;
+        out[i].octave_idx = out_features[i].octave_idx;
+        out[i].scale_idx  = out_features[i].scale_idx;
+        out[i].intensity  = out_features[i].intensity;
+        out[i].s_xx       = out_features[i].s_xx;
+        out[i].s_xy       = out_features[i].s_xy;
+        out[i].s_yy       = out_features[i].s_yy;
+    }
+    return n_out_gpu;
+}
+
+// Fused Plan-B path: aggregate features that already sit in the handle's
+// per-warp cache (populated by vksift_jl_dispatch_parallel_imas), filter
+// out octave_idx<0 sentinels, and run cross-warp ellipse-NMS in one FFI
+// call.  Caller never sees the un-NMSed pool — no JL-side aggregation
+// buffer or pack/unpack step required.
+//
+// Returns the survivor count (≤ out_capacity).  Returns 0 when the parallel
+// cache is empty or the GPU pass fails.
+// Inline polarity filter — matches the shader convention "intensity > 0 = dark
+// blob, intensity < 0 = light blob".  polarity_sign == 0 → keep both.
+static inline int _polarity_match(float intensity, int32_t polarity_sign)
+{
+    if (polarity_sign == 0) return 1;
+    if (polarity_sign > 0)  return intensity > 0.0f;
+    return intensity < 0.0f;
+}
+
+uint32_t vksift_jl_aggregate_and_cross_warp_nms(
+    vksift_jl_handle h,
+    vksift_jl_feature *out, uint32_t out_capacity,
+    uint32_t canvas_w, uint32_t canvas_h,
+    int32_t window_half, int32_t polarity_sign,
+    int32_t mode, float k_cutoff)
+{
+    if (!h || !out || out_capacity == 0u) return 0u;
+    if (h->parallel_n_warps == 0u || !h->parallel_features || !h->parallel_counts) return 0u;
+
+    // First count the features we'll actually pack so the lazy setup grows the
+    // SSBO + splat image to fit.  Without this the initial setup uses the
+    // default 8192-feature capacity and the aggregation loop silently drops
+    // the remainder — producing wildly wrong NMS results on large pools.
+    uint32_t expected = 0u;
+    for (uint32_t w = 0u; w < h->parallel_n_warps; ++w)
+    {
+        const vksift_jl_feature *src = h->parallel_features[w];
+        uint32_t n = h->parallel_counts[w];
+        if (!src || n == 0u) continue;
+        for (uint32_t i = 0u; i < n; ++i)
+        {
+            if (src[i].octave_idx < 0) continue;
+            if (!_polarity_match(src[i].intensity, polarity_sign)) continue;
+            expected++;
+        }
+    }
+    if (expected == 0u) return 0u;
+    if (expected > 65535u) expected = 65535u;
+
+    // Force lazy setup at the right capacity.
+    uint32_t dummy_n_out = 0u;
+    if (!vksift_runCrossWarpNmsInstance(h->instance, canvas_w, canvas_h, expected, &dummy_n_out,
+                                         window_half, mode, k_cutoff))
+    {
+        return 0u;
+    }
+    void *in_ptr  = vksift_getCrossWarpInPtr(h->instance);
+    uint32_t cap  = vksift_getCrossWarpCapacity(h->instance);
+    if (!in_ptr || cap == 0u) return 0u;
+
+    // Aggregate non-rejected features from the per-warp cache into the
+    // host-mapped SSBO at cw_in_buffer_ptr.  Layout: u32 nb_in, u32 max_nb_in,
+    // then vksift_Feature[].
+    uint32_t *hdr = (uint32_t *)in_ptr;
+    vksift_Feature *features = (vksift_Feature *)((uint8_t *)in_ptr + 8u);
+    uint32_t n_packed = 0u;
+    for (uint32_t w = 0u; w < h->parallel_n_warps; ++w)
+    {
+        const vksift_jl_feature *src = h->parallel_features[w];
+        uint32_t n = h->parallel_counts[w];
+        if (!src || n == 0u) continue;
+        for (uint32_t i = 0u; i < n; ++i)
+        {
+            if (src[i].octave_idx < 0) continue;        // boundary-rejected
+            if (!_polarity_match(src[i].intensity, polarity_sign)) continue;
+            if (n_packed >= cap) goto packed_full;       // honor shader cap (65535)
+            vksift_Feature *dst = &features[n_packed++];
+            // Match the layout vksift_Feature expects.  The shader only
+            // touches x/y/sigma/octave_idx/intensity/s_xx/s_xy/s_yy, but we
+            // zero the whole record for cleanliness (descriptor, orientation,
+            // scale_x/y).
+            memset(dst, 0, sizeof(vksift_Feature));
+            dst->x          = src[i].x;
+            dst->y          = src[i].y;
+            dst->sigma      = src[i].sigma;
+            dst->octave_idx = src[i].octave_idx;
+            dst->scale_idx  = src[i].scale_idx;
+            dst->intensity  = src[i].intensity;
+            dst->s_xx       = src[i].s_xx;
+            dst->s_xy       = src[i].s_xy;
+            dst->s_yy       = src[i].s_yy;
+        }
+    }
+packed_full:
+    hdr[0] = n_packed;
+    hdr[1] = cap;
+    if (n_packed == 0u) return 0u;
+
+    uint32_t n_out_gpu = 0u;
+    if (!vksift_runCrossWarpNmsInstance(h->instance, canvas_w, canvas_h, n_packed, &n_out_gpu,
+                                         window_half, mode, k_cutoff))
+    {
+        return 0u;
+    }
+    void *out_ptr = vksift_getCrossWarpOutPtr(h->instance);
+    if (!out_ptr) return 0u;
+    vksift_Feature *survivors = (vksift_Feature *)((uint8_t *)out_ptr + 8u);
+    uint32_t copy_n = n_out_gpu < out_capacity ? n_out_gpu : out_capacity;
+    for (uint32_t i = 0u; i < copy_n; ++i)
+    {
+        out[i].x          = survivors[i].x;
+        out[i].y          = survivors[i].y;
+        out[i].sigma      = survivors[i].sigma;
+        out[i].octave_idx = survivors[i].octave_idx;
+        out[i].scale_idx  = survivors[i].scale_idx;
+        out[i].intensity  = survivors[i].intensity;
+        out[i].s_xx       = survivors[i].s_xx;
+        out[i].s_xy       = survivors[i].s_xy;
+        out[i].s_yy       = survivors[i].s_yy;
+    }
+    return copy_n;
+}

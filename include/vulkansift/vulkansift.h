@@ -81,6 +81,26 @@ extern "C"
                                     uint32_t *out_w, uint32_t *out_h);
   VKSIFT_EXPORT const float *vksift_getImasReadbackPtr(vksift_Instance instance);
 
+  // Cross-warp ellipse-footprint NMS over an aggregated pool of features.
+  // Caller writes `n_in` vksift_Feature records into the buffer returned by
+  // vksift_getCrossWarpInPtr(instance) (the buffer carries a u32 nb / u32 max_nb
+  // header followed by the feature array — the helper sets both).  After this
+  // returns true, vksift_getCrossWarpOutPtr(instance) is the survivor buffer
+  // (same header layout); *n_out holds the survivor count.  canvas_w/canvas_h
+  // size the splat scratch image (typically input image dims).
+  //
+  // n_in is internally clamped to 65535 due to the 16-bit feature-index packing
+  // in CrossWarpSplat.comp.  Caller should pre-cap if more features arrive.
+  // mode: 0 = M×M centroid+window NMS, 1 = Mahalanobis ellipse-footprint NMS.
+  VKSIFT_EXPORT bool vksift_runCrossWarpNmsInstance(vksift_Instance instance,
+                                                    uint32_t canvas_w, uint32_t canvas_h,
+                                                    uint32_t n_in, uint32_t *n_out,
+                                                    int32_t window_half,
+                                                    int32_t mode, float k_cutoff);
+  VKSIFT_EXPORT void *vksift_getCrossWarpInPtr(vksift_Instance instance);
+  VKSIFT_EXPORT void *vksift_getCrossWarpOutPtr(vksift_Instance instance);
+  VKSIFT_EXPORT uint32_t vksift_getCrossWarpCapacity(vksift_Instance instance);
+
   // Run SIFT detection on the most-recent IMAS-tilted image (mem->rotated_image,
   // device-side) — no host roundtrip. Caller must have run vksift_runImas first
   // to populate rotated_image.
